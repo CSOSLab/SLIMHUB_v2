@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slimhub-v2"
+version = "0.1.0"
+description = "NUS-only SLIMHUB daemon and CLI for DEAN_NODE_V2 peripherals"
+requires-python = ">=3.11"
+dependencies = [
+    "bleak==3.0.2",
+]
+
+[project.scripts]
+slimhub = "slimhub.cli.app:main"
+slimhub-v2 = "slimhub.cli.app:main"
+
+[tool.setuptools.packages.find]
+include = ["slimhub*"]

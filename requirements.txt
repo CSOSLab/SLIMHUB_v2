@@ -1,0 +1,3 @@
+# Runtime dependencies.
+# Keep this in sync with pyproject.toml.
+bleak==3.0.2
