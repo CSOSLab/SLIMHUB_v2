@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from slimhub.config import DEFAULT_LOCATION, AppPaths
-from slimhub.events import RawDataEvent
+from slimhub.events import AlertEvent, RawDataEvent
 from slimhub.protocol.nus import normalize_mac
 
 
@@ -28,11 +28,18 @@ CSV_FIELDS = [
     "is_pir_human_detection_event",
 ]
 
+ALERT_CSV_FIELDS = [
+    "timestamp",
+    "mac",
+    "location",
+    "message",
+]
+
 
 class RawDataLogger:
     def __init__(self, paths: AppPaths) -> None:
         self.paths = paths
-        self._queue: asyncio.Queue[RawDataEvent | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[RawDataEvent | AlertEvent | None] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
@@ -53,12 +60,21 @@ class RawDataLogger:
             return
         await self._queue.put(event)
 
+    async def log_alert(self, event: AlertEvent) -> None:
+        if self._task is None:
+            await self.write_alert(event)
+            return
+        await self._queue.put(event)
+
     async def _run(self) -> None:
         while True:
             event = await self._queue.get()
             if event is None:
                 return
-            await self.write_event(event)
+            if isinstance(event, AlertEvent):
+                await self.write_alert(event)
+            else:
+                await self.write_event(event)
 
     async def write_event(self, event: RawDataEvent) -> None:
         path = self._path_for(event)
@@ -70,6 +86,16 @@ class RawDataLogger:
                 writer.writeheader()
             writer.writerow(self._row_for(event))
 
+    async def write_alert(self, event: AlertEvent) -> None:
+        path = self._alert_path_for(event)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        needs_header = not path.exists() or path.stat().st_size == 0
+        with path.open("a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=ALERT_CSV_FIELDS)
+            if needs_header:
+                writer.writeheader()
+            writer.writerow(self._alert_row_for(event))
+
     def _path_for(self, event: RawDataEvent) -> Path:
         timestamp = datetime.fromtimestamp(event.timestamp)
         location = event.location or DEFAULT_LOCATION
@@ -79,6 +105,18 @@ class RawDataLogger:
             / location
             / mac
             / "rawdata"
+            / f"{timestamp.strftime('%Y-%m-%d')}.csv"
+        )
+
+    def _alert_path_for(self, event: AlertEvent) -> Path:
+        timestamp = datetime.fromtimestamp(event.timestamp)
+        location = event.location or DEFAULT_LOCATION
+        mac = normalize_mac(event.mac)
+        return (
+            self.paths.data_dir
+            / location
+            / mac
+            / "alert"
             / f"{timestamp.strftime('%Y-%m-%d')}.csv"
         )
 
@@ -107,3 +145,12 @@ class RawDataLogger:
         for idx, value in enumerate(sound):
             row[f"sound_{idx}"] = value
         return row
+
+    def _alert_row_for(self, event: AlertEvent) -> dict[str, object]:
+        timestamp = datetime.fromtimestamp(event.timestamp)
+        return {
+            "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            "mac": normalize_mac(event.mac),
+            "location": event.location or DEFAULT_LOCATION,
+            "message": event.packet.message,
+        }

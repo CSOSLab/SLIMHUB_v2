@@ -67,11 +67,11 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(frame.parsed.message, "ready")
 
     def test_command_frame_uses_target_mac_and_command_packet_type(self) -> None:
-        frame = build_command_frame("AA:BB:CC:DD:EE:FF", "strong_enter")
+        frame = build_command_frame("AA:BB:CC:DD:EE:FF", "enter")
 
         self.assertEqual(frame[:6], bytes.fromhex("AABBCCDDEEFF"))
         self.assertEqual(frame[6:14], b"COMMAND\x00")
-        self.assertIn(b"strong_enter", frame)
+        self.assertIn(b"enter", frame)
 
 
 if __name__ == "__main__":

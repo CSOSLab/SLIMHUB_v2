@@ -32,7 +32,7 @@ class UnitspaceTests(unittest.TestCase):
         commands = estimator.handle(make_event("AA:BB:CC:DD:EE:01", "ENTRY", 10.0))
 
         self.assertEqual(len(commands), 1)
-        self.assertEqual(commands[0].command, "strong_enter")
+        self.assertEqual(commands[0].command, "enter")
         self.assertEqual(commands[0].address, "AA:BB:CC:DD:EE:01")
 
     def test_same_address_noise_is_ignored(self) -> None:
@@ -50,7 +50,7 @@ class UnitspaceTests(unittest.TestCase):
 
         commands = estimator.handle(make_event("AA:BB:CC:DD:EE:02", "LIVING", 12.0))
 
-        self.assertEqual([command.command for command in commands], ["strong_enter", "strong_exit"])
+        self.assertEqual([command.command for command in commands], ["enter", "exit"])
         self.assertEqual(commands[0].address, "AA:BB:CC:DD:EE:02")
         self.assertEqual(commands[1].address, "AA:BB:CC:DD:EE:01")
         self.assertEqual(commands[1].location, "ENTRY")

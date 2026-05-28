@@ -74,8 +74,8 @@ Inbound packet types:
 - `ALERT`: UTF-8 text payload
 
 Outbound unitspace commands are sent as `COMMAND` frames to NUS RX. The frame MAC
-is the target node MAC and the payload is a UTF-8 command such as
-`strong_enter` or `strong_exit`.
+is the target node MAC and the payload is a UTF-8 command such as `enter` or
+`exit`.
 
 ## Compatibility Reader
 

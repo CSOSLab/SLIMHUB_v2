@@ -29,11 +29,11 @@ class DeviceRegistryTests(unittest.IsolatedAsyncioTestCase):
         await registry.register_alias("11:22:33:44:55:66", session.address)
 
         sent = await registry.send_command(
-            CommandEvent("11:22:33:44:55:66", "strong_enter", "ENTRY", "test")
+            CommandEvent("11:22:33:44:55:66", "enter", "ENTRY")
         )
 
         self.assertTrue(sent)
-        self.assertEqual(session.commands[0].command, "strong_enter")
+        self.assertEqual(session.commands[0].command, "enter")
         self.assertEqual(
             await registry.resolve_address("11:22:33:44:55:66"),
             "AA:BB:CC:DD:EE:01",

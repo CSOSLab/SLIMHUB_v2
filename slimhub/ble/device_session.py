@@ -216,12 +216,10 @@ class DeviceSession:
             try:
                 frame = build_command_frame(command.address, command.command)
                 await client.write_gatt_char(NUS_RX_WRITE_UUID, frame, response=False)
-                self.logger.info(
-                    "%s command sent target=%s command=%s reason=%s",
-                    self.address,
-                    command.address,
+                self.logger.debug(
+                    "command sent location=%s command=%s",
+                    command.location,
                     command.command,
-                    command.reason,
                 )
             except Exception as exc:
                 self.last_error = str(exc)

@@ -5,9 +5,9 @@ import unittest
 from pathlib import Path
 
 from slimhub.config import AppPaths
-from slimhub.events import RawDataEvent
+from slimhub.events import AlertEvent, RawDataEvent
 from slimhub.logging import RawDataLogger
-from slimhub.protocol.nus import RawDataPacket
+from slimhub.protocol.nus import AlertPacket, RawDataPacket
 
 
 class RawLoggerTests(unittest.IsolatedAsyncioTestCase):
@@ -52,6 +52,32 @@ class RawLoggerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(lines), 3)
             self.assertIn("timestamp,mac,location", lines[0])
             self.assertEqual(lines[1].count("AA:BB:CC:DD:EE:FF"), 1)
+
+    async def test_alert_logger_writes_data_directory_without_rawdata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = AppPaths.from_base(tmpdir)
+            logger = RawDataLogger(paths)
+            event = AlertEvent(
+                timestamp=0.0,
+                mac="AA:BB:CC:DD:EE:FF",
+                location="ENTRY",
+                packet=AlertPacket("ready"),
+                payload=b"ready",
+            )
+
+            await logger.write_alert(event)
+
+            path = (
+                Path(tmpdir)
+                / "data"
+                / "ENTRY"
+                / "AA:BB:CC:DD:EE:FF"
+                / "alert"
+                / "1970-01-01.csv"
+            )
+            lines = path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(lines[0], "timestamp,mac,location,message")
+            self.assertTrue(lines[1].endswith(",ready"))
 
 
 if __name__ == "__main__":

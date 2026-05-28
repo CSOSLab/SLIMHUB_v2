@@ -27,9 +27,7 @@ class SimpleUnitspaceEstimator:
 
         if self.status.last_address is None:
             self._remember(address, location, event.timestamp)
-            return [
-                CommandEvent(address, "strong_enter", location, "first_detection"),
-            ]
+            return [CommandEvent(address, "enter", location)]
 
         if address == self.status.last_address:
             self._remember(address, location, event.timestamp)
@@ -39,13 +37,8 @@ class SimpleUnitspaceEstimator:
         previous_location = self.status.last_location or DEFAULT_LOCATION
         self._remember(address, location, event.timestamp)
         return [
-            CommandEvent(address, "strong_enter", location, "movement_detected"),
-            CommandEvent(
-                previous_address,
-                "strong_exit",
-                previous_location,
-                "movement_detected",
-            ),
+            CommandEvent(address, "enter", location),
+            CommandEvent(previous_address, "exit", previous_location),
         ]
 
     def snapshot(self) -> dict[str, object]:

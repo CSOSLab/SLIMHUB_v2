@@ -12,7 +12,7 @@ from slimhub.ble.central import BleCentral
 from slimhub.ble.registry import DeviceRegistry
 from slimhub.ble.scanner import discover_named_devices
 from slimhub.config import AppPaths, DeviceConfigStore
-from slimhub.events import RawDataEvent
+from slimhub.events import AlertEvent, CommandEvent, RawDataEvent
 from slimhub.logging import RawDataLogger
 from slimhub.protocol.nus import (
     DEFAULT_DEVICE_NAME,
@@ -105,27 +105,42 @@ class SlimHubDaemon:
                 payload=frame.payload,
             )
             await self.raw_logger.log(event)
+            sent_commands = []
             for command in self.estimator.handle(event):
                 sent = await self.registry.send_command(command)
                 if not sent:
                     self.logger.warning(
-                        "No active session for command target=%s command=%s",
-                        command.address,
+                        "No active session for command location=%s command=%s",
+                        command.location,
                         command.command,
                     )
+                    continue
+                sent_commands.append(command)
+            self._log_commands(sent_commands)
         elif isinstance(frame.parsed, AlertPacket):
-            self.logger.info("ALERT mac=%s message=%r", frame.mac, frame.parsed.message)
+            config = self.config_store.load(frame.mac)
+            self.config_store.save(config)
+            await self.raw_logger.log_alert(
+                AlertEvent(
+                    timestamp=time.time(),
+                    mac=frame.mac,
+                    location=config.location,
+                    packet=frame.parsed,
+                    payload=frame.payload,
+                )
+            )
 
     async def _scan_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
                 async with self.adapter_lock:
                     devices = await discover_named_devices(self.device_name, self.scan_timeout)
-                self.logger.info(
-                    "BLE scan found %d %s devices",
-                    len(devices),
-                    self.device_name,
-                )
+                if await self._connected_session_count() == 0:
+                    self.logger.info(
+                        "BLE scan found %d %s devices",
+                        len(devices),
+                        self.device_name,
+                    )
                 for device in devices:
                     await self._start_or_update_session(device)
             except asyncio.CancelledError:
@@ -138,6 +153,28 @@ class SlimHubDaemon:
         address = normalize_mac(str(getattr(target, "address")))
         await self.central.ensure_target(target)
         self.config_store.save(self.config_store.load(address))
+
+    async def _connected_session_count(self) -> int:
+        statuses = await self.registry.list_status()
+        return sum(1 for item in statuses if item.get("connected"))
+
+    def _log_commands(self, commands: list[CommandEvent]) -> None:
+        if not commands:
+            return
+
+        enter_location = None
+        exit_location = None
+        for command in commands:
+            location = command.location or "undefined"
+            action = command.command.upper()
+            self.logger.info("%s %s", location, action)
+            if command.command == "enter":
+                enter_location = location
+            elif command.command == "exit":
+                exit_location = location
+
+        if enter_location and exit_location:
+            self.logger.info("%s >>> %s", exit_location, enter_location)
 
     async def _start_server(self) -> None:
         socket_path = self.paths.socket_path
