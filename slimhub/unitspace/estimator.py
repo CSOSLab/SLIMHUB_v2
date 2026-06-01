@@ -6,6 +6,10 @@ from slimhub.config import DEFAULT_LOCATION
 from slimhub.events import CommandEvent, RawDataEvent
 from slimhub.protocol.nus import normalize_mac
 
+ENTER_SIGNALS = {1, 10}
+EXIT_SIGNAL = 20
+NOISE_THRESHOLD_SECONDS = 5.0
+
 
 @dataclass
 class UnitspaceStatus:
@@ -19,26 +23,44 @@ class SimpleUnitspaceEstimator:
         self.status = UnitspaceStatus()
 
     def handle(self, event: RawDataEvent) -> list[CommandEvent]:
-        if event.packet.detected != 1:
+        if event.packet.flag_human_presence != 1:
             return []
 
         address = normalize_mac(event.mac)
         location = event.location or DEFAULT_LOCATION
+        signal = event.packet.detected
 
-        if self.status.last_address is None:
+        if signal in ENTER_SIGNALS:
+            return self._handle_enter(address, location, event.timestamp)
+        if signal == EXIT_SIGNAL:
             self._remember(address, location, event.timestamp)
-            return [CommandEvent(address, "enter", location)]
+            return [CommandEvent(address, "strong_exit", location)]
+
+        return []
+
+    def _handle_enter(
+        self,
+        address: str,
+        location: str,
+        timestamp: float,
+    ) -> list[CommandEvent]:
+        if self.status.last_address is None:
+            self._remember(address, location, timestamp)
+            return [CommandEvent(address, "strong_enter", location)]
 
         if address == self.status.last_address:
-            self._remember(address, location, event.timestamp)
+            if timestamp - self.status.last_timestamp < NOISE_THRESHOLD_SECONDS:
+                self._remember(address, location, timestamp)
+                return []
+            self._remember(address, location, timestamp)
             return []
 
         previous_address = self.status.last_address
         previous_location = self.status.last_location or DEFAULT_LOCATION
-        self._remember(address, location, event.timestamp)
+        self._remember(address, location, timestamp)
         return [
-            CommandEvent(address, "enter", location),
-            CommandEvent(previous_address, "exit", previous_location),
+            CommandEvent(address, "strong_enter", location),
+            CommandEvent(previous_address, "strong_exit", previous_location),
         ]
 
     def snapshot(self) -> dict[str, object]:

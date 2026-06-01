@@ -12,7 +12,6 @@ dependencies = [
 ]
 
 [project.scripts]
-slimhub = "slimhub.cli.app:main"
 slimhub-v2 = "slimhub.cli.app:main"
 
 [tool.setuptools.packages.find]

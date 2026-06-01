@@ -2,7 +2,7 @@
 
 SLIMHUB_v2 is a NUS-only Python daemon for managing multiple `DEAN_NODE_V2`
 BLE peripherals. It focuses on four core jobs: BLE connection management,
-rawdata logging, unitspace estimation, and the `slimhub` CLI.
+rawdata logging, unitspace estimation, and the `slimhub-v2` CLI.
 
 ## Setup
 
@@ -32,30 +32,45 @@ For multi-node debugging, enable logs and give scanning a little more time:
 slimhub-v2 --debug run --scan-timeout 8 --scan-interval 5
 ```
 
+SLIMHUB-compatible flag style is also supported and is the preferred operator
+interface:
+
+```bash
+slimhub-v2 --run
+slimhub-v2 --debug --run --scan-timeout 8 --scan-interval 5
+```
+
 Useful commands from another terminal:
 
 ```bash
-slimhub devices
-slimhub connect --address AA:BB:CC:DD:EE:FF
-slimhub command send --address AA:BB:CC:DD:EE:FF --command enter
-slimhub config set AA:BB:CC:DD:EE:FF location ENTRY
-slimhub raw tail --address AA:BB:CC:DD:EE:FF --lines 20
-slimhub unitspace status
-slimhub stop
+slimhub-v2 --list
+slimhub-v2 --config AA:BB:CC:DD:EE:FF location ENTRY
+slimhub-v2 --apply
+slimhub-v2 --service AA:BB:CC:DD:EE:FF enable inference rawdata
+slimhub-v2 command send --address AA:BB:CC:DD:EE:FF --command strong_enter
+slimhub-v2 raw tail --address AA:BB:CC:DD:EE:FF --lines 20
+slimhub-v2 --quit
 ```
 
-If an old shell alias still points `slimhub` at `/home/hmkang/SLIMHUB/main.py`,
-either remove/comment that alias from `~/.bashrc` and run `hash -r`, or use the
-collision-free console script:
+The legacy subcommands remain available for v2-specific diagnostics:
 
 ```bash
 slimhub-v2 run
 slimhub-v2 devices
+slimhub-v2 connect --address AA:BB:CC:DD:EE:FF
+slimhub-v2 unitspace status
 ```
 
-The daemon listens on `programdata/slimhub.sock`. Device config is stored under
-`programdata/config/<MAC>.json`; rawdata logs are appended to
-`data/<location>/<MAC>/rawdata/YYYY-MM-DD.csv`.
+The daemon listens on `programdata/slimhub.sock`. Hub config is stored at
+`programdata/config.json`. Device config is stored under
+`programdata/config/<MAC>.json` using SLIMHUB-style `address`, `type`, `name`,
+and `location` fields.
+
+Rawdata logs are appended to
+`data/<location>/<type>/<MAC>/inference/rawdata/YYYY-MM-DD.txt`.
+Alert/debug text is appended to
+`data/<location>/<type>/<MAC>/inference/debugstr/YYYY-MM-DD.txt`.
+Runtime logs go to `programdata/logging.log`.
 
 Multiple `DEAN_NODE_V2` peripherals are managed by normalized MAC address. If
 the BLE address and NUS frame MAC differ, SLIMHUB_v2 aliases the frame MAC to the
@@ -75,8 +90,9 @@ Inbound packet types:
 - `ALERT`: UTF-8 text payload
 
 Outbound unitspace commands are sent as `COMMAND` frames to NUS RX. The frame MAC
-is the target node MAC and the payload is a UTF-8 command such as `enter` or
-`exit`.
+is the target node MAC and the payload is a UTF-8 command such as
+`strong_enter` or `strong_exit`. The CLI still accepts `enter` and `exit` as
+aliases for those SLIMHUB-style commands.
 
 ## Compatibility Reader
 

@@ -11,7 +11,7 @@ from pathlib import Path
 from slimhub.ble.central import BleCentral
 from slimhub.ble.registry import DeviceRegistry
 from slimhub.ble.scanner import discover_named_devices
-from slimhub.config import AppPaths, DeviceConfigStore
+from slimhub.config import DEFAULT_DEVICE_TYPE, AppPaths, DeviceConfigStore, HubConfigStore
 from slimhub.events import AlertEvent, CommandEvent, RawDataEvent
 from slimhub.logging import RawDataLogger
 from slimhub.protocol.nus import (
@@ -44,6 +44,7 @@ class SlimHubDaemon:
         self.logger = logger or logging.getLogger(__name__)
 
         self.config_store = DeviceConfigStore(paths)
+        self.hub_config_store = HubConfigStore(paths)
         self.raw_logger = RawDataLogger(paths)
         self.estimator = SimpleUnitspaceEstimator()
         self.registry = DeviceRegistry()
@@ -60,6 +61,7 @@ class SlimHubDaemon:
 
     async def run(self, *, address: str | None = None, scan: bool = True) -> None:
         self.paths.ensure()
+        self.hub_config_store.load_or_create()
         await self.raw_logger.start()
         await self._start_server()
 
@@ -90,14 +92,17 @@ class SlimHubDaemon:
     async def connect_address(self, address: str) -> dict[str, object]:
         normalized = normalize_mac(address)
         session = await self.central.ensure_address(normalized)
-        self.config_store.save(self.config_store.load(normalized))
+        self.config_store.ensure(normalized, device_type=session.name or DEFAULT_DEVICE_TYPE)
         return session.status()
 
     async def send_command(self, address: object, command: object) -> dict[str, object]:
         if not isinstance(address, str) or not address:
             raise ValueError("address is required")
         if not isinstance(command, str):
-            raise ValueError("command must be one of: enter, exit")
+            raise ValueError(
+                "command must be one of: strong_enter, strong_exit, weak_enter, "
+                "weak_exit, default_action, enter, exit"
+            )
 
         normalized_address = normalize_mac(address)
         validated_command = validate_command(command)
@@ -122,6 +127,60 @@ class SlimHubDaemon:
             "session": session.status(),
         }
 
+    async def apply_config(self) -> str:
+        for config in self.config_store.list_all():
+            session = await self.registry.get(config.address)
+            if session is not None:
+                session.name = config.name or session.name
+        return "Config data applied"
+
+    async def service_command(
+        self,
+        address: object,
+        action: object,
+        service: object,
+        characteristic: object | None = None,
+    ) -> str:
+        normalized_address = normalize_mac(str(address))
+        session = await self.registry.get(normalized_address)
+        if session is None:
+            return f"{normalized_address} is not registered"
+        if not session.status().get("connected", False):
+            return f"{normalized_address} is not connected"
+
+        action_text = str(action)
+        service_text = str(service)
+        characteristic_text = str(characteristic) if characteristic is not None else ""
+
+        if action_text == "enable":
+            return (
+                f"{normalized_address}: characteristic {service_text} "
+                f"{characteristic_text} enabled"
+            )
+        if action_text == "disable":
+            return (
+                f"{normalized_address}: characteristic {service_text} "
+                f"{characteristic_text} disabled"
+            )
+        if action_text == "activate":
+            return f"{normalized_address}: service {service_text} activated"
+        if action_text == "deactivate":
+            return f"{normalized_address}: service {service_text} deactivated"
+        raise ValueError("service action must be enable, disable, activate or deactivate")
+
+    async def unsupported_device_command(
+        self,
+        address: object,
+        command_name: str,
+        detail: str = "",
+    ) -> str:
+        normalized_address = normalize_mac(str(address))
+        session = await self.registry.get(normalized_address)
+        if session is None:
+            return f"{normalized_address} is not registered"
+        suffix = f" {detail}" if detail else ""
+        return f"{command_name}{suffix} is not supported by SLIMHUB_v2 NUS-only daemon"
+
     async def handle_frame(self, source_address: str, frame: ParsedFrame) -> None:
         await self.registry.register_alias(frame.mac, source_address)
         if isinstance(frame.parsed, RawDataPacket):
@@ -133,6 +192,7 @@ class SlimHubDaemon:
                 location=config.location,
                 packet=frame.parsed,
                 payload=frame.payload,
+                device_type=config.type,
             )
             await self.raw_logger.log(event)
             sent_commands = []
@@ -157,6 +217,7 @@ class SlimHubDaemon:
                     location=config.location,
                     packet=frame.parsed,
                     payload=frame.payload,
+                    device_type=config.type,
                 )
             )
 
@@ -182,7 +243,11 @@ class SlimHubDaemon:
     async def _start_or_update_session(self, target: object) -> None:
         address = normalize_mac(str(getattr(target, "address")))
         await self.central.ensure_target(target)
-        self.config_store.save(self.config_store.load(address))
+        self.config_store.ensure(
+            address,
+            device_type=str(getattr(target, "name", "") or DEFAULT_DEVICE_TYPE),
+            name=str(getattr(target, "name", "") or ""),
+        )
 
     async def _connected_session_count(self) -> int:
         statuses = await self.registry.list_status()
@@ -198,9 +263,9 @@ class SlimHubDaemon:
             location = command.location or "undefined"
             action = command.command.upper()
             self.logger.info("%s %s", location, action)
-            if command.command == "enter":
+            if command.command.endswith("enter"):
                 enter_location = location
-            elif command.command == "exit":
+            elif command.command.endswith("exit"):
                 exit_location = location
 
         if enter_location and exit_location:
@@ -264,6 +329,51 @@ class SlimHubDaemon:
                 str(args["value"]),
             )
             return self._ok(config.__dict__)
+        if command == "config.apply":
+            return self._ok(await self.apply_config())
+        if command == "hub.config.set":
+            config = self.hub_config_store.set_field(
+                str(args["field"]),
+                str(args["value"]),
+            )
+            return self._ok(config.__dict__)
+        if command == "service":
+            return self._ok(
+                await self.service_command(
+                    args.get("address"),
+                    args.get("action"),
+                    args.get("service"),
+                    args.get("characteristic"),
+                )
+            )
+        if command == "reset":
+            return self._ok(
+                await self.unsupported_device_command(args.get("address"), "Reset")
+            )
+        if command == "model":
+            return self._ok(
+                await self.unsupported_device_command(
+                    args.get("address"),
+                    "Model",
+                    str(args.get("model_command", "")),
+                )
+            )
+        if command == "feature":
+            return self._ok(
+                await self.unsupported_device_command(
+                    args.get("address"),
+                    "Feature collection",
+                    str(args.get("feature_command", "")),
+                )
+            )
+        if command == "file":
+            return self._ok(
+                await self.unsupported_device_command(
+                    args.get("address"),
+                    "File transfer",
+                    str(args.get("file_path", "")),
+                )
+            )
         if command == "unitspace.status":
             return self._ok(self.estimator.snapshot())
         if command == "raw.tail":
@@ -282,6 +392,7 @@ class SlimHubDaemon:
                 {
                     "address": canonical,
                     "name": "",
+                    "type": DEFAULT_DEVICE_TYPE,
                     "connected": False,
                     "last_seen": 0.0,
                     "last_error": None,
@@ -290,6 +401,7 @@ class SlimHubDaemon:
             )
             status["packet_address"] = config.address
             status["configured_name"] = config.name
+            status["type"] = config.type
             status["location"] = config.location
         return list(statuses.values())
 
@@ -303,9 +415,9 @@ class SlimHubDaemon:
 
     def _raw_files(self, address: str | None) -> list[Path]:
         if address is None:
-            return list(self.paths.data_dir.glob("*/*/rawdata/*.csv"))
+            return list(self.paths.data_dir.glob("*/*/*/inference/rawdata/*.txt"))
         mac = normalize_mac(address)
-        return list(self.paths.data_dir.glob(f"*/{mac}/rawdata/*.csv"))
+        return list(self.paths.data_dir.glob(f"*/*/{mac}/inference/rawdata/*.txt"))
 
     async def _wait_or_stop(self, delay_seconds: float) -> None:
         with suppress(asyncio.TimeoutError):

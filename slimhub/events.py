@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from slimhub.config import DEFAULT_DEVICE_TYPE
 from slimhub.protocol.nus import AlertPacket, RawDataPacket
 
 
@@ -12,6 +13,7 @@ class RawDataEvent:
     location: str
     packet: RawDataPacket
     payload: bytes
+    device_type: str = DEFAULT_DEVICE_TYPE
 
 
 @dataclass(frozen=True)
@@ -21,6 +23,7 @@ class AlertEvent:
     location: str
     packet: AlertPacket
     payload: bytes
+    device_type: str = DEFAULT_DEVICE_TYPE
 
 
 @dataclass(frozen=True)

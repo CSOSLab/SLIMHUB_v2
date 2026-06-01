@@ -44,14 +44,16 @@ class RawLoggerTests(unittest.IsolatedAsyncioTestCase):
                 Path(tmpdir)
                 / "data"
                 / "undefined"
+                / "DEAN_NODE_V2"
                 / "AA:BB:CC:DD:EE:FF"
+                / "inference"
                 / "rawdata"
-                / "1970-01-01.csv"
+                / "1970-01-01.txt"
             )
             lines = path.read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(lines), 3)
-            self.assertIn("timestamp,mac,location", lines[0])
-            self.assertEqual(lines[1].count("AA:BB:CC:DD:EE:FF"), 1)
+            self.assertTrue(lines[0].startswith("time,GridEye,Direction"))
+            self.assertIn(",1,1,0,0.00,0,0,0,0,0,", lines[1])
 
     async def test_alert_logger_writes_data_directory_without_rawdata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -71,13 +73,14 @@ class RawLoggerTests(unittest.IsolatedAsyncioTestCase):
                 Path(tmpdir)
                 / "data"
                 / "ENTRY"
+                / "DEAN_NODE_V2"
                 / "AA:BB:CC:DD:EE:FF"
-                / "alert"
-                / "1970-01-01.csv"
+                / "inference"
+                / "debugstr"
+                / "1970-01-01.txt"
             )
             lines = path.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(lines[0], "timestamp,mac,location,message")
-            self.assertTrue(lines[1].endswith(",ready"))
+            self.assertTrue(lines[0].endswith(",ready"))
 
 
 if __name__ == "__main__":

@@ -2,37 +2,42 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import json
 from datetime import datetime
 from pathlib import Path
 
-from slimhub.config import DEFAULT_LOCATION, AppPaths
+from slimhub.config import DEFAULT_DEVICE_TYPE, DEFAULT_LOCATION, AppPaths
 from slimhub.events import AlertEvent, RawDataEvent
 from slimhub.protocol.nus import normalize_mac
 
 
+SOUND_CLASSLIST = [
+    "background",
+    "hitting",
+    "speech_tv",
+    "air_appliances",
+    "brushing",
+    "peeing",
+    "flushing",
+    "flush_end",
+    "microwave",
+    "cooking",
+    "watering_low",
+    "watering_high",
+]
+
 CSV_FIELDS = [
-    "timestamp",
-    "mac",
-    "location",
-    "flag_human_presence",
-    "detected",
-    "flag_env",
-    "temperature_c",
-    "humidity",
+    "time",
+    "GridEye",
+    "Direction",
+    "ENV",
+    "temp",
+    "humid",
     "iaq",
     "eco2",
     "bvoc",
-    "accuracy",
-    "flag_sound",
-    *[f"sound_{idx}" for idx in range(16)],
-    "is_pir_human_detection_event",
-]
-
-ALERT_CSV_FIELDS = [
-    "timestamp",
-    "mac",
-    "location",
-    "message",
+    "SOUND",
+    *SOUND_CLASSLIST,
 ]
 
 
@@ -89,68 +94,71 @@ class RawDataLogger:
     async def write_alert(self, event: AlertEvent) -> None:
         path = self._alert_path_for(event)
         path.parent.mkdir(parents=True, exist_ok=True)
-        needs_header = not path.exists() or path.stat().st_size == 0
-        with path.open("a", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=ALERT_CSV_FIELDS)
-            if needs_header:
-                writer.writeheader()
-            writer.writerow(self._alert_row_for(event))
+        with path.open("a", encoding="utf-8") as f:
+            f.write(self._alert_line_for(event) + "\n")
 
     def _path_for(self, event: RawDataEvent) -> Path:
         timestamp = datetime.fromtimestamp(event.timestamp)
         location = event.location or DEFAULT_LOCATION
         mac = normalize_mac(event.mac)
+        device_type = event.device_type or DEFAULT_DEVICE_TYPE
         return (
             self.paths.data_dir
             / location
+            / device_type
             / mac
+            / "inference"
             / "rawdata"
-            / f"{timestamp.strftime('%Y-%m-%d')}.csv"
+            / f"{timestamp.strftime('%Y-%m-%d')}.txt"
         )
 
     def _alert_path_for(self, event: AlertEvent) -> Path:
         timestamp = datetime.fromtimestamp(event.timestamp)
         location = event.location or DEFAULT_LOCATION
         mac = normalize_mac(event.mac)
+        device_type = event.device_type or DEFAULT_DEVICE_TYPE
         return (
             self.paths.data_dir
             / location
+            / device_type
             / mac
-            / "alert"
-            / f"{timestamp.strftime('%Y-%m-%d')}.csv"
+            / "inference"
+            / "debugstr"
+            / f"{timestamp.strftime('%Y-%m-%d')}.txt"
         )
 
     def _row_for(self, event: RawDataEvent) -> dict[str, object]:
         timestamp = datetime.fromtimestamp(event.timestamp)
         packet = event.packet
-        sound = list(packet.sound[:16])
-        sound.extend([0] * (16 - len(sound)))
+        sound = list(packet.sound[: len(SOUND_CLASSLIST)])
+        sound.extend([0] * (len(SOUND_CLASSLIST) - len(sound)))
 
         row: dict[str, object] = {
-            "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-            "mac": normalize_mac(event.mac),
-            "location": event.location or DEFAULT_LOCATION,
-            "flag_human_presence": packet.flag_human_presence,
-            "detected": packet.detected,
-            "flag_env": packet.flag_env,
-            "temperature_c": f"{packet.temperature_c:.2f}",
-            "humidity": packet.humidity,
+            "time": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            "GridEye": packet.flag_human_presence,
+            "Direction": packet.detected,
+            "ENV": packet.flag_env,
+            "temp": f"{packet.temperature_c:.2f}",
+            "humid": packet.humidity,
             "iaq": packet.iaq,
             "eco2": packet.eco2,
             "bvoc": packet.bvoc,
-            "accuracy": packet.accuracy,
-            "flag_sound": packet.flag_sound,
-            "is_pir_human_detection_event": int(packet.is_pir_human_detection_event),
+            "SOUND": packet.flag_sound,
         }
-        for idx, value in enumerate(sound):
-            row[f"sound_{idx}"] = value
+        for label, value in zip(SOUND_CLASSLIST, sound):
+            row[label] = (value + 128) / 256
         return row
 
-    def _alert_row_for(self, event: AlertEvent) -> dict[str, object]:
+    def _alert_line_for(self, event: AlertEvent) -> str:
         timestamp = datetime.fromtimestamp(event.timestamp)
-        return {
-            "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-            "mac": normalize_mac(event.mac),
-            "location": event.location or DEFAULT_LOCATION,
-            "message": event.packet.message,
-        }
+        timestamp_text = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            payload = json.loads(event.packet.message)
+        except json.JSONDecodeError:
+            line = event.packet.message.rstrip("\n")
+            return f"{timestamp_text},{line}"
+
+        if isinstance(payload, dict):
+            payload["timestamp"] = timestamp_text
+            return json.dumps(payload, ensure_ascii=False)
+        return f"{timestamp_text},{event.packet.message.rstrip()}"

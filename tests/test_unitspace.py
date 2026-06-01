@@ -32,7 +32,7 @@ class UnitspaceTests(unittest.TestCase):
         commands = estimator.handle(make_event("AA:BB:CC:DD:EE:01", "ENTRY", 10.0))
 
         self.assertEqual(len(commands), 1)
-        self.assertEqual(commands[0].command, "enter")
+        self.assertEqual(commands[0].command, "strong_enter")
         self.assertEqual(commands[0].address, "AA:BB:CC:DD:EE:01")
 
     def test_same_address_noise_is_ignored(self) -> None:
@@ -50,10 +50,21 @@ class UnitspaceTests(unittest.TestCase):
 
         commands = estimator.handle(make_event("AA:BB:CC:DD:EE:02", "LIVING", 12.0))
 
-        self.assertEqual([command.command for command in commands], ["enter", "exit"])
+        self.assertEqual(
+            [command.command for command in commands],
+            ["strong_enter", "strong_exit"],
+        )
         self.assertEqual(commands[0].address, "AA:BB:CC:DD:EE:02")
         self.assertEqual(commands[1].address, "AA:BB:CC:DD:EE:01")
         self.assertEqual(commands[1].location, "ENTRY")
+
+    def test_exit_signal_sends_strong_exit(self) -> None:
+        estimator = SimpleUnitspaceEstimator()
+
+        commands = estimator.handle(make_event("AA:BB:CC:DD:EE:01", "ENTRY", 10.0, detected=20))
+
+        self.assertEqual([command.command for command in commands], ["strong_exit"])
+        self.assertEqual(estimator.snapshot()["last_address"], "AA:BB:CC:DD:EE:01")
 
     def test_non_detected_rawdata_does_not_change_state(self) -> None:
         estimator = SimpleUnitspaceEstimator()
