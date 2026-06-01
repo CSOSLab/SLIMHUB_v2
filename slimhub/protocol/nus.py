@@ -11,6 +11,7 @@ NUS_RX_WRITE_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 NUS_TX_NOTIFY_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
 DEFAULT_DEVICE_NAME = "DEAN_NODE_V2"
+VALID_COMMANDS = ("enter", "exit")
 END_FLAG = b"\x0d\x0a"
 MAC_LEN = 6
 PACKET_TYPE_LEN = 8
@@ -127,8 +128,14 @@ def build_frame(mac: str, packet_type: str, payload: bytes) -> bytes:
     )
 
 
+def validate_command(command: str) -> str:
+    if command not in VALID_COMMANDS:
+        raise ValueError("command must be one of: enter, exit")
+    return command
+
+
 def build_command_frame(mac: str, command: str) -> bytes:
-    return build_frame(mac, "COMMAND", command.encode("utf-8"))
+    return build_frame(mac, "COMMAND", validate_command(command).encode("utf-8"))
 
 
 def parse_rawdata(payload: bytes) -> RawDataPacket:

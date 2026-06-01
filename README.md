@@ -37,6 +37,7 @@ Useful commands from another terminal:
 ```bash
 slimhub devices
 slimhub connect --address AA:BB:CC:DD:EE:FF
+slimhub command send --address AA:BB:CC:DD:EE:FF --command enter
 slimhub config set AA:BB:CC:DD:EE:FF location ENTRY
 slimhub raw tail --address AA:BB:CC:DD:EE:FF --lines 20
 slimhub unitspace status

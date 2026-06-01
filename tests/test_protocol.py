@@ -73,6 +73,10 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(frame[6:14], b"COMMAND\x00")
         self.assertIn(b"enter", frame)
 
+    def test_command_frame_rejects_unknown_command(self) -> None:
+        with self.assertRaisesRegex(ValueError, "command must be one of"):
+            build_command_frame("AA:BB:CC:DD:EE:FF", "stay")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,7 @@ from slimhub.protocol.nus import (
     ParsedFrame,
     RawDataPacket,
     normalize_mac,
+    validate_command,
 )
 from slimhub.unitspace import SimpleUnitspaceEstimator
 
@@ -91,6 +92,35 @@ class SlimHubDaemon:
         session = await self.central.ensure_address(normalized)
         self.config_store.save(self.config_store.load(normalized))
         return session.status()
+
+    async def send_command(self, address: object, command: object) -> dict[str, object]:
+        if not isinstance(address, str) or not address:
+            raise ValueError("address is required")
+        if not isinstance(command, str):
+            raise ValueError("command must be one of: enter, exit")
+
+        normalized_address = normalize_mac(address)
+        validated_command = validate_command(command)
+        session = await self.registry.get(normalized_address)
+        if session is None:
+            raise ValueError(
+                f"no active device session for address: {normalized_address}"
+            )
+
+        config = self.config_store.load(normalized_address)
+        sent = await self.registry.send_command(
+            CommandEvent(normalized_address, validated_command, config.location)
+        )
+        if not sent:
+            raise ValueError(
+                f"no active device session for address: {normalized_address}"
+            )
+
+        return {
+            "address": normalized_address,
+            "command": validated_command,
+            "session": session.status(),
+        }
 
     async def handle_frame(self, source_address: str, frame: ParsedFrame) -> None:
         await self.registry.register_alias(frame.mac, source_address)
@@ -223,6 +253,10 @@ class SlimHubDaemon:
             return self._ok(await self._devices_payload())
         if command == "connect":
             return self._ok(await self.connect_address(str(args["address"])))
+        if command == "command.send":
+            return self._ok(
+                await self.send_command(args.get("address"), args.get("command"))
+            )
         if command == "config.set":
             config = self.config_store.set_field(
                 str(args["address"]),

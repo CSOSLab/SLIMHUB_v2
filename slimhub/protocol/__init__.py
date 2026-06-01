@@ -4,6 +4,7 @@ from slimhub.protocol.nus import (
     PacketParseError,
     ParsedFrame,
     RawDataPacket,
+    VALID_COMMANDS,
     build_command_frame,
     build_frame,
     describe_frame,
@@ -12,6 +13,7 @@ from slimhub.protocol.nus import (
     normalize_mac,
     parse_frame,
     parse_rawdata,
+    validate_command,
 )
 
 __all__ = [
@@ -20,6 +22,7 @@ __all__ = [
     "PacketParseError",
     "ParsedFrame",
     "RawDataPacket",
+    "VALID_COMMANDS",
     "build_command_frame",
     "build_frame",
     "describe_frame",
@@ -28,4 +31,5 @@ __all__ = [
     "normalize_mac",
     "parse_frame",
     "parse_rawdata",
+    "validate_command",
 ]

@@ -8,7 +8,7 @@ import sys
 from collections.abc import Sequence
 
 from slimhub.config import AppPaths
-from slimhub.protocol.nus import DEFAULT_DEVICE_NAME
+from slimhub.protocol.nus import DEFAULT_DEVICE_NAME, VALID_COMMANDS
 from slimhub.cli.client import send_request_sync
 
 
@@ -31,6 +31,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     connect_parser = subparsers.add_parser("connect", help="Connect to a BLE address.")
     connect_parser.add_argument("--address", required=True)
+
+    command_parser = subparsers.add_parser("command", help="Manual NUS commands.")
+    command_subparsers = command_parser.add_subparsers(
+        dest="command_action",
+        required=True,
+    )
+    command_send = command_subparsers.add_parser("send", help="Send a NUS COMMAND.")
+    command_send.add_argument("--address", required=True)
+    command_send.add_argument(
+        "--command",
+        dest="nus_command",
+        choices=VALID_COMMANDS,
+        required=True,
+    )
 
     config_parser = subparsers.add_parser("config", help="Manage local device config.")
     config_subparsers = config_parser.add_subparsers(dest="config_command", required=True)
@@ -95,6 +109,12 @@ def _send(paths: AppPaths, args: argparse.Namespace) -> object:
         return send_request_sync(paths, "devices")
     if args.command == "connect":
         return send_request_sync(paths, "connect", {"address": args.address})
+    if args.command == "command" and args.command_action == "send":
+        return send_request_sync(
+            paths,
+            "command.send",
+            {"address": args.address, "command": args.nus_command},
+        )
     if args.command == "config" and args.config_command == "set":
         return send_request_sync(
             paths,
@@ -120,6 +140,9 @@ def _print_result(args: argparse.Namespace, data: object) -> None:
         for line in (data or {}).get("lines", []):
             print(line)
         return
+    if args.command == "command":
+        _print_command_send(data)
+        return
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
@@ -142,6 +165,18 @@ def _print_devices(data: object) -> None:
             f"{str(item.get('configured_name') or item.get('name') or ''):<20} "
             f"{str(item.get('last_error') or '')}"
         )
+
+
+def _print_command_send(data: object) -> None:
+    payload = data if isinstance(data, dict) else {}
+    session = payload.get("session")
+    session_payload = session if isinstance(session, dict) else {}
+    print(
+        "NUS write queued: "
+        f"command={payload.get('command')} "
+        f"address={payload.get('address')} "
+        f"session={session_payload.get('address')}"
+    )
 
 
 def _setup_logging(debug: bool) -> None:
