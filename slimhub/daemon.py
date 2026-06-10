@@ -22,6 +22,7 @@ from slimhub.protocol.nus import (
     normalize_mac,
     validate_command,
 )
+from slimhub.power_shadow import ShadowPowerState
 from slimhub.unitspace import SimpleUnitspaceEstimator
 
 
@@ -47,11 +48,13 @@ class SlimHubDaemon:
         self.hub_config_store = HubConfigStore(paths)
         self.raw_logger = RawDataLogger(paths)
         self.estimator = SimpleUnitspaceEstimator()
+        self.power_shadow = ShadowPowerState(paths)
         self.registry = DeviceRegistry()
         self.adapter_lock = asyncio.Lock()
         self.central = BleCentral(
             registry=self.registry,
             on_frame=self.handle_frame,
+            on_connection_state=self.handle_connection_state,
             reconnect_delay=self.reconnect_delay,
             adapter_lock=self.adapter_lock,
             logger=self.logger,
@@ -99,10 +102,7 @@ class SlimHubDaemon:
         if not isinstance(address, str) or not address:
             raise ValueError("address is required")
         if not isinstance(command, str):
-            raise ValueError(
-                "command must be one of: strong_enter, strong_exit, weak_enter, "
-                "weak_exit, default_action, enter, exit"
-            )
+            raise ValueError("command must be one of: enter, exit")
 
         normalized_address = normalize_mac(address)
         validated_command = validate_command(command)
@@ -120,6 +120,11 @@ class SlimHubDaemon:
             raise ValueError(
                 f"no active device session for address: {normalized_address}"
             )
+        self.power_shadow.update_command_hint(
+            normalized_address,
+            validated_command,
+            time.time(),
+        )
 
         return {
             "address": normalized_address,
@@ -194,6 +199,7 @@ class SlimHubDaemon:
                 payload=frame.payload,
                 device_type=config.type,
             )
+            self.power_shadow.update_rawdata(frame.mac, frame.parsed, event.timestamp)
             await self.raw_logger.log(event)
             sent_commands = []
             for command in self.estimator.handle(event):
@@ -206,20 +212,36 @@ class SlimHubDaemon:
                     )
                     continue
                 sent_commands.append(command)
+                self.power_shadow.update_command_hint(
+                    command.address,
+                    command.command,
+                    time.time(),
+                )
             self._log_commands(sent_commands)
         elif isinstance(frame.parsed, AlertPacket):
             config = self.config_store.load(frame.mac)
             self.config_store.save(config)
-            await self.raw_logger.log_alert(
-                AlertEvent(
-                    timestamp=time.time(),
-                    mac=frame.mac,
-                    location=config.location,
-                    packet=frame.parsed,
-                    payload=frame.payload,
-                    device_type=config.type,
-                )
+            event = AlertEvent(
+                timestamp=time.time(),
+                mac=frame.mac,
+                location=config.location,
+                packet=frame.parsed,
+                payload=frame.payload,
+                device_type=config.type,
             )
+            self.power_shadow.update_alert(frame.mac, frame.parsed.message, event.timestamp)
+            await self.raw_logger.log_alert(event)
+
+    async def handle_connection_state(
+        self,
+        address: str,
+        connected: bool,
+        timestamp: float,
+    ) -> None:
+        if connected:
+            self.power_shadow.mark_connected(address, timestamp)
+        else:
+            self.power_shadow.mark_disconnected(address, timestamp)
 
     async def _scan_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -376,6 +398,11 @@ class SlimHubDaemon:
             )
         if command == "unitspace.status":
             return self._ok(self.estimator.snapshot())
+        if command == "power.status":
+            address = args.get("address")
+            return self._ok(
+                self.power_shadow.snapshot(str(address)) if address else self.power_shadow.snapshot()
+            )
         if command == "raw.tail":
             address = args.get("address")
             lines = int(args.get("lines", 20))

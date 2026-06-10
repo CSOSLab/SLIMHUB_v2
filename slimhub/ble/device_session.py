@@ -24,6 +24,7 @@ from slimhub.protocol.nus import (
 
 
 FrameHandler = Callable[[str, ParsedFrame], Awaitable[None]]
+ConnectionStateHandler = Callable[[str, bool, float], Awaitable[None]]
 
 
 class DeviceSession:
@@ -32,6 +33,7 @@ class DeviceSession:
         target: object | str,
         *,
         on_frame: FrameHandler,
+        on_connection_state: ConnectionStateHandler | None = None,
         reconnect_delay: float = 3.0,
         adapter_lock: asyncio.Lock | None = None,
         logger: logging.Logger | None = None,
@@ -40,6 +42,7 @@ class DeviceSession:
         self.address = normalize_mac(str(getattr(target, "address", target)))
         self.name = str(getattr(target, "name", "") or "")
         self.on_frame = on_frame
+        self.on_connection_state = on_connection_state
         self.reconnect_delay = reconnect_delay
         self.adapter_lock = adapter_lock or asyncio.Lock()
         self.logger = logger or logging.getLogger(__name__)
@@ -124,6 +127,8 @@ class DeviceSession:
 
                     self.last_error = None
                     self.last_seen = time.time()
+                    if self.on_connection_state is not None:
+                        await self.on_connection_state(self.address, True, self.last_seen)
                     self.logger.info("%s subscribed to NUS TX", self.address)
 
                 command_task = asyncio.create_task(
@@ -179,6 +184,8 @@ class DeviceSession:
                             await client.disconnect()
                 self.connected = False
                 self._client = None
+                if self.on_connection_state is not None:
+                    await self.on_connection_state(self.address, False, time.time())
 
             if not self._stop_event.is_set():
                 self.waiting_for_advertisement = True

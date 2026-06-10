@@ -92,6 +92,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     unitspace_subparsers.add_parser("status", help="Show unitspace estimator status.")
 
+    power_parser = subparsers.add_parser("power", help="Shadow power-state commands.")
+    power_subparsers = power_parser.add_subparsers(
+        dest="power_command",
+        required=True,
+    )
+    power_status = power_subparsers.add_parser("status", help="Show shadow power-state status.")
+    power_status.add_argument("--address")
+
     return parser
 
 
@@ -231,6 +239,8 @@ def _send(paths: AppPaths, args: argparse.Namespace) -> object:
         )
     if args.subcommand == "unitspace" and args.unitspace_command == "status":
         return send_request_sync(paths, "unitspace.status")
+    if args.subcommand == "power" and args.power_command == "status":
+        return send_request_sync(paths, "power.status", {"address": args.address})
     raise RuntimeError("unhandled CLI command")
 
 

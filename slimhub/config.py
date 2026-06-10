@@ -42,7 +42,7 @@ class AppPaths:
 
     @property
     def logs_dir(self) -> Path:
-        return self.programdata_dir
+        return self.base_dir / "logs"
 
     @property
     def socket_path(self) -> Path:

@@ -67,16 +67,17 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(frame.parsed.message, "ready")
 
     def test_command_frame_uses_target_mac_and_command_packet_type(self) -> None:
-        frame = build_command_frame("AA:BB:CC:DD:EE:FF", "strong_enter")
+        frame = build_command_frame("AA:BB:CC:DD:EE:FF", "enter")
 
         self.assertEqual(frame[:6], bytes.fromhex("AABBCCDDEEFF"))
         self.assertEqual(frame[6:14], b"COMMAND\x00")
-        self.assertIn(b"strong_enter", frame)
+        self.assertIn(b"enter", frame)
 
-    def test_command_frame_maps_legacy_enter_to_strong_enter(self) -> None:
-        frame = build_command_frame("AA:BB:CC:DD:EE:FF", "enter")
+    def test_command_frame_maps_legacy_enter_to_enter(self) -> None:
+        frame = build_command_frame("AA:BB:CC:DD:EE:FF", "strong_enter")
 
-        self.assertIn(b"strong_enter", frame)
+        self.assertIn(b"enter", frame)
+        self.assertNotIn(b"strong_enter", frame)
 
     def test_command_frame_rejects_unknown_command(self) -> None:
         with self.assertRaisesRegex(ValueError, "command must be one of"):

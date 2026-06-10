@@ -34,7 +34,7 @@ class SimpleUnitspaceEstimator:
             return self._handle_enter(address, location, event.timestamp)
         if signal == EXIT_SIGNAL:
             self._remember(address, location, event.timestamp)
-            return [CommandEvent(address, "strong_exit", location)]
+            return [CommandEvent(address, "exit", location)]
 
         return []
 
@@ -46,7 +46,7 @@ class SimpleUnitspaceEstimator:
     ) -> list[CommandEvent]:
         if self.status.last_address is None:
             self._remember(address, location, timestamp)
-            return [CommandEvent(address, "strong_enter", location)]
+            return [CommandEvent(address, "enter", location)]
 
         if address == self.status.last_address:
             if timestamp - self.status.last_timestamp < NOISE_THRESHOLD_SECONDS:
@@ -59,8 +59,8 @@ class SimpleUnitspaceEstimator:
         previous_location = self.status.last_location or DEFAULT_LOCATION
         self._remember(address, location, timestamp)
         return [
-            CommandEvent(address, "strong_enter", location),
-            CommandEvent(previous_address, "strong_exit", previous_location),
+            CommandEvent(address, "enter", location),
+            CommandEvent(previous_address, "exit", previous_location),
         ]
 
     def snapshot(self) -> dict[str, object]:

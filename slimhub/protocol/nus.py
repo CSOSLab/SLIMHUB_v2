@@ -12,17 +12,14 @@ NUS_TX_NOTIFY_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
 DEFAULT_DEVICE_NAME = "DEAN_NODE_V2"
 VALID_COMMANDS = (
-    "strong_enter",
-    "strong_exit",
-    "weak_enter",
-    "weak_exit",
-    "default_action",
     "enter",
     "exit",
 )
 COMMAND_ALIASES = {
-    "enter": "strong_enter",
-    "exit": "strong_exit",
+    "strong_enter": "enter",
+    "weak_enter": "enter",
+    "strong_exit": "exit",
+    "weak_exit": "exit",
 }
 END_FLAG = b"\x0d\x0a"
 MAC_LEN = 6
@@ -141,12 +138,10 @@ def build_frame(mac: str, packet_type: str, payload: bytes) -> bytes:
 
 
 def validate_command(command: str) -> str:
-    if command not in VALID_COMMANDS:
-        raise ValueError(
-            "command must be one of: strong_enter, strong_exit, weak_enter, "
-            "weak_exit, default_action, enter, exit"
-        )
-    return COMMAND_ALIASES.get(command, command)
+    normalized = COMMAND_ALIASES.get(command, command)
+    if normalized not in VALID_COMMANDS:
+        raise ValueError("command must be one of: enter, exit")
+    return normalized
 
 
 def build_command_frame(mac: str, command: str) -> bytes:

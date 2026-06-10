@@ -47,7 +47,7 @@ slimhub-v2 --list
 slimhub-v2 --config AA:BB:CC:DD:EE:FF location ENTRY
 slimhub-v2 --apply
 slimhub-v2 --service AA:BB:CC:DD:EE:FF enable inference rawdata
-slimhub-v2 command send --address AA:BB:CC:DD:EE:FF --command strong_enter
+slimhub-v2 command send --address AA:BB:CC:DD:EE:FF --command enter
 slimhub-v2 raw tail --address AA:BB:CC:DD:EE:FF --lines 20
 slimhub-v2 --quit
 ```
@@ -59,6 +59,7 @@ slimhub-v2 run
 slimhub-v2 devices
 slimhub-v2 connect --address AA:BB:CC:DD:EE:FF
 slimhub-v2 unitspace status
+slimhub-v2 power status
 ```
 
 The daemon listens on `programdata/slimhub.sock`. Hub config is stored at
@@ -90,9 +91,31 @@ Inbound packet types:
 - `ALERT`: UTF-8 text payload
 
 Outbound unitspace commands are sent as `COMMAND` frames to NUS RX. The frame MAC
-is the target node MAC and the payload is a UTF-8 command such as
-`strong_enter` or `strong_exit`. The CLI still accepts `enter` and `exit` as
-aliases for those SLIMHUB-style commands.
+is the target node MAC and the payload is a UTF-8 command: `enter` or `exit`.
+Older operator vocabulary such as `strong_enter`, `weak_enter`, `strong_exit`,
+and `weak_exit` is normalized before frame construction, so nonstandard command
+payloads are not written over NUS.
+
+## Shadow Power State
+
+SLIMHUB_v2 keeps an RPI5-side shadow power-state simulation for each DEAN node.
+It uses RAWDATA human-presence fields, conservative ALERT/debug parsing for
+PIR/RADAR/MIC tokens, local `enter`/`exit` command hints, and BLE
+connection/disconnection timestamps. This is logging and visibility only; it
+does not send new power-control commands to the ESP32.
+
+Shadow transitions are appended to `programdata/power_shadow.log` as JSON lines.
+Current state can be queried with:
+
+```bash
+slimhub-v2 power status
+slimhub-v2 power status --address AA:BB:CC:DD:EE:FF
+```
+
+The current NUS payloads may not always expose MIC RMS or RADAR distance. For
+more accurate simulation later, DEAN Node ALERT text should include stable
+fields such as `RADAR presence active: dist_cm=<number>` and
+`MIC activity active: rms=<number>`.
 
 ## Compatibility Reader
 
