@@ -19,8 +19,10 @@ from slimhub.protocol.nus import (
     AlertPacket,
     ParsedFrame,
     RawDataPacket,
+    ReportPacket,
+    VALID_COMMANDS,
     normalize_mac,
-    validate_command,
+    validate_command_payload,
 )
 from slimhub.power_shadow import ShadowPowerState
 from slimhub.unitspace import SimpleUnitspaceEstimator
@@ -102,10 +104,12 @@ class SlimHubDaemon:
         if not isinstance(address, str) or not address:
             raise ValueError("address is required")
         if not isinstance(command, str):
-            raise ValueError("command must be one of: enter, exit")
+            raise ValueError(
+                "command must be one of: enter, exit, record, record:<seconds>, record_stop"
+            )
 
         normalized_address = normalize_mac(address)
-        validated_command = validate_command(command)
+        validated_command = validate_command_payload(command)
         session = await self.registry.get(normalized_address)
         if session is None:
             raise ValueError(
@@ -120,11 +124,12 @@ class SlimHubDaemon:
             raise ValueError(
                 f"no active device session for address: {normalized_address}"
             )
-        self.power_shadow.update_command_hint(
-            normalized_address,
-            validated_command,
-            time.time(),
-        )
+        if validated_command in VALID_COMMANDS:
+            self.power_shadow.update_command_hint(
+                normalized_address,
+                validated_command,
+                time.time(),
+            )
 
         return {
             "address": normalized_address,
@@ -231,6 +236,10 @@ class SlimHubDaemon:
             )
             self.power_shadow.update_alert(frame.mac, frame.parsed.message, event.timestamp)
             await self.raw_logger.log_alert(event)
+        elif isinstance(frame.parsed, ReportPacket):
+            config = self.config_store.load(frame.mac)
+            self.config_store.save(config)
+            self._log_report(frame)
 
     async def handle_connection_state(
         self,
@@ -292,6 +301,21 @@ class SlimHubDaemon:
 
         if enter_location and exit_location:
             self.logger.info("%s >>> %s", exit_location, enter_location)
+
+    def _log_report(self, frame: ParsedFrame) -> None:
+        report = frame.parsed
+        if not isinstance(report, ReportPacket):
+            return
+        if report.fields.get("src") != "SOUND":
+            self.logger.debug("REPORT mac=%s payload=%r", frame.mac, report.message)
+            return
+
+        details = " ".join(
+            f"{key}={value}"
+            for key in ("event", "path", "max_ms", "bytes", "dropped", "reason", "err")
+            if (value := report.fields.get(key))
+        )
+        self.logger.info("SOUND report mac=%s %s", frame.mac, details or report.message)
 
     async def _start_server(self) -> None:
         socket_path = self.paths.socket_path

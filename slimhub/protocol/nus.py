@@ -15,6 +15,10 @@ VALID_COMMANDS = (
     "enter",
     "exit",
 )
+RECORD_COMMAND = "record"
+RECORD_STOP_COMMAND = "record_stop"
+MIN_RECORD_SECONDS = 1
+MAX_RECORD_SECONDS = 300
 COMMAND_ALIASES = {
     "strong_enter": "enter",
     "weak_enter": "enter",
@@ -57,13 +61,19 @@ class AlertPacket:
 
 
 @dataclass(frozen=True)
+class ReportPacket:
+    message: str
+    fields: dict[str, str]
+
+
+@dataclass(frozen=True)
 class ParsedFrame:
     mac: str
     mac_bytes: bytes
     packet_type: str
     packet_length: int
     payload: bytes
-    parsed: RawDataPacket | AlertPacket
+    parsed: RawDataPacket | AlertPacket | ReportPacket
 
 
 class FrameAssembler:
@@ -144,8 +154,38 @@ def validate_command(command: str) -> str:
     return normalized
 
 
+def validate_record_seconds(seconds: int) -> int:
+    if isinstance(seconds, bool) or not isinstance(seconds, int):
+        raise ValueError("record seconds must be an integer from 1 to 300")
+    if seconds < MIN_RECORD_SECONDS or seconds > MAX_RECORD_SECONDS:
+        raise ValueError("record seconds must be an integer from 1 to 300")
+    return seconds
+
+
+def build_record_command(seconds: int | None = None) -> str:
+    if seconds is None:
+        return RECORD_COMMAND
+    return f"{RECORD_COMMAND}:{validate_record_seconds(seconds)}"
+
+
+def validate_command_payload(command: str) -> str:
+    normalized = COMMAND_ALIASES.get(command, command)
+    if normalized in VALID_COMMANDS or normalized in (RECORD_COMMAND, RECORD_STOP_COMMAND):
+        return normalized
+    if normalized.startswith(f"{RECORD_COMMAND}:"):
+        seconds_text = normalized[len(RECORD_COMMAND) + 1 :]
+        try:
+            seconds = int(seconds_text, 10)
+        except ValueError as exc:
+            raise ValueError("record seconds must be an integer from 1 to 300") from exc
+        return build_record_command(seconds)
+    raise ValueError(
+        "command must be one of: enter, exit, record, record:<seconds>, record_stop"
+    )
+
+
 def build_command_frame(mac: str, command: str) -> bytes:
-    return build_frame(mac, "COMMAND", validate_command(command).encode("utf-8"))
+    return build_frame(mac, "COMMAND", validate_command_payload(command).encode("utf-8"))
 
 
 def parse_rawdata(payload: bytes) -> RawDataPacket:
@@ -205,6 +245,16 @@ def parse_alert(payload: bytes) -> AlertPacket:
     return AlertPacket(message=payload.decode("utf-8", errors="replace"))
 
 
+def parse_report(payload: bytes) -> ReportPacket:
+    message = payload.decode("utf-8", errors="replace")
+    fields = {}
+    for part in message.split(","):
+        key, separator, value = part.partition("=")
+        if separator:
+            fields[key.strip()] = value.strip()
+    return ReportPacket(message=message, fields=fields)
+
+
 def parse_frame(data: bytes) -> ParsedFrame:
     if len(data) < HEADER_LEN + END_FLAG_LEN:
         raise PacketParseError(
@@ -241,9 +291,11 @@ def parse_frame(data: bytes) -> ParsedFrame:
     mac = ":".join(f"{byte:02X}" for byte in mac_bytes)
 
     if packet_type == "RAWDATA":
-        parsed: RawDataPacket | AlertPacket = parse_rawdata(payload)
+        parsed: RawDataPacket | AlertPacket | ReportPacket = parse_rawdata(payload)
     elif packet_type == "ALERT":
         parsed = parse_alert(payload)
+    elif packet_type == "REPORT":
+        parsed = parse_report(payload)
     else:
         raise PacketParseError(f"unknown packet type: {packet_type!r}")
 
@@ -267,6 +319,12 @@ def describe_frame(frame: ParsedFrame) -> str:
     if isinstance(parsed, AlertPacket):
         return (
             f"ALERT mac={frame.mac} length={frame.packet_length} "
+            f"message={parsed.message!r}"
+        )
+
+    if isinstance(parsed, ReportPacket):
+        return (
+            f"REPORT mac={frame.mac} length={frame.packet_length} "
             f"message={parsed.message!r}"
         )
 

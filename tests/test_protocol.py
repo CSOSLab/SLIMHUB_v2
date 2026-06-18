@@ -8,13 +8,20 @@ from slimhub.protocol.nus import (
     FrameAssembler,
     PacketParseError,
     RawDataPacket,
+    ReportPacket,
     build_command_frame,
     build_frame,
+    build_record_command,
     parse_frame,
 )
 
 
 class ProtocolTests(unittest.TestCase):
+    def command_payload(self, command: str) -> bytes:
+        frame = build_command_frame("AA:BB:CC:DD:EE:FF", command)
+        payload_len = int.from_bytes(frame[14:16], byteorder="little")
+        return frame[16 : 16 + payload_len]
+
     def test_assembler_handles_split_frames(self) -> None:
         frame = build_frame("AA:BB:CC:DD:EE:FF", "ALERT", b"hello")
         assembler = FrameAssembler()
@@ -66,6 +73,16 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(frame.packet_type, "ALERT")
         self.assertEqual(frame.parsed.message, "ready")
 
+    def test_sound_report_frame_parses_key_value_payload(self) -> None:
+        payload = b"src=SOUND,event=RECORD_START,path=SOUND/001.wav,max_ms=30000"
+        frame = parse_frame(build_frame("AA:BB:CC:DD:EE:FF", "REPORT", payload))
+
+        self.assertIsInstance(frame.parsed, ReportPacket)
+        self.assertEqual(frame.packet_type, "REPORT")
+        self.assertEqual(frame.parsed.fields["src"], "SOUND")
+        self.assertEqual(frame.parsed.fields["event"], "RECORD_START")
+        self.assertEqual(frame.parsed.fields["path"], "SOUND/001.wav")
+
     def test_command_frame_uses_target_mac_and_command_packet_type(self) -> None:
         frame = build_command_frame("AA:BB:CC:DD:EE:FF", "enter")
 
@@ -73,11 +90,35 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(frame[6:14], b"COMMAND\x00")
         self.assertIn(b"enter", frame)
 
+    def test_exit_command_frame_builds_exit_payload(self) -> None:
+        self.assertEqual(self.command_payload("exit"), b"exit")
+
     def test_command_frame_maps_legacy_enter_to_enter(self) -> None:
         frame = build_command_frame("AA:BB:CC:DD:EE:FF", "strong_enter")
 
         self.assertIn(b"enter", frame)
         self.assertNotIn(b"strong_enter", frame)
+
+    def test_record_command_frame_builds_record_payload(self) -> None:
+        self.assertEqual(self.command_payload("record"), b"record")
+
+    def test_record_seconds_command_frame_builds_duration_payload(self) -> None:
+        self.assertEqual(
+            self.command_payload(build_record_command(15)),
+            b"record:15",
+        )
+
+    def test_record_stop_command_frame_builds_stop_payload(self) -> None:
+        self.assertEqual(self.command_payload("record_stop"), b"record_stop")
+
+    def test_record_seconds_rejects_invalid_values(self) -> None:
+        for command in ("record:0", "record:301", "record:abc"):
+            with self.subTest(command=command):
+                with self.assertRaisesRegex(ValueError, "record seconds"):
+                    build_command_frame("AA:BB:CC:DD:EE:FF", command)
+
+        with self.assertRaisesRegex(ValueError, "record seconds"):
+            build_record_command(0)
 
     def test_command_frame_rejects_unknown_command(self) -> None:
         with self.assertRaisesRegex(ValueError, "command must be one of"):

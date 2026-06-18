@@ -9,7 +9,14 @@ from collections.abc import Sequence
 
 from slimhub.cli.client import send_request_sync
 from slimhub.config import AppPaths, HubConfigStore
-from slimhub.protocol.nus import DEFAULT_DEVICE_NAME, VALID_COMMANDS
+from slimhub.protocol.nus import (
+    DEFAULT_DEVICE_NAME,
+    MAX_RECORD_SECONDS,
+    MIN_RECORD_SECONDS,
+    RECORD_STOP_COMMAND,
+    VALID_COMMANDS,
+    build_record_command,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -71,6 +78,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=VALID_COMMANDS,
         required=True,
     )
+    command_record = command_subparsers.add_parser(
+        "record",
+        help="Start DEAN Node sound recording.",
+    )
+    command_record.add_argument("--address", required=True)
+    command_record.add_argument("--seconds", type=_record_seconds)
+    command_record_stop = command_subparsers.add_parser(
+        "record-stop",
+        help="Stop DEAN Node sound recording.",
+    )
+    command_record_stop.add_argument("--address", required=True)
 
     config_parser = subparsers.add_parser("config", help="Manage local device config.")
     config_subparsers = config_parser.add_subparsers(dest="config_command", required=True)
@@ -225,6 +243,18 @@ def _send(paths: AppPaths, args: argparse.Namespace) -> object:
             "command.send",
             {"address": args.address, "command": args.nus_command},
         )
+    if args.subcommand == "command" and args.command_action == "record":
+        return send_request_sync(
+            paths,
+            "command.send",
+            {"address": args.address, "command": build_record_command(args.seconds)},
+        )
+    if args.subcommand == "command" and args.command_action == "record-stop":
+        return send_request_sync(
+            paths,
+            "command.send",
+            {"address": args.address, "command": RECORD_STOP_COMMAND},
+        )
     if args.subcommand == "config" and args.config_command == "set":
         return send_request_sync(
             paths,
@@ -287,6 +317,20 @@ def _print_command_send(data: object) -> None:
         f"address={payload.get('address')} "
         f"session={session_payload.get('address')}"
     )
+
+
+def _record_seconds(value: str) -> int:
+    try:
+        seconds = int(value, 10)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"seconds must be an integer from {MIN_RECORD_SECONDS} to {MAX_RECORD_SECONDS}"
+        ) from exc
+    if seconds < MIN_RECORD_SECONDS or seconds > MAX_RECORD_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"seconds must be an integer from {MIN_RECORD_SECONDS} to {MAX_RECORD_SECONDS}"
+        )
+    return seconds
 
 
 def _setup_logging(debug: bool, paths: AppPaths) -> None:
