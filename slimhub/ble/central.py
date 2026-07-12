@@ -19,11 +19,15 @@ class BleCentral:
         adapter_lock: asyncio.Lock,
         logger: logging.Logger,
         on_connection_state: ConnectionStateHandler | None = None,
+        connect_timeout: float = 10.0,
+        notify_timeout: float = 5.0,
     ) -> None:
         self.registry = registry
         self.on_frame = on_frame
         self.on_connection_state = on_connection_state
         self.reconnect_delay = reconnect_delay
+        self.connect_timeout = connect_timeout
+        self.notify_timeout = notify_timeout
         self.adapter_lock = adapter_lock
         self.logger = logger
 
@@ -39,6 +43,8 @@ class BleCentral:
                 on_frame=self.on_frame,
                 on_connection_state=self.on_connection_state,
                 reconnect_delay=self.reconnect_delay,
+                connect_timeout=self.connect_timeout,
+                notify_timeout=self.notify_timeout,
                 adapter_lock=self.adapter_lock,
                 logger=self.logger,
             )

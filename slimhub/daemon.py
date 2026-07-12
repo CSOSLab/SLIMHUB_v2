@@ -12,7 +12,14 @@ from slimhub.ble.central import BleCentral
 from slimhub.ble.registry import DeviceRegistry
 from slimhub.ble.scanner import discover_named_devices
 from slimhub.config import DEFAULT_DEVICE_TYPE, AppPaths, DeviceConfigStore, HubConfigStore
-from slimhub.events import AlertEvent, CommandEvent, RawDataEvent
+from slimhub.events import (
+    AlertEvent,
+    CommandEvent,
+    ConnectionStateEvent,
+    RawDataEvent,
+    ReportEvent,
+    UnitspaceSignalEvent,
+)
 from slimhub.logging import RawDataLogger
 from slimhub.protocol.nus import (
     DEFAULT_DEVICE_NAME,
@@ -25,7 +32,26 @@ from slimhub.protocol.nus import (
     validate_command_payload,
 )
 from slimhub.power_shadow import ShadowPowerState
-from slimhub.unitspace import SimpleUnitspaceEstimator
+from slimhub.unitspace.estimator import SimpleUnitspaceEstimator, inout_report_action
+
+
+STRUCTURED_REPORT_SOURCES = {"POWER", "INOUT", "ENV", "USD"}
+USD_STATUS_FIELDS = (
+    "batt_mv",
+    "batt_v",
+    "batt_pct",
+    "batt_rem_mah",
+    "batt_cap_mah",
+    "batt_valid",
+    "usb",
+    "chg",
+    "sd",
+    "file",
+    "uptime",
+    "ok",
+)
+DEFAULT_CONNECT_TIMEOUT = 10.0
+DEFAULT_NOTIFY_TIMEOUT = 5.0
 
 
 class SlimHubDaemon:
@@ -37,6 +63,8 @@ class SlimHubDaemon:
         scan_timeout: float = 5.0,
         scan_interval: float = 10.0,
         reconnect_delay: float = 3.0,
+        connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+        notify_timeout: float = DEFAULT_NOTIFY_TIMEOUT,
         logger: logging.Logger | None = None,
     ) -> None:
         self.paths = paths
@@ -44,6 +72,8 @@ class SlimHubDaemon:
         self.scan_timeout = scan_timeout
         self.scan_interval = scan_interval
         self.reconnect_delay = reconnect_delay
+        self.connect_timeout = connect_timeout
+        self.notify_timeout = notify_timeout
         self.logger = logger or logging.getLogger(__name__)
 
         self.config_store = DeviceConfigStore(paths)
@@ -52,12 +82,15 @@ class SlimHubDaemon:
         self.estimator = SimpleUnitspaceEstimator()
         self.power_shadow = ShadowPowerState(paths)
         self.registry = DeviceRegistry()
+        self.battery_status: dict[str, dict[str, object]] = {}
         self.adapter_lock = asyncio.Lock()
         self.central = BleCentral(
             registry=self.registry,
             on_frame=self.handle_frame,
             on_connection_state=self.handle_connection_state,
             reconnect_delay=self.reconnect_delay,
+            connect_timeout=self.connect_timeout,
+            notify_timeout=self.notify_timeout,
             adapter_lock=self.adapter_lock,
             logger=self.logger,
         )
@@ -69,6 +102,15 @@ class SlimHubDaemon:
         self.hub_config_store.load_or_create()
         await self.raw_logger.start()
         await self._start_server()
+        self.logger.info(
+            "BLE scan settings name=%s scan_timeout=%.1fs scan_interval=%.1fs "
+            "connect_timeout=%.1fs notify_timeout=%.1fs",
+            self.device_name,
+            self.scan_timeout,
+            self.scan_interval,
+            self.connect_timeout,
+            self.notify_timeout,
+        )
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -196,49 +238,85 @@ class SlimHubDaemon:
         if isinstance(frame.parsed, RawDataPacket):
             config = self.config_store.load(frame.mac)
             self.config_store.save(config)
+            timestamp = time.time()
             event = RawDataEvent(
-                timestamp=time.time(),
+                timestamp=timestamp,
                 mac=frame.mac,
                 location=config.location,
                 packet=frame.parsed,
                 payload=frame.payload,
                 device_type=config.type,
             )
-            self.power_shadow.update_rawdata(frame.mac, frame.parsed, event.timestamp)
+            self.power_shadow.update_rawdata(frame.mac, frame.parsed, timestamp)
             await self.raw_logger.log(event)
-            sent_commands = []
-            for command in self.estimator.handle(event):
-                sent = await self.registry.send_command(command)
-                if not sent:
-                    self.logger.warning(
-                        "No active session for command location=%s command=%s",
-                        command.location,
-                        command.command,
-                    )
-                    continue
-                sent_commands.append(command)
-                self.power_shadow.update_command_hint(
-                    command.address,
-                    command.command,
-                    time.time(),
-                )
+            sent_commands = await self._send_unitspace_commands(
+                self.estimator.handle(event)
+            )
             self._log_commands(sent_commands)
         elif isinstance(frame.parsed, AlertPacket):
             config = self.config_store.load(frame.mac)
             self.config_store.save(config)
+            timestamp = time.time()
             event = AlertEvent(
-                timestamp=time.time(),
+                timestamp=timestamp,
                 mac=frame.mac,
                 location=config.location,
                 packet=frame.parsed,
                 payload=frame.payload,
                 device_type=config.type,
             )
-            self.power_shadow.update_alert(frame.mac, frame.parsed.message, event.timestamp)
+            self.power_shadow.update_alert(frame.mac, frame.parsed.message, timestamp)
             await self.raw_logger.log_alert(event)
         elif isinstance(frame.parsed, ReportPacket):
             config = self.config_store.load(frame.mac)
             self.config_store.save(config)
+            timestamp = time.time()
+            src = frame.parsed.fields.get("src", "").upper()
+            connected = await self._source_connected(source_address)
+            if src in STRUCTURED_REPORT_SOURCES:
+                await self.raw_logger.log_report(
+                    ReportEvent(
+                        timestamp=timestamp,
+                        mac=frame.mac,
+                        source_address=source_address,
+                        location=config.location,
+                        packet=frame.parsed,
+                        payload=frame.payload,
+                        device_type=config.type,
+                        connected=connected,
+                    )
+                )
+            if src == "USD":
+                self._remember_usd_status(
+                    frame.mac,
+                    source_address,
+                    config.location,
+                    config.type,
+                    frame.parsed,
+                    timestamp,
+                    connected,
+                )
+            if src == "INOUT":
+                self.power_shadow.update_report(frame.mac, frame.parsed, timestamp)
+                action = inout_report_action(frame.parsed)
+                if action is None:
+                    self.logger.warning(
+                        "Ignoring INOUT report without enter/exit signal mac=%s payload=%r",
+                        frame.mac,
+                        frame.parsed.message,
+                    )
+                else:
+                    event = UnitspaceSignalEvent(
+                        timestamp=timestamp,
+                        mac=frame.mac,
+                        location=config.location,
+                        action=action,
+                        source="REPORT",
+                    )
+                    sent_commands = await self._send_unitspace_commands(
+                        self.estimator.handle(event)
+                    )
+                    self._log_commands(sent_commands)
             self._log_report(frame)
 
     async def handle_connection_state(
@@ -251,18 +329,21 @@ class SlimHubDaemon:
             self.power_shadow.mark_connected(address, timestamp)
         else:
             self.power_shadow.mark_disconnected(address, timestamp)
+        await self.raw_logger.log_connection_state(
+            ConnectionStateEvent(
+                timestamp=timestamp,
+                address=address,
+                connected=connected,
+            )
+        )
+        state = "connected" if connected else "disconnected"
+        self.logger.info("%s %s", address, state)
 
     async def _scan_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
                 async with self.adapter_lock:
                     devices = await discover_named_devices(self.device_name, self.scan_timeout)
-                if await self._connected_session_count() == 0:
-                    self.logger.info(
-                        "BLE scan found %d %s devices",
-                        len(devices),
-                        self.device_name,
-                    )
                 for device in devices:
                     await self._start_or_update_session(device)
             except asyncio.CancelledError:
@@ -270,6 +351,34 @@ class SlimHubDaemon:
             except Exception:
                 self.logger.exception("BLE scan failed")
             await self._wait_or_stop(self.scan_interval)
+
+    async def _send_unitspace_commands(
+        self,
+        commands: list[CommandEvent],
+    ) -> list[CommandEvent]:
+        sent_commands = []
+        for command in commands:
+            sent = await self.registry.send_command(command)
+            if not sent:
+                self.logger.warning(
+                    "No active session for command location=%s command=%s",
+                    command.location,
+                    command.command,
+                )
+                continue
+            sent_commands.append(command)
+            self.power_shadow.update_command_hint(
+                command.address,
+                command.command,
+                time.time(),
+            )
+        return sent_commands
+
+    async def _source_connected(self, source_address: str) -> bool:
+        session = await self.registry.get(source_address)
+        if session is None:
+            return False
+        return bool(session.status().get("connected", False))
 
     async def _start_or_update_session(self, target: object) -> None:
         address = normalize_mac(str(getattr(target, "address")))
@@ -306,16 +415,23 @@ class SlimHubDaemon:
         report = frame.parsed
         if not isinstance(report, ReportPacket):
             return
-        if report.fields.get("src") != "SOUND":
-            self.logger.debug("REPORT mac=%s payload=%r", frame.mac, report.message)
+        src = report.fields.get("src", "").upper()
+        if src == "INOUT":
             return
 
-        details = " ".join(
-            f"{key}={value}"
-            for key in ("event", "path", "max_ms", "bytes", "dropped", "reason", "err")
-            if (value := report.fields.get(key))
-        )
-        self.logger.info("SOUND report mac=%s %s", frame.mac, details or report.message)
+        if src == "USD":
+            return
+
+        if src != "SOUND":
+            return
+
+        if report.fields.get("err") or report.fields.get("dropped"):
+            details = " ".join(
+                f"{key}={value}"
+                for key in ("event", "path", "dropped", "reason", "err")
+                if (value := report.fields.get(key))
+            )
+            self.logger.warning("SOUND report mac=%s %s", frame.mac, details or report.message)
 
     async def _start_server(self) -> None:
         socket_path = self.paths.socket_path
@@ -427,6 +543,8 @@ class SlimHubDaemon:
             return self._ok(
                 self.power_shadow.snapshot(str(address)) if address else self.power_shadow.snapshot()
             )
+        if command == "battery.status":
+            return self._ok(await self._battery_status_payload(args.get("address")))
         if command == "raw.tail":
             address = args.get("address")
             lines = int(args.get("lines", 20))
@@ -476,3 +594,60 @@ class SlimHubDaemon:
 
     def _ok(self, data: object) -> dict[str, object]:
         return {"ok": True, "data": data, "error": None}
+
+    def _remember_usd_status(
+        self,
+        mac: str,
+        source_address: str,
+        location: str,
+        device_type: str,
+        report: ReportPacket,
+        timestamp: float,
+        connected: bool,
+    ) -> None:
+        fields = dict(report.fields)
+        status: dict[str, object] = {
+            "address": normalize_mac(mac),
+            "ble_address": normalize_mac(source_address),
+            "location": location,
+            "device_type": device_type,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp)),
+            "timestamp": timestamp,
+            "connected": connected,
+            "src": fields.get("src", ""),
+            "event": fields.get("event", ""),
+            "fields": fields,
+        }
+        for key in USD_STATUS_FIELDS:
+            if key in fields:
+                status[key] = _coerce_report_value(fields[key])
+        self.battery_status[normalize_mac(mac)] = status
+
+    async def _battery_status_payload(self, address: object | None) -> object:
+        if address is None:
+            return [
+                dict(status)
+                for _, status in sorted(self.battery_status.items())
+            ]
+
+        normalized = normalize_mac(str(address))
+        if normalized in self.battery_status:
+            return dict(self.battery_status[normalized])
+        for status in self.battery_status.values():
+            if status.get("ble_address") == normalized:
+                return dict(status)
+        return {}
+
+
+def _coerce_report_value(value: str) -> object:
+    text = value.strip()
+    if text == "":
+        return ""
+    try:
+        return int(text, 10)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        return text

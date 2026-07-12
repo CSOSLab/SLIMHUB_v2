@@ -14,7 +14,7 @@ from slimhub.power_shadow import (
     SLEEP_READY,
     ShadowPowerState,
 )
-from slimhub.protocol.nus import RawDataPacket
+from slimhub.protocol.nus import RawDataPacket, ReportPacket
 
 
 ADDRESS = "AA:BB:CC:DD:EE:FF"
@@ -51,6 +51,15 @@ class ShadowPowerStateTests(unittest.TestCase):
         self.assertEqual(snapshot.state, PIR_TRIGGER_VERIFY)
         self.assertTrue(snapshot.active)
 
+    def test_radar_confirmed_rawdata_moves_to_confirmed_active(self) -> None:
+        shadow = ShadowPowerState()
+
+        snapshot = shadow.update_rawdata(ADDRESS, raw_packet(10), 10.0)
+
+        self.assertEqual(snapshot.state, RADAR_CONFIRMED_ACTIVE)
+        self.assertTrue(snapshot.active)
+        self.assertTrue(snapshot.radar_present)
+
     def test_radar_present_distance_moves_to_confirmed_active(self) -> None:
         shadow = ShadowPowerState()
 
@@ -62,6 +71,34 @@ class ShadowPowerStateTests(unittest.TestCase):
 
         self.assertEqual(snapshot.state, RADAR_CONFIRMED_ACTIVE)
         self.assertTrue(snapshot.active)
+
+    def test_inout_enter_report_updates_visibility_and_confirmed_active(self) -> None:
+        shadow = ShadowPowerState()
+        report = ReportPacket(
+            message=(
+                "src=INOUT,event=ENTER,signal=enter,code=10,pir=1,"
+                "radar=1,dist_cm=75,state=inside_moving,reason=radar_confirmed"
+            ),
+            fields={
+                "src": "INOUT",
+                "event": "ENTER",
+                "signal": "enter",
+                "code": "10",
+                "pir": "1",
+                "radar": "1",
+                "dist_cm": "75",
+                "state": "inside_moving",
+                "reason": "radar_confirmed",
+            },
+        )
+
+        snapshot = shadow.update_report(ADDRESS, report, 10.0)
+
+        self.assertEqual(snapshot.state, RADAR_CONFIRMED_ACTIVE)
+        self.assertEqual(snapshot.last_inout_event, "ENTER")
+        self.assertEqual(snapshot.last_inout_state, "inside_moving")
+        self.assertEqual(snapshot.last_inout_code, "10")
+        self.assertEqual(snapshot.last_radar_distance_cm, 75.0)
 
     def test_radar_absence_uses_grace_before_sleep_ready(self) -> None:
         shadow = ShadowPowerState()

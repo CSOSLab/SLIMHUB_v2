@@ -5,7 +5,7 @@ import re
 from dataclasses import asdict, dataclass
 
 from slimhub.config import AppPaths
-from slimhub.protocol.nus import RawDataPacket, normalize_mac, validate_command
+from slimhub.protocol.nus import RawDataPacket, ReportPacket, normalize_mac, validate_command
 
 
 ABSENT_SLEEP = "ABSENT_SLEEP"
@@ -19,6 +19,9 @@ ACTIVE_STATES = {PIR_TRIGGER_VERIFY, RADAR_CONFIRMED_ACTIVE, MIC_ASSISTED_ACTIVE
 PIR_HOLD_SECONDS = 3.0
 ABSENCE_GRACE_SECONDS = 10.0
 MIC_SUSTAIN_SECONDS = 2.5
+LEGACY_PIR_ENTER_SIGNAL = 1
+RADAR_CONFIRMED_ENTER_SIGNAL = 10
+INOUT_INSIDE_STATES = {"inside_moving", "inside_still", "inside_shadow"}
 
 
 @dataclass
@@ -44,6 +47,12 @@ class ShadowDeviceState:
     last_mic_at: float | None = None
     last_mic_rms: float | None = None
     last_alert: str | None = None
+    last_inout_event: str | None = None
+    last_inout_state: str | None = None
+    last_inout_signal: str | None = None
+    last_inout_code: str | None = None
+    last_inout_reason: str | None = None
+    last_inout_at: float | None = None
 
 
 class ShadowPowerState:
@@ -60,7 +69,10 @@ class ShadowPowerState:
         state = self._get(address)
         old = state.state
         state.last_update = timestamp
-        if self._rawdata_has_human(frame):
+        if self._rawdata_is_radar_confirmed_enter(frame):
+            state.pir_active_until = timestamp + PIR_HOLD_SECONDS
+            self._apply_radar(state, present=True, distance_cm=None, timestamp=timestamp)
+        elif self._rawdata_is_legacy_pir_enter(frame):
             state.pir_active_until = timestamp + PIR_HOLD_SECONDS
             state.presence_confirmed_since_sleep = True
             self._set_state(state, PIR_TRIGGER_VERIFY, timestamp)
@@ -102,6 +114,77 @@ class ShadowPowerState:
 
         self._evaluate_idle(state, timestamp)
         self._log_if_changed(state, old, timestamp, "alert")
+        return state
+
+    def update_report(
+        self,
+        address: str,
+        report: ReportPacket,
+        timestamp: float,
+    ) -> ShadowDeviceState:
+        state = self._get(address)
+        old = state.state
+        state.last_update = timestamp
+
+        if report.fields.get("src", "").upper() != "INOUT":
+            return state
+
+        event = report.fields.get("event", "")
+        inout_state = report.fields.get("state", "")
+        signal = report.fields.get("signal", "")
+        code = report.fields.get("code", "")
+        state.last_inout_event = event or None
+        state.last_inout_state = inout_state or None
+        state.last_inout_signal = signal or None
+        state.last_inout_code = code or None
+        state.last_inout_reason = report.fields.get("reason") or None
+        state.last_inout_at = timestamp
+
+        normalized_event = event.upper()
+        normalized_state = inout_state.lower()
+        normalized_signal = signal.lower()
+        distance_cm = report.fields.get("dist_cm")
+        radar_present = _bool_or_none(report.fields.get("radar"))
+        if radar_present is None:
+            distance = _float_or_none(distance_cm)
+            if distance is not None:
+                radar_present = distance > 0
+
+        pir_active = _bool_or_none(report.fields.get("pir"))
+        if pir_active is True:
+            state.pir_active_until = timestamp + PIR_HOLD_SECONDS
+
+        if (
+            normalized_event == "ENTER"
+            or normalized_signal == "enter"
+            or code == str(RADAR_CONFIRMED_ENTER_SIGNAL)
+            or normalized_state in INOUT_INSIDE_STATES
+        ):
+            self._apply_radar(
+                state,
+                present=True,
+                distance_cm=distance_cm,
+                timestamp=timestamp,
+            )
+        elif normalized_state == "wait_radar" or pir_active is True:
+            self._set_state(state, PIR_TRIGGER_VERIFY, timestamp)
+        elif normalized_state == "outside" or radar_present is False:
+            self._apply_radar(
+                state,
+                present=False,
+                distance_cm=distance_cm,
+                timestamp=timestamp,
+            )
+            self._evaluate_idle(state, timestamp)
+        elif radar_present is True:
+            self._apply_radar(
+                state,
+                present=True,
+                distance_cm=distance_cm,
+                timestamp=timestamp,
+            )
+
+        self._log_if_changed(state, old, timestamp, "report")
         return state
 
     def update_command_hint(
@@ -235,8 +318,17 @@ class ShadowPowerState:
         state.active = new_state in ACTIVE_STATES
         state.last_update = timestamp
 
-    def _rawdata_has_human(self, packet: RawDataPacket) -> bool:
-        return packet.flag_human_presence == 1 and packet.detected != 0
+    def _rawdata_is_legacy_pir_enter(self, packet: RawDataPacket) -> bool:
+        return (
+            packet.flag_human_presence == 1
+            and packet.detected == LEGACY_PIR_ENTER_SIGNAL
+        )
+
+    def _rawdata_is_radar_confirmed_enter(self, packet: RawDataPacket) -> bool:
+        return (
+            packet.flag_human_presence == 1
+            and packet.detected == RADAR_CONFIRMED_ENTER_SIGNAL
+        )
 
     def _log_if_changed(
         self,
@@ -312,3 +404,14 @@ def _float_or_none(value: object) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _bool_or_none(value: object) -> bool | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "present", "active", "detected", "on"}:
+        return True
+    if text in {"0", "false", "no", "absent", "inactive", "off", "none"}:
+        return False
+    return None

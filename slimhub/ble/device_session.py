@@ -17,7 +17,6 @@ from slimhub.protocol.nus import (
     PacketParseError,
     ParsedFrame,
     build_command_frame,
-    hex_dump,
     normalize_mac,
     parse_frame,
 )
@@ -35,6 +34,8 @@ class DeviceSession:
         on_frame: FrameHandler,
         on_connection_state: ConnectionStateHandler | None = None,
         reconnect_delay: float = 3.0,
+        connect_timeout: float = 10.0,
+        notify_timeout: float = 5.0,
         adapter_lock: asyncio.Lock | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
@@ -44,6 +45,8 @@ class DeviceSession:
         self.on_frame = on_frame
         self.on_connection_state = on_connection_state
         self.reconnect_delay = reconnect_delay
+        self.connect_timeout = connect_timeout
+        self.notify_timeout = notify_timeout
         self.adapter_lock = adapter_lock or asyncio.Lock()
         self.logger = logger or logging.getLogger(__name__)
 
@@ -100,36 +103,36 @@ class DeviceSession:
             loop = asyncio.get_running_loop()
 
             def on_disconnect(_: BleakClient) -> None:
-                self.logger.warning("%s disconnected", self.address)
                 loop.call_soon_threadsafe(disconnected_event.set)
 
             try:
-                if self._unavailable_logged:
-                    self.logger.debug("Connecting to %s", self.address)
-                else:
-                    self.logger.info("Connecting to %s", self.address)
                 client = BleakClient(
                     self.target,
                     disconnected_callback=on_disconnect,
                 )
                 async with self.adapter_lock:
-                    await client.connect()
+                    await asyncio.wait_for(
+                        client.connect(),
+                        timeout=self.connect_timeout,
+                    )
                     self._client = client
                     self.connected = bool(client.is_connected)
                     self.waiting_for_advertisement = False
                     self._unavailable_logged = False
 
                     assembler = FrameAssembler()
-                    await client.start_notify(
-                        NUS_TX_NOTIFY_UUID,
-                        self._build_notify_handler(assembler),
+                    await asyncio.wait_for(
+                        client.start_notify(
+                            NUS_TX_NOTIFY_UUID,
+                            self._build_notify_handler(assembler),
+                        ),
+                        timeout=self.notify_timeout,
                     )
 
                     self.last_error = None
                     self.last_seen = time.time()
                     if self.on_connection_state is not None:
                         await self.on_connection_state(self.address, True, self.last_seen)
-                    self.logger.info("%s subscribed to NUS TX", self.address)
 
                 command_task = asyncio.create_task(
                     self._command_worker(client),
@@ -162,12 +165,7 @@ class DeviceSession:
             except Exception as exc:
                 self.last_error = str(exc)
                 if self._is_expected_connect_failure(exc):
-                    if self._unavailable_logged:
-                        self.logger.debug(
-                            "%s still unavailable; waiting for next advertisement",
-                            self.address,
-                        )
-                    else:
+                    if not self._unavailable_logged:
                         self.logger.warning(
                             "%s unavailable; waiting for next advertisement before reconnect: %s",
                             self.address,
@@ -194,23 +192,16 @@ class DeviceSession:
     def _build_notify_handler(self, assembler: FrameAssembler) -> Callable[[object, bytearray], None]:
         def handle_notify(sender: object, data: bytearray) -> None:
             chunk = bytes(data)
-            self.logger.debug(
-                "%s notify sender=%s chunk_len=%d hex=%s",
-                self.address,
-                sender,
-                len(chunk),
-                hex_dump(chunk),
-            )
 
             for frame_bytes in assembler.push(chunk):
                 try:
                     frame = parse_frame(frame_bytes)
                 except PacketParseError as exc:
                     self.logger.error(
-                        "%s parse_error=%s frame_hex=%s",
+                        "%s parse_error=%s frame_len=%d",
                         self.address,
                         exc,
-                        hex_dump(frame_bytes),
+                        len(frame_bytes),
                     )
                     continue
                 asyncio.create_task(self.on_frame(self.address, frame))
@@ -223,11 +214,6 @@ class DeviceSession:
             try:
                 frame = build_command_frame(command.address, command.command)
                 await client.write_gatt_char(NUS_RX_WRITE_UUID, frame, response=False)
-                self.logger.debug(
-                    "command sent location=%s command=%s",
-                    command.location,
-                    command.command,
-                )
             except Exception as exc:
                 self.last_error = str(exc)
                 self.logger.exception(

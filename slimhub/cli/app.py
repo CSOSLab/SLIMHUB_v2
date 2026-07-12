@@ -4,8 +4,10 @@ import argparse
 import asyncio
 import json
 import logging
+import subprocess
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 from slimhub.cli.client import send_request_sync
 from slimhub.config import AppPaths, HubConfigStore
@@ -23,6 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="slimhub-v2", description="SLIMHUB v2 CLI")
     parser.add_argument("--base-dir", help="Runtime base directory. Default: current directory.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
+    parser.add_argument("--background", action="store_true", help="Run daemon in the background.")
 
     parser.add_argument("-r", "--run", dest="run_flag", action="store_true", help="Run slimhub client.")
     parser.add_argument("-c", "--config", dest="legacy_config", nargs=3, metavar=("address", "target", "data"))
@@ -45,19 +48,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--address", help="Optional BLE address to connect immediately when using --run.")
     parser.add_argument("--name", default=DEFAULT_DEVICE_NAME, help="BLE device name to scan.")
     parser.add_argument("--no-scan", action="store_true", help="Disable BLE scan loop.")
-    parser.add_argument("--scan-timeout", type=float, default=5.0)
-    parser.add_argument("--scan-interval", type=float, default=10.0)
+    parser.add_argument("--scan-timeout", type=float, default=5.0, help="BLE scan duration in seconds.")
+    parser.add_argument("--scan-interval", type=float, default=10.0, help="Delay between BLE scans in seconds.")
     parser.add_argument("--reconnect-delay", type=float, default=3.0)
+    parser.add_argument("--connect-timeout", type=float, default=10.0, help="BLE connect timeout in seconds.")
+    parser.add_argument("--notify-timeout", type=float, default=5.0, help="NUS notify subscription timeout in seconds.")
 
     subparsers = parser.add_subparsers(dest="subcommand")
 
     run_parser = subparsers.add_parser("run", help="Run the SLIMHUB daemon.")
+    run_parser.add_argument("--background", action="store_true", help="Run daemon in the background.")
     run_parser.add_argument("--address", help="Optional BLE address to connect immediately.")
     run_parser.add_argument("--name", default=DEFAULT_DEVICE_NAME, help="BLE device name to scan.")
     run_parser.add_argument("--no-scan", action="store_true", help="Disable BLE scan loop.")
-    run_parser.add_argument("--scan-timeout", type=float, default=5.0)
-    run_parser.add_argument("--scan-interval", type=float, default=10.0)
+    run_parser.add_argument("--scan-timeout", type=float, default=5.0, help="BLE scan duration in seconds.")
+    run_parser.add_argument("--scan-interval", type=float, default=10.0, help="Delay between BLE scans in seconds.")
     run_parser.add_argument("--reconnect-delay", type=float, default=3.0)
+    run_parser.add_argument("--connect-timeout", type=float, default=10.0, help="BLE connect timeout in seconds.")
+    run_parser.add_argument("--notify-timeout", type=float, default=5.0, help="NUS notify subscription timeout in seconds.")
 
     subparsers.add_parser("stop", help="Stop the running daemon.")
     subparsers.add_parser("devices", help="List known devices.")
@@ -118,6 +126,14 @@ def build_parser() -> argparse.ArgumentParser:
     power_status = power_subparsers.add_parser("status", help="Show shadow power-state status.")
     power_status.add_argument("--address")
 
+    battery_parser = subparsers.add_parser("battery", help="Battery and uSD status commands.")
+    battery_subparsers = battery_parser.add_subparsers(
+        dest="battery_command",
+        required=True,
+    )
+    battery_status = battery_subparsers.add_parser("status", help="Show latest USD STATUS report.")
+    battery_status.add_argument("--address")
+
     return parser
 
 
@@ -133,6 +149,9 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
 
     try:
         if _is_run_command(args):
+            if args.background:
+                return _run_background(argv, paths)
+
             from slimhub.daemon import SlimHubDaemon
 
             daemon = SlimHubDaemon(
@@ -141,6 +160,8 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
                 scan_timeout=args.scan_timeout,
                 scan_interval=args.scan_interval,
                 reconnect_delay=args.reconnect_delay,
+                connect_timeout=args.connect_timeout,
+                notify_timeout=args.notify_timeout,
             )
             print("==== SLIMHUB START ====")
             logging.info("SLIMHUB start")
@@ -184,6 +205,40 @@ def _has_action(args: argparse.Namespace) -> bool:
 
 def _is_run_command(args: argparse.Namespace) -> bool:
     return bool(args.run_flag or args.subcommand == "run")
+
+
+def _run_background(argv: Sequence[str] | None, paths: AppPaths) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    child_args = [arg for arg in args if arg != "--background"]
+    if not _is_module_invocation_available():
+        command = [sys.executable, *sys.argv]
+        command = [part for part in command if part != "--background"]
+    else:
+        command = [sys.executable, "-m", "slimhub.cli.app", *child_args]
+
+    out_path = paths.logs_dir / "slimhub-v2.out"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out = out_path.open("ab")
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        out.close()
+
+    print(f"SLIMHUB background started pid={process.pid}")
+    print(f"Output: {out_path}")
+    print(f"Runtime log: {paths.logging_path}")
+    return 0
+
+
+def _is_module_invocation_available() -> bool:
+    return Path(__file__).name == "app.py"
 
 
 def _send(paths: AppPaths, args: argparse.Namespace) -> object:
@@ -271,6 +326,8 @@ def _send(paths: AppPaths, args: argparse.Namespace) -> object:
         return send_request_sync(paths, "unitspace.status")
     if args.subcommand == "power" and args.power_command == "status":
         return send_request_sync(paths, "power.status", {"address": args.address})
+    if args.subcommand == "battery" and args.battery_command == "status":
+        return send_request_sync(paths, "battery.status", {"address": args.address})
     raise RuntimeError("unhandled CLI command")
 
 
@@ -284,6 +341,9 @@ def _print_result(args: argparse.Namespace, data: object) -> None:
         return
     if args.subcommand == "command":
         _print_command_send(data)
+        return
+    if args.subcommand == "battery":
+        _print_battery_status(data)
         return
     if isinstance(data, str):
         print(data)
@@ -319,6 +379,51 @@ def _print_command_send(data: object) -> None:
     )
 
 
+def _print_battery_status(data: object) -> None:
+    if isinstance(data, dict):
+        rows = [data] if data else []
+    elif isinstance(data, list):
+        rows = [item for item in data if isinstance(item, dict)]
+    else:
+        rows = []
+
+    if not rows:
+        print("No battery reports")
+        return
+
+    print(
+        f"{'Address':<20}{'Location':<12}{'Batt':<8}{'Volt':<8}"
+        f"{'mV':<7}{'USB':<5}{'CHG':<5}{'SD':<5}{'File':<18}{'Uptime':<10}"
+    )
+    for item in rows:
+        batt_pct = _format_percent(item.get("batt_pct"))
+        batt_v = _format_value(item.get("batt_v"))
+        print(
+            f"{str(item.get('address', '')):<20}"
+            f"{str(item.get('location', 'undefined')):<12}"
+            f"{batt_pct:<8}"
+            f"{batt_v:<8}"
+            f"{str(item.get('batt_mv', '')):<7}"
+            f"{str(item.get('usb', '')):<5}"
+            f"{str(item.get('chg', '')):<5}"
+            f"{str(item.get('sd', '')):<5}"
+            f"{str(item.get('file', '')):<18}"
+            f"{str(item.get('uptime', '')):<10}"
+        )
+
+
+def _format_percent(value: object) -> str:
+    if value in (None, ""):
+        return ""
+    return f"{value}%"
+
+
+def _format_value(value: object) -> str:
+    if isinstance(value, float):
+        return f"{value:.3f}"
+    return "" if value is None else str(value)
+
+
 def _record_seconds(value: str) -> int:
     try:
         seconds = int(value, 10)
@@ -337,9 +442,20 @@ def _setup_logging(debug: bool, paths: AppPaths) -> None:
     paths.ensure()
     logging.basicConfig(
         filename=str(paths.logging_path),
-        level=logging.DEBUG if debug else logging.INFO,
+        level=logging.INFO,
         format="%(asctime)s: %(levelname)s: %(message)s",
     )
+    logging.getLogger("slimhub").setLevel(logging.INFO)
+    for name in (
+        "asyncio",
+        "bleak",
+        "bleak.backends",
+        "bleak.backends.bluezdbus",
+        "dbus",
+        "dbus_fast",
+        "dbus_next",
+    ):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def main(argv: Sequence[str] | None = None) -> None:

@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from slimhub.config import DEFAULT_DEVICE_TYPE, DEFAULT_LOCATION, AppPaths
-from slimhub.events import AlertEvent, RawDataEvent
+from slimhub.events import AlertEvent, ConnectionStateEvent, RawDataEvent, ReportEvent
 from slimhub.protocol.nus import normalize_mac
 
 
@@ -40,11 +40,26 @@ CSV_FIELDS = [
     *SOUND_CLASSLIST,
 ]
 
+USD_STATUS_FIELDS = (
+    "batt_mv",
+    "batt_v",
+    "batt_pct",
+    "batt_rem_mah",
+    "usb",
+    "chg",
+    "sd",
+    "file",
+    "uptime",
+    "ok",
+)
+
 
 class RawDataLogger:
     def __init__(self, paths: AppPaths) -> None:
         self.paths = paths
-        self._queue: asyncio.Queue[RawDataEvent | AlertEvent | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[
+            RawDataEvent | AlertEvent | ReportEvent | ConnectionStateEvent | None
+        ] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
@@ -71,6 +86,18 @@ class RawDataLogger:
             return
         await self._queue.put(event)
 
+    async def log_report(self, event: ReportEvent) -> None:
+        if self._task is None:
+            await self.write_report(event)
+            return
+        await self._queue.put(event)
+
+    async def log_connection_state(self, event: ConnectionStateEvent) -> None:
+        if self._task is None:
+            await self.write_connection_state(event)
+            return
+        await self._queue.put(event)
+
     async def _run(self) -> None:
         while True:
             event = await self._queue.get()
@@ -78,6 +105,10 @@ class RawDataLogger:
                 return
             if isinstance(event, AlertEvent):
                 await self.write_alert(event)
+            elif isinstance(event, ReportEvent):
+                await self.write_report(event)
+            elif isinstance(event, ConnectionStateEvent):
+                await self.write_connection_state(event)
             else:
                 await self.write_event(event)
 
@@ -96,6 +127,32 @@ class RawDataLogger:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
             f.write(self._alert_line_for(event) + "\n")
+
+    async def write_report(self, event: ReportEvent) -> None:
+        path = self._structured_path_for(event.timestamp)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    self._structured_report_row_for(event),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+
+    async def write_connection_state(self, event: ConnectionStateEvent) -> None:
+        path = self._structured_path_for(event.timestamp)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    self._connection_state_row_for(event),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
 
     def _path_for(self, event: RawDataEvent) -> Path:
         timestamp = datetime.fromtimestamp(event.timestamp)
@@ -126,6 +183,10 @@ class RawDataLogger:
             / "debugstr"
             / f"{timestamp.strftime('%Y-%m-%d')}.txt"
         )
+
+    def _structured_path_for(self, timestamp: float) -> Path:
+        date = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
+        return self.paths.programdata_dir / "reports" / f"{date}.jsonl"
 
     def _row_for(self, event: RawDataEvent) -> dict[str, object]:
         timestamp = datetime.fromtimestamp(event.timestamp)
@@ -162,3 +223,41 @@ class RawDataLogger:
             payload["timestamp"] = timestamp_text
             return json.dumps(payload, ensure_ascii=False)
         return f"{timestamp_text},{event.packet.message.rstrip()}"
+
+    def _structured_report_row_for(self, event: ReportEvent) -> dict[str, object]:
+        timestamp = datetime.fromtimestamp(event.timestamp)
+        fields = dict(event.packet.fields)
+        row: dict[str, object] = {
+            "kind": "report",
+            "time": timestamp.isoformat(timespec="milliseconds"),
+            "timestamp": event.timestamp,
+            "mac": normalize_mac(event.mac),
+            "ble_address": normalize_mac(event.source_address),
+            "location": event.location or DEFAULT_LOCATION,
+            "device_type": event.device_type or DEFAULT_DEVICE_TYPE,
+            "connected": event.connected,
+            "packet_type": "REPORT",
+            "src": fields.get("src", ""),
+            "event": fields.get("event", ""),
+            "message": event.packet.message,
+            "fields": fields,
+        }
+        for key in USD_STATUS_FIELDS:
+            if key in fields:
+                row[key] = fields[key]
+        return row
+
+    def _connection_state_row_for(
+        self,
+        event: ConnectionStateEvent,
+    ) -> dict[str, object]:
+        timestamp = datetime.fromtimestamp(event.timestamp)
+        address = normalize_mac(event.address)
+        return {
+            "kind": "connection",
+            "time": timestamp.isoformat(timespec="milliseconds"),
+            "timestamp": event.timestamp,
+            "mac": address,
+            "ble_address": address,
+            "connected": event.connected,
+        }

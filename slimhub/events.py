@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from slimhub.config import DEFAULT_DEVICE_TYPE
-from slimhub.protocol.nus import AlertPacket, RawDataPacket
+from slimhub.protocol.nus import AlertPacket, RawDataPacket, ReportPacket
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,34 @@ class AlertEvent:
     packet: AlertPacket
     payload: bytes
     device_type: str = DEFAULT_DEVICE_TYPE
+
+
+@dataclass(frozen=True)
+class ReportEvent:
+    timestamp: float
+    mac: str
+    source_address: str
+    location: str
+    packet: ReportPacket
+    payload: bytes
+    device_type: str = DEFAULT_DEVICE_TYPE
+    connected: bool | None = None
+
+
+@dataclass(frozen=True)
+class ConnectionStateEvent:
+    timestamp: float
+    address: str
+    connected: bool
+
+
+@dataclass(frozen=True)
+class UnitspaceSignalEvent:
+    timestamp: float
+    mac: str
+    location: str
+    action: str
+    source: str
 
 
 @dataclass(frozen=True)

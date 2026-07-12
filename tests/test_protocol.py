@@ -83,6 +83,19 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(frame.parsed.fields["event"], "RECORD_START")
         self.assertEqual(frame.parsed.fields["path"], "SOUND/001.wav")
 
+    def test_inout_report_frame_parses_state_payload(self) -> None:
+        payload = (
+            b"src=INOUT,event=ENTER,signal=enter,code=10,pir=1,"
+            b"radar=1,dist_cm=75,state=inside_moving,reason=radar_confirmed"
+        )
+        frame = parse_frame(build_frame("AA:BB:CC:DD:EE:FF", "REPORT", payload))
+
+        self.assertIsInstance(frame.parsed, ReportPacket)
+        self.assertEqual(frame.parsed.fields["src"], "INOUT")
+        self.assertEqual(frame.parsed.fields["event"], "ENTER")
+        self.assertEqual(frame.parsed.fields["code"], "10")
+        self.assertEqual(frame.parsed.fields["state"], "inside_moving")
+
     def test_command_frame_uses_target_mac_and_command_packet_type(self) -> None:
         frame = build_command_frame("AA:BB:CC:DD:EE:FF", "enter")
 

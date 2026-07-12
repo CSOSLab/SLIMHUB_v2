@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from slimhub.cli.app import build_parser, run_cli
+from slimhub.config import AppPaths
 
 
 ADDRESS = "AA:BB:CC:DD:EE:FF"
@@ -76,6 +77,92 @@ class CliAppTests(unittest.TestCase):
 
         self.assertEqual(enter.nus_command, "enter")
         self.assertEqual(exit_.nus_command, "exit")
+
+    def test_battery_status_requests_and_prints_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            response = {
+                "address": ADDRESS,
+                "location": "ENTRY",
+                "batt_pct": 75,
+                "batt_v": 3.98,
+                "batt_mv": 3980,
+                "usb": 0,
+                "chg": 1,
+                "sd": 0,
+                "file": "LOG/001.CSV",
+                "uptime": 12345,
+            }
+            with patch("slimhub.cli.app.send_request_sync", return_value=response) as send:
+                with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                    status = run_cli(
+                        [
+                            "--base-dir",
+                            tmpdir,
+                            "battery",
+                            "status",
+                            "--address",
+                            ADDRESS,
+                        ]
+                    )
+
+            self.assertEqual(status, 0)
+            self.assertEqual(send.call_args.args[1], "battery.status")
+            self.assertEqual(send.call_args.args[2], {"address": ADDRESS})
+            output = stdout.getvalue()
+            self.assertIn("75%", output)
+            self.assertIn("3.980", output)
+            self.assertIn("LOG/001.CSV", output)
+
+    def test_run_background_starts_detached_process(self) -> None:
+        class FakeProcess:
+            pid = 12345
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("slimhub.cli.app.subprocess.Popen", return_value=FakeProcess()) as popen:
+                with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                    status = run_cli(
+                        [
+                            "--base-dir",
+                            tmpdir,
+                            "--debug",
+                            "run",
+                            "--background",
+                            "--scan-timeout",
+                            "8",
+                            "--scan-interval",
+                            "5",
+                        ]
+                    )
+
+            self.assertEqual(status, 0)
+            command = popen.call_args.args[0]
+            self.assertEqual(command[:3], [__import__("sys").executable, "-m", "slimhub.cli.app"])
+            self.assertIn("--debug", command)
+            self.assertIn("run", command)
+            self.assertIn("--scan-timeout", command)
+            self.assertNotIn("--background", command)
+            self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            self.assertIn("pid=12345", stdout.getvalue())
+
+    def test_debug_logging_does_not_enable_noisy_dependency_debug(self) -> None:
+        import logging
+
+        from slimhub.cli.app import _setup_logging
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for handler in logging.getLogger().handlers[:]:
+                logging.getLogger().removeHandler(handler)
+                handler.close()
+
+            _setup_logging(True, AppPaths.from_base(tmpdir))
+
+            self.assertEqual(logging.getLogger().level, logging.INFO)
+            self.assertEqual(logging.getLogger("slimhub").level, logging.INFO)
+            self.assertEqual(logging.getLogger("bleak").level, logging.WARNING)
+            self.assertEqual(logging.getLogger("dbus_fast").level, logging.WARNING)
+            for handler in logging.getLogger().handlers[:]:
+                logging.getLogger().removeHandler(handler)
+                handler.close()
 
 
 if __name__ == "__main__":
