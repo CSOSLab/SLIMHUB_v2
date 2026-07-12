@@ -4,7 +4,11 @@ import logging
 import asyncio
 from collections.abc import Awaitable, Callable
 
-from slimhub.ble.device_session import ConnectionStateHandler, DeviceSession
+from slimhub.ble.device_session import (
+    CommandResultHandler,
+    ConnectionStateHandler,
+    DeviceSession,
+)
 from slimhub.ble.registry import DeviceRegistry
 from slimhub.protocol.nus import ParsedFrame, normalize_mac
 
@@ -19,12 +23,14 @@ class BleCentral:
         adapter_lock: asyncio.Lock,
         logger: logging.Logger,
         on_connection_state: ConnectionStateHandler | None = None,
+        on_command_result: CommandResultHandler | None = None,
         connect_timeout: float = 10.0,
         notify_timeout: float = 5.0,
     ) -> None:
         self.registry = registry
         self.on_frame = on_frame
         self.on_connection_state = on_connection_state
+        self.on_command_result = on_command_result
         self.reconnect_delay = reconnect_delay
         self.connect_timeout = connect_timeout
         self.notify_timeout = notify_timeout
@@ -42,6 +48,7 @@ class BleCentral:
                 target,
                 on_frame=self.on_frame,
                 on_connection_state=self.on_connection_state,
+                on_command_result=self.on_command_result,
                 reconnect_delay=self.reconnect_delay,
                 connect_timeout=self.connect_timeout,
                 notify_timeout=self.notify_timeout,

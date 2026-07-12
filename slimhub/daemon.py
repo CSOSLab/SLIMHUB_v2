@@ -6,6 +6,7 @@ import logging
 import signal
 import time
 from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 
 from slimhub.ble.central import BleCentral
@@ -18,7 +19,7 @@ from slimhub.events import (
     ConnectionStateEvent,
     RawDataEvent,
     ReportEvent,
-    UnitspaceSignalEvent,
+    StructuredEvent,
 )
 from slimhub.logging import RawDataLogger
 from slimhub.protocol.nus import (
@@ -32,10 +33,10 @@ from slimhub.protocol.nus import (
     validate_command_payload,
 )
 from slimhub.power_shadow import ShadowPowerState
-from slimhub.unitspace.estimator import SimpleUnitspaceEstimator, inout_report_action
+from slimhub.unitspace.clock import EventReorderBuffer, NodeClockNormalizer
+from slimhub.unitspace.estimator import SimpleUnitspaceEstimator
 
 
-STRUCTURED_REPORT_SOURCES = {"POWER", "INOUT", "ENV", "USD"}
 USD_STATUS_FIELDS = (
     "batt_mv",
     "batt_v",
@@ -80,14 +81,21 @@ class SlimHubDaemon:
         self.hub_config_store = HubConfigStore(paths)
         self.raw_logger = RawDataLogger(paths)
         self.estimator = SimpleUnitspaceEstimator()
+        self.clock_normalizer = NodeClockNormalizer()
+        self.report_reorder_buffer: EventReorderBuffer[ReportEvent] = EventReorderBuffer()
+        self._report_reorder_task: asyncio.Task[None] | None = None
         self.power_shadow = ShadowPowerState(paths)
         self.registry = DeviceRegistry()
         self.battery_status: dict[str, dict[str, object]] = {}
+        self._session_ids: dict[str, str] = {}
+        self._session_generation: dict[str, int] = {}
+        self._sound_schemas: dict[str, tuple[str | None, int | None]] = {}
         self.adapter_lock = asyncio.Lock()
         self.central = BleCentral(
             registry=self.registry,
             on_frame=self.handle_frame,
             on_connection_state=self.handle_connection_state,
+            on_command_result=self.handle_command_result,
             reconnect_delay=self.reconnect_delay,
             connect_timeout=self.connect_timeout,
             notify_timeout=self.notify_timeout,
@@ -129,6 +137,11 @@ class SlimHubDaemon:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            await self.flush_report_reorder_buffer()
+            if self._report_reorder_task is not None:
+                self._report_reorder_task.cancel()
+                await asyncio.gather(self._report_reorder_task, return_exceptions=True)
+                self._report_reorder_task = None
             await self.registry.stop_all()
             await self.raw_logger.stop()
             await self._stop_server()
@@ -239,6 +252,9 @@ class SlimHubDaemon:
             config = self.config_store.load(frame.mac)
             self.config_store.save(config)
             timestamp = time.time()
+            sound_schema_version, sound_class_count = self._sound_schemas.get(
+                normalize_mac(frame.mac), (None, None)
+            )
             event = RawDataEvent(
                 timestamp=timestamp,
                 mac=frame.mac,
@@ -246,12 +262,18 @@ class SlimHubDaemon:
                 packet=frame.parsed,
                 payload=frame.payload,
                 device_type=config.type,
+                source_address=source_address,
+                session_id=self._session_ids.get(normalize_mac(source_address)),
+                receipt_timestamp=timestamp,
+                sound_schema_version=sound_schema_version,
+                sound_class_count=sound_class_count,
             )
             self.power_shadow.update_rawdata(frame.mac, frame.parsed, timestamp)
             await self.raw_logger.log(event)
             sent_commands = await self._send_unitspace_commands(
                 self.estimator.handle(event)
             )
+            await self._log_estimator_records()
             self._log_commands(sent_commands)
         elif isinstance(frame.parsed, AlertPacket):
             config = self.config_store.load(frame.mac)
@@ -273,50 +295,42 @@ class SlimHubDaemon:
             timestamp = time.time()
             src = frame.parsed.fields.get("src", "").upper()
             connected = await self._source_connected(source_address)
-            if src in STRUCTURED_REPORT_SOURCES:
-                await self.raw_logger.log_report(
-                    ReportEvent(
-                        timestamp=timestamp,
-                        mac=frame.mac,
-                        source_address=source_address,
-                        location=config.location,
-                        packet=frame.parsed,
-                        payload=frame.payload,
-                        device_type=config.type,
-                        connected=connected,
-                    )
-                )
-            if src == "USD":
-                self._remember_usd_status(
-                    frame.mac,
-                    source_address,
-                    config.location,
-                    config.type,
-                    frame.parsed,
-                    timestamp,
-                    connected,
-                )
-            if src == "INOUT":
-                self.power_shadow.update_report(frame.mac, frame.parsed, timestamp)
-                action = inout_report_action(frame.parsed)
-                if action is None:
-                    self.logger.warning(
-                        "Ignoring INOUT report without enter/exit signal mac=%s payload=%r",
-                        frame.mac,
-                        frame.parsed.message,
-                    )
-                else:
-                    event = UnitspaceSignalEvent(
-                        timestamp=timestamp,
-                        mac=frame.mac,
-                        location=config.location,
-                        action=action,
-                        source="REPORT",
-                    )
-                    sent_commands = await self._send_unitspace_commands(
-                        self.estimator.handle(event)
-                    )
-                    self._log_commands(sent_commands)
+            boot_id = frame.parsed.fields.get("boot_id")
+            event_ts_ms = _int_or_none(frame.parsed.fields.get("event_ts_ms"))
+            normalized = self.clock_normalizer.normalize(
+                frame.mac,
+                boot_id,
+                event_ts_ms,
+                timestamp,
+            )
+            report_event = ReportEvent(
+                timestamp=timestamp,
+                mac=frame.mac,
+                source_address=source_address,
+                location=config.location,
+                packet=frame.parsed,
+                payload=frame.payload,
+                device_type=config.type,
+                connected=connected,
+                session_id=self._session_ids.get(normalize_mac(source_address)),
+                receipt_timestamp=timestamp,
+                clock_offset_ms=normalized.offset_ms,
+                clock_error_ms=normalized.error_ms,
+                wrap_epoch=normalized.wrap_epoch,
+                normalized_timestamp=normalized.timestamp,
+            )
+            # Reports are diagnostic evidence even when their source is new to
+            # this Central build, so retain every well-formed REPORT packet.
+            await self.raw_logger.log_report(report_event)
+            if src == "INOUT" and boot_id and event_ts_ms is not None:
+                for ordered_event in self.report_reorder_buffer.push(
+                    report_event,
+                    normalized.timestamp,
+                ):
+                    await self._process_report_event(ordered_event)
+                self._ensure_report_reorder_flush()
+            else:
+                await self._process_report_event(report_event)
             self._log_report(frame)
 
     async def handle_connection_state(
@@ -326,6 +340,10 @@ class SlimHubDaemon:
         timestamp: float,
     ) -> None:
         if connected:
+            normalized = normalize_mac(address)
+            generation = self._session_generation.get(normalized, 0) + 1
+            self._session_generation[normalized] = generation
+            self._session_ids[normalized] = f"{normalized.replace(':', '')}-{generation}"
             self.power_shadow.mark_connected(address, timestamp)
         else:
             self.power_shadow.mark_disconnected(address, timestamp)
@@ -334,10 +352,38 @@ class SlimHubDaemon:
                 timestamp=timestamp,
                 address=address,
                 connected=connected,
+                session_id=self._session_ids.get(normalize_mac(address)),
             )
         )
         state = "connected" if connected else "disconnected"
         self.logger.info("%s %s", address, state)
+
+    async def handle_command_result(
+        self,
+        command: CommandEvent,
+        succeeded: bool,
+        error: str | None,
+        timestamp: float,
+    ) -> None:
+        # A successful GATT write is transport evidence only. Desired/actual
+        # state remains pending until C0/C1 or reconnect STATE reconciliation.
+        await self.raw_logger.log_structured(
+            StructuredEvent(
+                timestamp=timestamp,
+                kind="command_write",
+                mac=command.address,
+                data={
+                    "classification": "write_success" if succeeded else "write_failure",
+                    "command": command.command,
+                    "cmd_id": command.cmd_id,
+                    "desired_epoch": command.desired_epoch,
+                    "canonical_node_id": command.canonical_node_id or command.address,
+                    "ble_address": command.ble_address,
+                    "error": error,
+                    "ack_pending": True,
+                },
+            )
+        )
 
     async def _scan_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -358,6 +404,8 @@ class SlimHubDaemon:
     ) -> list[CommandEvent]:
         sent_commands = []
         for command in commands:
+            ble_address = await self.registry.resolve_address(command.address)
+            command = replace(command, ble_address=ble_address)
             sent = await self.registry.send_command(command)
             if not sent:
                 self.logger.warning(
@@ -372,7 +420,75 @@ class SlimHubDaemon:
                 command.command,
                 time.time(),
             )
+            await self.raw_logger.log_structured(
+                StructuredEvent(
+                    timestamp=time.time(),
+                    kind="command",
+                    mac=command.address,
+                    data={
+                        "classification": "desired_state",
+                        "command": command.command,
+                        "cmd_id": command.cmd_id,
+                        "desired_epoch": command.desired_epoch,
+                        "canonical_node_id": command.canonical_node_id or command.address,
+                        "ble_address": command.ble_address,
+                        "location": command.location,
+                        "estimator_state": self.estimator.snapshot(),
+                    },
+                )
+            )
         return sent_commands
+
+    async def _log_estimator_records(self) -> None:
+        for record in self.estimator.drain_records():
+            await self.raw_logger.log_structured(
+                StructuredEvent(
+                    timestamp=record.timestamp,
+                    kind=record.kind,
+                    mac=record.mac,
+                    data={
+                        **record.data,
+                        "estimator_state": self.estimator.snapshot(),
+                    },
+                )
+            )
+
+    async def _process_report_event(self, event: ReportEvent) -> None:
+        src = event.packet.fields.get("src", "").upper()
+        if src == "USD":
+            self._remember_usd_status(
+                event.mac,
+                event.source_address,
+                event.location,
+                event.device_type,
+                event.packet,
+                event.timestamp,
+                bool(event.connected),
+            )
+        if src == "INOUT":
+            self.power_shadow.update_report(event.mac, event.packet, event.timestamp)
+            sent_commands = await self._send_unitspace_commands(
+                self.estimator.handle_report(event)
+            )
+            await self._log_estimator_records()
+            self._log_commands(sent_commands)
+        if src == "SOUND":
+            self._remember_sound_schema(event.mac, event.packet)
+
+    def _ensure_report_reorder_flush(self) -> None:
+        if self._report_reorder_task is None or self._report_reorder_task.done():
+            self._report_reorder_task = asyncio.create_task(
+                self._flush_reports_after_window(),
+                name="inout-report-reorder",
+            )
+
+    async def _flush_reports_after_window(self) -> None:
+        await asyncio.sleep(self.report_reorder_buffer.window_seconds)
+        await self.flush_report_reorder_buffer()
+
+    async def flush_report_reorder_buffer(self) -> None:
+        for event in self.report_reorder_buffer.flush():
+            await self._process_report_event(event)
 
     async def _source_connected(self, source_address: str) -> bool:
         session = await self.registry.get(source_address)
@@ -638,6 +754,16 @@ class SlimHubDaemon:
                 return dict(status)
         return {}
 
+    def _remember_sound_schema(self, mac: str, report: ReportPacket) -> None:
+        fields = report.fields
+        version = fields.get("schema_version") or fields.get("sound_schema")
+        class_count = _int_or_none(fields.get("class_count"))
+        if version is None and class_count is None:
+            return
+        # The logger validates this pair when it next writes RAWDATA. Keeping
+        # the report visible even when firmware is malformed is intentional.
+        self._sound_schemas[normalize_mac(mac)] = (version, class_count)
+
 
 def _coerce_report_value(value: str) -> object:
     text = value.strip()
@@ -651,3 +777,10 @@ def _coerce_report_value(value: str) -> object:
         return float(text)
     except ValueError:
         return text
+
+
+def _int_or_none(value: object) -> int | None:
+    try:
+        return int(str(value).strip(), 10)
+    except (TypeError, ValueError):
+        return None

@@ -206,6 +206,8 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual([command.command for command in session.commands], ["enter"])
             self.assertEqual(session.commands[0].address, frame_mac)
+            self.assertEqual(session.commands[0].canonical_node_id, frame_mac)
+            self.assertEqual(session.commands[0].ble_address, ble_address)
 
     async def test_report_enter_new_node_sends_enter_new_then_exit_previous(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -303,6 +305,83 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status["file"], "LOG/001.CSV")
             self.assertEqual(status["uptime"], 12345)
             self.assertEqual(status["ok"], 1)
+
+    async def test_two_node_ack_replay_confirms_only_destination_without_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            a = FakeSession("AA:BB:CC:DD:EE:01")
+            b = FakeSession("AA:BB:CC:DD:EE:02")
+            await daemon.registry.add(a)
+            await daemon.registry.add(b)
+            daemon.config_store.set_field(a.address, "location", "ENTRY")
+            daemon.config_store.set_field(b.address, "location", "LIVING")
+
+            await daemon.handle_frame(a.address, raw_frame(a.address, 10))
+            await daemon.handle_frame(
+                a.address,
+                report_frame(
+                    a.address,
+                    "src=INOUT,event=SEQUENCE,result=ENTER_CONFIRMED,event_id=D0,boot_id=a,event_seq=1,event_ts_ms=1000",
+                    {
+                        "src": "INOUT", "event": "SEQUENCE", "result": "ENTER_CONFIRMED",
+                        "event_id": "D0", "boot_id": "a", "event_seq": "1", "event_ts_ms": "1000",
+                    },
+                ),
+            )
+            await daemon.handle_frame(b.address, raw_frame(b.address, 10))
+            await daemon.handle_frame(
+                b.address,
+                report_frame(
+                    b.address,
+                    "src=INOUT,event=SEQUENCE,result=ENTER_CONFIRMED,event_id=D0,boot_id=b,event_seq=1,event_ts_ms=2000",
+                    {
+                        "src": "INOUT", "event": "SEQUENCE", "result": "ENTER_CONFIRMED",
+                        "event_id": "D0", "boot_id": "b", "event_seq": "1", "event_ts_ms": "2000",
+                    },
+                ),
+            )
+            await daemon.handle_frame(
+                a.address,
+                report_frame(
+                    a.address,
+                    "src=INOUT,event=SEQUENCE,result=EXIT_CONFIRMED,event_id=D1,boot_id=a,event_seq=2,event_ts_ms=2200",
+                    {
+                        "src": "INOUT", "event": "SEQUENCE", "result": "EXIT_CONFIRMED",
+                        "event_id": "D1", "boot_id": "a", "event_seq": "2", "event_ts_ms": "2200",
+                    },
+                ),
+            )
+
+            await daemon.flush_report_reorder_buffer()
+
+            self.assertEqual([command.command for command in a.commands], ["enter", "exit"])
+            self.assertEqual([command.command for command in b.commands], ["enter"])
+            self.assertEqual(
+                daemon.estimator.snapshot()["confirmed_occupants"],
+                [b.address],
+            )
+
+    async def test_malformed_inout_event_and_sequence_do_not_stop_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            address = "AA:BB:CC:DD:EE:01"
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            session = FakeSession(address)
+            await daemon.registry.add(session)
+
+            for message, fields in (
+                (
+                    "src=INOUT,event=EVENT,id=C0,primary_seq=bad",
+                    {"src": "INOUT", "event": "EVENT", "id": "C0", "primary_seq": "bad"},
+                ),
+                (
+                    "src=INOUT,event=SEQUENCE,result=ENTER_CONFIRMED,event_id=D0,event_seq=bad",
+                    {"src": "INOUT", "event": "SEQUENCE", "result": "ENTER_CONFIRMED", "event_id": "D0", "event_seq": "bad"},
+                ),
+            ):
+                await daemon.handle_frame(address, report_frame(address, message, fields))
+
+            self.assertFalse(daemon.stop_event.is_set())
+            self.assertEqual(session.commands, [])
 
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@ from slimhub.protocol.nus import (
 
 FrameHandler = Callable[[str, ParsedFrame], Awaitable[None]]
 ConnectionStateHandler = Callable[[str, bool, float], Awaitable[None]]
+CommandResultHandler = Callable[[CommandEvent, bool, str | None, float], Awaitable[None]]
 
 
 class DeviceSession:
@@ -33,6 +34,7 @@ class DeviceSession:
         *,
         on_frame: FrameHandler,
         on_connection_state: ConnectionStateHandler | None = None,
+        on_command_result: CommandResultHandler | None = None,
         reconnect_delay: float = 3.0,
         connect_timeout: float = 10.0,
         notify_timeout: float = 5.0,
@@ -44,6 +46,7 @@ class DeviceSession:
         self.name = str(getattr(target, "name", "") or "")
         self.on_frame = on_frame
         self.on_connection_state = on_connection_state
+        self.on_command_result = on_command_result
         self.reconnect_delay = reconnect_delay
         self.connect_timeout = connect_timeout
         self.notify_timeout = notify_timeout
@@ -59,7 +62,9 @@ class DeviceSession:
         self._stop_event = asyncio.Event()
         self._target_updated_event = asyncio.Event()
         self._target_updated_event.set()
-        self._command_queue: asyncio.Queue[CommandEvent] = asyncio.Queue()
+        self._command_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._pending_commands: dict[str, CommandEvent] = {}
+        self._command_lock = asyncio.Lock()
         self._client: BleakClient | None = None
         self._task: asyncio.Task[None] | None = None
 
@@ -83,7 +88,14 @@ class DeviceSession:
             self._task = None
 
     async def send_command(self, command: CommandEvent) -> None:
-        await self._command_queue.put(command)
+        # A disconnected node must converge to its final desired state, not
+        # replay every historical enter/exit command after reconnect.
+        key = normalize_mac(command.canonical_node_id or command.address)
+        async with self._command_lock:
+            was_pending = key in self._pending_commands
+            self._pending_commands[key] = command
+            if not was_pending:
+                await self._command_queue.put(key)
 
     def status(self) -> dict[str, object]:
         return {
@@ -93,7 +105,7 @@ class DeviceSession:
             "last_seen": self.last_seen,
             "last_error": self.last_error,
             "waiting_for_advertisement": self.waiting_for_advertisement,
-            "queued_commands": self._command_queue.qsize(),
+            "queued_commands": len(self._pending_commands),
         }
 
     async def _run(self) -> None:
@@ -210,10 +222,15 @@ class DeviceSession:
 
     async def _command_worker(self, client: BleakClient) -> None:
         while not self._stop_event.is_set():
-            command = await self._command_queue.get()
+            key = await self._command_queue.get()
+            async with self._command_lock:
+                command = self._pending_commands.pop(key, None)
+            if command is None:
+                continue
             try:
                 frame = build_command_frame(command.address, command.command)
                 await client.write_gatt_char(NUS_RX_WRITE_UUID, frame, response=False)
+                await self._notify_command_result(command, True, None)
             except Exception as exc:
                 self.last_error = str(exc)
                 self.logger.exception(
@@ -222,6 +239,24 @@ class DeviceSession:
                     command.address,
                     command.command,
                 )
+                await self._notify_command_result(command, False, str(exc))
+                async with self._command_lock:
+                    # Preserve a newer desired state if one arrived while the
+                    # write was in flight; otherwise retry this idempotent
+                    # command after a short backoff.
+                    if key not in self._pending_commands:
+                        self._pending_commands[key] = command
+                        await self._command_queue.put(key)
+                await asyncio.sleep(min(self.reconnect_delay, 1.0))
+
+    async def _notify_command_result(
+        self,
+        command: CommandEvent,
+        succeeded: bool,
+        error: str | None,
+    ) -> None:
+        if self.on_command_result is not None:
+            await self.on_command_result(command, succeeded, error, time.time())
 
     async def _wait_for_target_update(self) -> None:
         while not self._stop_event.is_set():

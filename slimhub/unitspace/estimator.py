@@ -1,25 +1,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Iterable
 
 from slimhub.config import DEFAULT_LOCATION
-from slimhub.events import CommandEvent, RawDataEvent, UnitspaceSignalEvent
+from slimhub.events import CommandEvent, RawDataEvent, ReportEvent, UnitspaceSignalEvent
 from slimhub.protocol.nus import ReportPacket, normalize_mac
 
-# detected=1 is the legacy PIR-only enter signal; new DEAN_Node_v2 firmware
-# uses detected=10 as the primary PIR+RADAR-confirmed enter signal.
+
 LEGACY_PIR_ENTER_SIGNAL = 1
 RADAR_CONFIRMED_ENTER_SIGNAL = 10
-ENTER_SIGNALS = {LEGACY_PIR_ENTER_SIGNAL, RADAR_CONFIRMED_ENTER_SIGNAL}
 EXIT_SIGNAL = 20
-NOISE_THRESHOLD_SECONDS = 5.0
 ENTER_ACTION = "enter"
 EXIT_ACTION = "exit"
 INOUT_REPORT_SRC = "INOUT"
+SIDECAR_COALESCE_SECONDS = 5.0
+SIDECAR_FALLBACK_DEDUPE_SECONDS = 1.0
 
 
 @dataclass
 class UnitspaceStatus:
+    # ``last_*`` is retained for the CLI/API compatibility, but describes the
+    # desired occupant.  ``confirmed_occupants`` is driven only by D0/D1.
     last_address: str | None = None
     last_location: str | None = None
     last_timestamp: float = 0.0
@@ -28,58 +30,199 @@ class UnitspaceStatus:
     last_signal_timestamp: float = 0.0
 
 
+@dataclass(frozen=True)
+class EstimatorRecord:
+    kind: str
+    mac: str
+    timestamp: float
+    data: dict[str, object]
+
+
 class SimpleUnitspaceEstimator:
+    """Turn strong IN/OUT evidence into desired-state commands.
+
+    RAW10 and its ENTER sidecar deliberately share a candidate.  Reports that
+    acknowledge commands or replay a sequence never enter this method as a
+    movement candidate, which prevents the D0/D1 feedback loop.
+    """
+
     def __init__(self) -> None:
         self.status = UnitspaceStatus()
+        self._last_raw_enter: dict[str, float] = {}
+        self._last_sidecar: dict[tuple[str, str], float] = {}
+        self._seen_primary: set[tuple[str, str, int]] = set()
+        self._seen_sequence: set[tuple[str, str, int]] = set()
+        self._desired_epoch = 0
+        self._acks: dict[str, dict[str, object]] = {}
+        self._confirmed_occupants: set[str] = set()
+        self._records: list[EstimatorRecord] = []
 
     def handle(self, event: RawDataEvent | UnitspaceSignalEvent) -> list[CommandEvent]:
-        signal = self._signal_from_event(event)
-        if signal is None:
+        """Consume raw evidence or a preliminary ENTER sidecar.
+
+        Legacy ``detected=1`` is stored as low-confidence evidence only.  It
+        cannot create an occupancy transition or an enter command.
+        """
+        if isinstance(event, RawDataEvent):
+            address = normalize_mac(event.mac)
+            timestamp = event.receipt_timestamp or event.timestamp
+            if event.packet.flag_human_presence != 1:
+                return []
+            if event.packet.detected == RADAR_CONFIRMED_ENTER_SIGNAL:
+                self._last_raw_enter[address] = timestamp
+                self._record("candidate", address, timestamp, source="RAW10", confidence="strong")
+                return self._handle_enter(address, event.location, timestamp)
+            if event.packet.detected == LEGACY_PIR_ENTER_SIGNAL:
+                self._record(
+                    "candidate",
+                    address,
+                    timestamp,
+                    source="RAW1",
+                    confidence="low",
+                    discard_reason="legacy_pir_evidence",
+                )
             return []
 
-        address, location, timestamp, action = signal
-        if self._is_duplicate_signal(address, action, timestamp):
-            if action == ENTER_ACTION and address == self.status.last_address:
-                self._remember_current(address, location, timestamp)
-            self._remember_signal(address, action, timestamp)
+        address = normalize_mac(event.mac)
+        timestamp = event.normalized_timestamp or event.timestamp
+        if event.confidence != "strong":
+            self._record(
+                "candidate",
+                address,
+                timestamp,
+                source=event.source,
+                confidence=event.confidence,
+                discard_reason="low_confidence",
+            )
+            return []
+        if self._is_exact_replay(event):
+            self._record("discard", address, timestamp, reason="exact_replay", source=event.source)
             return []
 
-        self._remember_signal(address, action, timestamp)
-        if action == ENTER_ACTION:
-            return self._handle_enter(address, location, timestamp)
-        return self._handle_exit(address, location, timestamp)
+        if event.action == ENTER_ACTION:
+            raw_timestamp = self._last_raw_enter.get(address)
+            if raw_timestamp is not None and abs(timestamp - raw_timestamp) <= SIDECAR_COALESCE_SECONDS:
+                self._remember_current(address, event.location, timestamp)
+                self._record(
+                    "candidate",
+                    address,
+                    timestamp,
+                    source="ENTER_SIDECAR",
+                    coalesced_with="RAW10",
+                )
+                return []
 
-    def _handle_enter(
-        self,
-        address: str,
-        location: str,
-        timestamp: float,
-    ) -> list[CommandEvent]:
-        if self.status.last_address is None:
-            self._remember_current(address, location, timestamp)
-            return [CommandEvent(address, ENTER_ACTION, location)]
+            fallback_key = (address, ENTER_ACTION)
+            previous = self._last_sidecar.get(fallback_key)
+            self._last_sidecar[fallback_key] = timestamp
+            if previous is not None and abs(timestamp - previous) <= SIDECAR_FALLBACK_DEDUPE_SECONDS:
+                self._record("discard", address, timestamp, reason="sidecar_fallback_dedupe")
+                return []
+            self._record("candidate", address, timestamp, source="ENTER_SIDECAR", coalesced_with=None)
+            return self._handle_enter(address, event.location, timestamp)
 
-        if address == self.status.last_address:
-            self._remember_current(address, location, timestamp)
+        if event.action == EXIT_ACTION:
+            # Kept only for older nodes that still emit raw/report exit
+            # candidates. C1/D1 never reach here.
+            return self._handle_legacy_exit(address, event.location, timestamp)
+        return []
+
+    def handle_report(self, event: ReportEvent) -> list[CommandEvent]:
+        """Record ACK/confirmation reports and handle ENTER sidecars only."""
+        report = event.packet
+        fields = report.fields
+        if fields.get("src", "").strip().upper() != INOUT_REPORT_SRC:
             return []
 
-        previous_address = self.status.last_address
-        previous_location = self.status.last_location or DEFAULT_LOCATION
-        self._remember_current(address, location, timestamp)
-        return [
-            CommandEvent(address, ENTER_ACTION, location),
-            CommandEvent(previous_address, EXIT_ACTION, previous_location),
-        ]
+        event_name = fields.get("event", "").strip().upper()
+        address = normalize_mac(event.mac)
+        timestamp = event.normalized_timestamp or event.receipt_timestamp or event.timestamp
+        boot_id = _optional_text(fields.get("boot_id"))
+        primary_seq = _int_or_none(fields.get("primary_seq"))
+        event_seq = _int_or_none(fields.get("event_seq"))
+        event_id = _optional_text(fields.get("event_id") or fields.get("id"))
+        node_timestamp = _int_or_none(fields.get("event_ts_ms"))
 
-    def _handle_exit(
-        self,
-        address: str,
-        location: str,
-        timestamp: float,
-    ) -> list[CommandEvent]:
-        if address == self.status.last_address:
-            self._clear_current(timestamp)
-        return [CommandEvent(address, EXIT_ACTION, location)]
+        if event_name == "EVENT":
+            if self._is_primary_replay(address, boot_id, primary_seq):
+                self._record("discard", address, timestamp, reason="primary_replay")
+                return []
+            if event_id in {"C0", "C1"}:
+                action = ENTER_ACTION if event_id == "C0" else EXIT_ACTION
+                self._acks[address] = {
+                    "event_id": event_id,
+                    "action": action,
+                    "cmd_id": _optional_text(fields.get("cmd_id")),
+                    "applied_state": fields.get("occupied") or fields.get("applied_state"),
+                    "target_match": fields.get("target_match"),
+                    "source_count": fields.get("source_count"),
+                    "ack_timestamp": timestamp,
+                }
+                self._record("ack", address, timestamp, **self._acks[address])
+            return []
+
+        if event_name == "SEQUENCE":
+            if self._is_sequence_replay(address, boot_id, event_seq):
+                self._record("discard", address, timestamp, reason="sequence_replay")
+                return []
+            result = fields.get("result", "").strip().upper()
+            if result == "ENTER_CONFIRMED" and event_id == "D0":
+                self._confirmed_occupants.add(address)
+                self._record("transition", address, timestamp, result=result, event_id=event_id)
+            elif result == "EXIT_CONFIRMED" and event_id == "D1":
+                self._confirmed_occupants.discard(address)
+                self._record("transition", address, timestamp, result=result, event_id=event_id)
+            else:
+                self._record("sequence", address, timestamp, result=result, event_id=event_id)
+            # Never feed SEQUENCE reports into candidate inference.
+            return []
+
+        if event_name == "STATE" and "occupied" in fields:
+            occupied = _bool_or_none(fields.get("occupied"))
+            if occupied is not None:
+                if occupied:
+                    self._confirmed_occupants.add(address)
+                else:
+                    self._confirmed_occupants.discard(address)
+                self._record("reconciliation", address, timestamp, occupied=occupied)
+            return []
+
+        if _is_preliminary_enter_report(report):
+            return self.handle(
+                UnitspaceSignalEvent(
+                    timestamp=timestamp,
+                    mac=address,
+                    location=event.location,
+                    action=ENTER_ACTION,
+                    source="REPORT",
+                    boot_id=boot_id,
+                    event_seq=event_seq,
+                    event_id=event_id,
+                    event_timestamp_ms=node_timestamp,
+                    normalized_timestamp=timestamp,
+                )
+            )
+
+        # Legacy report support. New C1/D1 flows never match this condition.
+        if inout_report_action(report) == EXIT_ACTION:
+            return self.handle(
+                UnitspaceSignalEvent(
+                    timestamp=timestamp,
+                    mac=address,
+                    location=event.location,
+                    action=EXIT_ACTION,
+                    source="REPORT_LEGACY",
+                    boot_id=boot_id,
+                    primary_seq=primary_seq,
+                    event_timestamp_ms=node_timestamp,
+                    normalized_timestamp=timestamp,
+                )
+            )
+        return []
+
+    def drain_records(self) -> list[EstimatorRecord]:
+        records, self._records = self._records, []
+        return records
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -89,12 +232,88 @@ class SimpleUnitspaceEstimator:
             "last_signal_address": self.status.last_signal_address,
             "last_signal_action": self.status.last_signal_action,
             "last_signal_timestamp": self.status.last_signal_timestamp,
+            "desired_address": self.status.last_address,
+            "confirmed_occupants": sorted(self._confirmed_occupants),
+            "acks": {address: dict(ack) for address, ack in self._acks.items()},
         }
+
+    @staticmethod
+    def reorder(events: Iterable[UnitspaceSignalEvent]) -> list[UnitspaceSignalEvent]:
+        """Stable utility for queued/replayed reports after clock normalization."""
+        return sorted(events, key=lambda item: item.normalized_timestamp or item.timestamp)
+
+    def _handle_enter(self, address: str, location: str, timestamp: float) -> list[CommandEvent]:
+        location = location or DEFAULT_LOCATION
+        if self.status.last_address is None:
+            before = self.status.last_address
+            self._remember_current(address, location, timestamp)
+            return [self._command(address, ENTER_ACTION, location, timestamp, before=before)]
+        if address == self.status.last_address:
+            self._remember_current(address, location, timestamp)
+            self._record("candidate", address, timestamp, result="same_desired_node")
+            return []
+
+        previous_address = self.status.last_address
+        previous_location = self.status.last_location or DEFAULT_LOCATION
+        self._remember_current(address, location, timestamp)
+        return [
+            self._command(address, ENTER_ACTION, location, timestamp, before=previous_address),
+            self._command(previous_address, EXIT_ACTION, previous_location, timestamp, before=previous_address),
+        ]
+
+    def _handle_legacy_exit(self, address: str, location: str, timestamp: float) -> list[CommandEvent]:
+        self._remember_signal(address, EXIT_ACTION, timestamp)
+        if address != self.status.last_address:
+            self._record("discard", address, timestamp, reason="exit_not_desired_occupant")
+            return []
+        before = self.status.last_address
+        self._clear_current(timestamp)
+        return [
+            self._command(
+                address,
+                EXIT_ACTION,
+                location or DEFAULT_LOCATION,
+                timestamp,
+                before=before,
+            )
+        ]
+
+    def _command(
+        self,
+        address: str,
+        action: str,
+        location: str,
+        timestamp: float,
+        *,
+        before: str | None,
+    ) -> CommandEvent:
+        self._desired_epoch += 1
+        command = CommandEvent(
+            address=address,
+            command=action,
+            location=location,
+            cmd_id=f"{address.replace(':', '')}-{self._desired_epoch}",
+            desired_epoch=self._desired_epoch,
+            canonical_node_id=address,
+            created_at=timestamp,
+        )
+        self._record(
+            "command",
+            address,
+            timestamp,
+            command=action,
+            cmd_id=command.cmd_id,
+            desired_epoch=command.desired_epoch,
+            estimator_before=before,
+            estimator_after=self.status.last_address,
+        )
+        return command
 
     def _remember_current(self, address: str, location: str, timestamp: float) -> None:
         self.status.last_address = address
-        self.status.last_location = location
+        self.status.last_location = location or DEFAULT_LOCATION
         self.status.last_timestamp = timestamp
+        self._remember_signal(address, ENTER_ACTION, timestamp)
 
     def _clear_current(self, timestamp: float) -> None:
         self.status.last_address = None
@@ -106,55 +325,60 @@ class SimpleUnitspaceEstimator:
         self.status.last_signal_action = action
         self.status.last_signal_timestamp = timestamp
 
-    def _is_duplicate_signal(
-        self,
-        address: str,
-        action: str,
-        timestamp: float,
-    ) -> bool:
-        return (
-            address == self.status.last_signal_address
-            and action == self.status.last_signal_action
-            and timestamp - self.status.last_signal_timestamp < NOISE_THRESHOLD_SECONDS
-        )
-
-    def _signal_from_event(
-        self,
-        event: RawDataEvent | UnitspaceSignalEvent,
-    ) -> tuple[str, str, float, str] | None:
+    def _is_exact_replay(self, event: UnitspaceSignalEvent) -> bool:
         address = normalize_mac(event.mac)
-        location = event.location or DEFAULT_LOCATION
-        if isinstance(event, UnitspaceSignalEvent):
-            if event.action not in {ENTER_ACTION, EXIT_ACTION}:
-                return None
-            return address, location, event.timestamp, event.action
+        if event.source == "PRIMARY" and event.boot_id and event.primary_seq is not None:
+            return self._is_primary_replay(address, event.boot_id, event.primary_seq)
+        if event.boot_id and event.event_seq is not None:
+            return self._is_sequence_replay(address, event.boot_id, event.event_seq)
+        return False
 
-        if event.packet.flag_human_presence != 1:
-            return None
-        if event.packet.detected in ENTER_SIGNALS:
-            return address, location, event.timestamp, ENTER_ACTION
-        if event.packet.detected == EXIT_SIGNAL:
-            return address, location, event.timestamp, EXIT_ACTION
-        return None
+    def _is_primary_replay(self, address: str, boot_id: str | None, primary_seq: int | None) -> bool:
+        if boot_id is None or primary_seq is None:
+            return False
+        key = (address, boot_id, primary_seq)
+        if key in self._seen_primary:
+            return True
+        self._seen_primary.add(key)
+        return False
+
+    def _is_sequence_replay(self, address: str, boot_id: str | None, event_seq: int | None) -> bool:
+        if boot_id is None or event_seq is None:
+            return False
+        key = (address, boot_id, event_seq)
+        if key in self._seen_sequence:
+            return True
+        self._seen_sequence.add(key)
+        return False
+
+    def _record(self, kind: str, mac: str, timestamp: float, **data: object) -> None:
+        self._records.append(EstimatorRecord(kind, normalize_mac(mac), timestamp, dict(data)))
 
 
 def inout_report_action(report: ReportPacket) -> str | None:
     if report.fields.get("src", "").strip().upper() != INOUT_REPORT_SRC:
         return None
-
+    if _is_preliminary_enter_report(report):
+        return ENTER_ACTION
     event = report.fields.get("event", "").strip().upper()
     signal = report.fields.get("signal", "").strip().lower()
     code = _int_or_none(report.fields.get("code"))
+    if event == "EXIT" or signal == EXIT_ACTION or code == EXIT_SIGNAL:
+        return EXIT_ACTION
+    return None
 
-    has_enter = (
-        event == "ENTER"
-        or signal == ENTER_ACTION
-        or code == RADAR_CONFIRMED_ENTER_SIGNAL
+
+def _is_preliminary_enter_report(report: ReportPacket) -> bool:
+    fields = report.fields
+    if fields.get("src", "").strip().upper() != INOUT_REPORT_SRC:
+        return False
+    return (
+        fields.get("event", "").strip().upper() == "ENTER"
+        and (
+            fields.get("signal", "").strip().lower() == ENTER_ACTION
+            or _int_or_none(fields.get("code")) == RADAR_CONFIRMED_ENTER_SIGNAL
+        )
     )
-    has_exit = event == "EXIT" or signal == EXIT_ACTION or code == EXIT_SIGNAL
-    if has_enter == has_exit:
-        return None
-    return ENTER_ACTION if has_enter else EXIT_ACTION
 
 
 def _int_or_none(value: object) -> int | None:
@@ -162,3 +386,17 @@ def _int_or_none(value: object) -> int | None:
         return int(str(value).strip(), 10)
     except (TypeError, ValueError):
         return None
+
+
+def _optional_text(value: object) -> str | None:
+    text = str(value).strip() if value is not None else ""
+    return text or None
+
+
+def _bool_or_none(value: object) -> bool | None:
+    text = str(value).strip().lower() if value is not None else ""
+    if text in {"1", "true", "yes", "inside", "occupied"}:
+        return True
+    if text in {"0", "false", "no", "outside", "vacant"}:
+        return False
+    return None

@@ -7,24 +7,18 @@ from datetime import datetime
 from pathlib import Path
 
 from slimhub.config import DEFAULT_DEVICE_TYPE, DEFAULT_LOCATION, AppPaths
-from slimhub.events import AlertEvent, ConnectionStateEvent, RawDataEvent, ReportEvent
+from slimhub.events import (
+    AlertEvent,
+    ConnectionStateEvent,
+    RawDataEvent,
+    ReportEvent,
+    StructuredEvent,
+)
+from slimhub.logging.sound_schema import B_TFLM_V1_SCHEMA, resolve_sound_schema
 from slimhub.protocol.nus import normalize_mac
 
 
-SOUND_CLASSLIST = [
-    "background",
-    "hitting",
-    "speech_tv",
-    "air_appliances",
-    "brushing",
-    "peeing",
-    "flushing",
-    "flush_end",
-    "microwave",
-    "cooking",
-    "watering_low",
-    "watering_high",
-]
+SOUND_CLASSLIST = list(B_TFLM_V1_SCHEMA.labels)
 
 CSV_FIELDS = [
     "time",
@@ -58,7 +52,12 @@ class RawDataLogger:
     def __init__(self, paths: AppPaths) -> None:
         self.paths = paths
         self._queue: asyncio.Queue[
-            RawDataEvent | AlertEvent | ReportEvent | ConnectionStateEvent | None
+            RawDataEvent
+            | AlertEvent
+            | ReportEvent
+            | ConnectionStateEvent
+            | StructuredEvent
+            | None
         ] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
 
@@ -98,6 +97,12 @@ class RawDataLogger:
             return
         await self._queue.put(event)
 
+    async def log_structured(self, event: StructuredEvent) -> None:
+        if self._task is None:
+            await self.write_structured(event)
+            return
+        await self._queue.put(event)
+
     async def _run(self) -> None:
         while True:
             event = await self._queue.get()
@@ -109,6 +114,8 @@ class RawDataLogger:
                 await self.write_report(event)
             elif isinstance(event, ConnectionStateEvent):
                 await self.write_connection_state(event)
+            elif isinstance(event, StructuredEvent):
+                await self.write_structured(event)
             else:
                 await self.write_event(event)
 
@@ -121,6 +128,29 @@ class RawDataLogger:
             if needs_header:
                 writer.writeheader()
             writer.writerow(self._row_for(event))
+        await self.write_structured(
+            StructuredEvent(
+                timestamp=event.receipt_timestamp or event.timestamp,
+                kind="raw",
+                mac=event.mac,
+                data={
+                    "ble_address": event.source_address,
+                    "location": event.location or DEFAULT_LOCATION,
+                    "device_type": event.device_type or DEFAULT_DEVICE_TYPE,
+                    "session_id": event.session_id,
+                    "packet_type": "RAWDATA",
+                    "raw_payload_hex": event.payload.hex(),
+                    "parsed": {
+                        "flag_human_presence": event.packet.flag_human_presence,
+                        "detected": event.packet.detected,
+                        "flag_env": event.packet.flag_env,
+                        "flag_sound": event.packet.flag_sound,
+                    },
+                    "sound_schema_version": event.sound_schema_version,
+                    "sound_class_count": event.sound_class_count,
+                },
+            )
+        )
 
     async def write_alert(self, event: AlertEvent) -> None:
         path = self._alert_path_for(event)
@@ -153,6 +183,20 @@ class RawDataLogger:
                 )
                 + "\n"
             )
+
+    async def write_structured(self, event: StructuredEvent) -> None:
+        path = self._structured_path_for(event.timestamp)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.fromtimestamp(event.timestamp)
+        row: dict[str, object] = {
+            "kind": event.kind,
+            "time": timestamp.isoformat(timespec="milliseconds"),
+            "receipt_ts": event.timestamp,
+            "mac": normalize_mac(event.mac),
+            **event.data,
+        }
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
     def _path_for(self, event: RawDataEvent) -> Path:
         timestamp = datetime.fromtimestamp(event.timestamp)
@@ -191,8 +235,14 @@ class RawDataLogger:
     def _row_for(self, event: RawDataEvent) -> dict[str, object]:
         timestamp = datetime.fromtimestamp(event.timestamp)
         packet = event.packet
-        sound = list(packet.sound[: len(SOUND_CLASSLIST)])
-        sound.extend([0] * (len(SOUND_CLASSLIST) - len(sound)))
+        try:
+            schema = resolve_sound_schema(event.sound_schema_version, event.sound_class_count)
+        except ValueError:
+            # Preserve the raw packet and avoid inventing labels if a firmware
+            # report advertises an incompatible schema.
+            schema = B_TFLM_V1_SCHEMA
+        sound = list(packet.sound[: schema.class_count])
+        sound.extend([None] * (schema.class_count - len(sound)))
 
         row: dict[str, object] = {
             "time": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
@@ -206,8 +256,10 @@ class RawDataLogger:
             "bvoc": packet.bvoc,
             "SOUND": packet.flag_sound,
         }
-        for label, value in zip(SOUND_CLASSLIST, sound):
-            row[label] = (value + 128) / 256
+        for label, value in zip(schema.labels, sound):
+            # A zero byte is the firmware's padding for an untransmitted score;
+            # it must not become a plausible-looking 0.5 probability.
+            row[label] = "" if not packet.flag_sound or value in (None, 0) else (value + 128) / 256
         return row
 
     def _alert_line_for(self, event: AlertEvent) -> str:
@@ -236,7 +288,13 @@ class RawDataLogger:
             "location": event.location or DEFAULT_LOCATION,
             "device_type": event.device_type or DEFAULT_DEVICE_TYPE,
             "connected": event.connected,
+            "session_id": event.session_id,
+            "receipt_ts": event.receipt_timestamp or event.timestamp,
+            "clock_offset_ms": event.clock_offset_ms,
+            "clock_error_ms": event.clock_error_ms,
+            "wrap_epoch": event.wrap_epoch,
             "packet_type": "REPORT",
+            "raw_payload_hex": event.payload.hex(),
             "src": fields.get("src", ""),
             "event": fields.get("event", ""),
             "message": event.packet.message,
@@ -245,6 +303,17 @@ class RawDataLogger:
         for key in USD_STATUS_FIELDS:
             if key in fields:
                 row[key] = fields[key]
+        for key in ("boot_id", "primary_seq", "event_seq", "event_id", "id", "event_ts_ms", "cmd_id", "target_match", "occupied", "source_count"):
+            if key in fields:
+                row[key] = fields[key]
+        event_id = str(fields.get("event_id") or fields.get("id") or "").upper()
+        result = str(fields.get("result") or "").upper()
+        if event_id in {"C0", "C1"}:
+            row["classification"] = "ack"
+        elif event_id in {"D0", "D1"} or result.endswith("CONFIRMED"):
+            row["classification"] = "transition"
+        else:
+            row["classification"] = "report"
         return row
 
     def _connection_state_row_for(
@@ -260,4 +329,5 @@ class RawDataLogger:
             "mac": address,
             "ble_address": address,
             "connected": event.connected,
+            "session_id": event.session_id,
         }

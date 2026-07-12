@@ -56,6 +56,45 @@ class RawLoggerTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(lines[0].startswith("time,GridEye,Direction"))
             self.assertIn(",1,1,0,0.00,0,0,0,0,0,", lines[1])
 
+    async def test_b_tflm_sound_schema_has_ten_labels_and_never_dequantizes_padding_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = AppPaths.from_base(tmpdir)
+            logger = RawDataLogger(paths)
+            packet = RawDataPacket(
+                flag_human_presence=0,
+                detected=0,
+                flag_env=0,
+                temperature_c=0.0,
+                humidity=0,
+                iaq=0,
+                eco2=0,
+                bvoc=0,
+                accuracy=0,
+                flag_sound=1,
+                sound=[-128, -64, 0, 64, 127, 0, 0, 0, 12, 34, 99, 99, 99, 99, 99, 99],
+                is_pir_human_detection_event=False,
+            )
+            event = RawDataEvent(
+                timestamp=0.0,
+                mac="AA:BB:CC:DD:EE:FF",
+                location="ENTRY",
+                packet=packet,
+                payload=b"raw",
+                sound_schema_version="b-tflm-v1",
+                sound_class_count=10,
+            )
+
+            await logger.write_event(event)
+
+            path = next((Path(tmpdir) / "data").glob("*/*/*/inference/rawdata/*.txt"))
+            header, row = path.read_text(encoding="utf-8").splitlines()
+            self.assertIn("watering_low", header)
+            self.assertIn("watering_high", header)
+            self.assertNotIn("microwave", header)
+            self.assertNotIn("cooking", header)
+            # 0-valued score padding is written as an empty CSV cell, not 0.5.
+            self.assertNotIn(",0.5,", f",{row},")
+
     async def test_alert_logger_writes_data_directory_without_rawdata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = AppPaths.from_base(tmpdir)

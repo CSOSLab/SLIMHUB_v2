@@ -1,0 +1,5 @@
+{"kind":"raw","mac":"AA:BB:CC:DD:EE:01","location":"ENTRY","receipt_ts":100.000,"detected":10}
+{"kind":"report","mac":"AA:BB:CC:DD:EE:01","location":"ENTRY","receipt_ts":100.120,"src":"INOUT","event":"SEQUENCE","result":"ENTER_CONFIRMED","event_id":"D0","boot_id":"node-a","event_seq":41,"event_ts_ms":1200}
+{"kind":"raw","mac":"AA:BB:CC:DD:EE:02","location":"LIVING","receipt_ts":102.000,"detected":10}
+{"kind":"report","mac":"AA:BB:CC:DD:EE:02","location":"LIVING","receipt_ts":102.100,"src":"INOUT","event":"SEQUENCE","result":"ENTER_CONFIRMED","event_id":"D0","boot_id":"node-b","event_seq":9,"event_ts_ms":560000}
+{"kind":"report","mac":"AA:BB:CC:DD:EE:01","location":"ENTRY","receipt_ts":102.150,"src":"INOUT","event":"SEQUENCE","result":"EXIT_CONFIRMED","event_id":"D1","boot_id":"node-a","event_seq":42,"event_ts_ms":3350}

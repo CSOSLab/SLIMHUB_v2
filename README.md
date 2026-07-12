@@ -83,7 +83,7 @@ Rawdata 로그는
 `data/<location>/<type>/<MAC>/inference/rawdata/YYYY-MM-DD.txt`에 누적됩니다.
 Alert/debug 텍스트는
 `data/<location>/<type>/<MAC>/inference/debugstr/YYYY-MM-DD.txt`에 누적됩니다.
-`REPORT src=POWER/INOUT/ENV/USD`와 BLE 연결/해제 event는
+모든 `RAWDATA`, `REPORT`, command lifecycle과 BLE 연결/해제 event는
 `programdata/reports/YYYY-MM-DD.jsonl`에 JSONL로 누적됩니다. 각 record에는
 frame MAC, BLE source address, packet receive time, `src`, `event`,
 parsed fields, connected state가 포함됩니다. `USD STATUS`의 `batt_mv`,
@@ -115,28 +115,34 @@ Inbound packet type은 다음과 같습니다.
 
 ### DEAN_Node_v2 PIR+RADAR IN/OUT
 
-현재 DEAN_Node_v2 firmware는 PIR 단독 trigger만으로 RAWDATA unitspace enter를
-보내지 않습니다. PIR은 firmware 내부 IN/OUT state machine을 시작하고,
-이후 RADAR가 presence를 confirm하면 RAWDATA에서 `flag_human_presence=1`,
-`detected=10`을 보냅니다. SLIMHUB_v2는 `detected=10`을 primary
-RADAR-confirmed unitspace `enter`로 처리합니다.
+현재 A(NCS) firmware에서 RAWDATA `flag_human_presence=1, detected=10`은
+PIR+RADAR가 확인한 **preliminary ENTER candidate**입니다. Central은 해당
+후보에 대해 원하는 node state를 명령하지만, BLE write만으로 점유를 확정하지
+않습니다. 같은 node의 `ENTER,code=10` REPORT는 RAW10 metadata sidecar이므로
+두 packet은 한 후보로 coalesce됩니다.
 
-`detected=1`은 이전 firmware를 위한 legacy PIR-only enter signal로
-유지합니다. `detected=20`은 계속 unitspace `exit` signal입니다.
+`detected=1`은 legacy PIR-only low-confidence evidence입니다. flood가 나도
+strong occupancy transition이나 `enter` command를 만들지 않습니다. 점유
+전이는 `EVENT id=C0/C1` command application ACK 및 실제 전이가 발생한
+`SEQUENCE ... event_id=D0/D1`으로 확인·기록합니다. `SEQUENCE` REPORT는
+feedback loop를 막기 위해 estimator 후보로 다시 입력하지 않습니다.
 
 Firmware는 다음과 같은 IN/OUT report packet도 보냅니다.
 
 ```text
-src=INOUT,event=ENTER,signal=enter,code=10,pir=1,radar=1,dist_cm=75,state=inside_moving,reason=radar_confirmed
-src=INOUT,event=STATE,state=wait_radar,pir=1,radar=0,reason=pir_triggered
-src=INOUT,event=STATE,state=outside,pir=0,radar=0,reason=absence
+src=INOUT,event=ENTER,signal=enter,code=10,boot_id=12ab34cd,event_seq=41,event_ts_ms=123456
+src=INOUT,event=EVENT,id=C0,boot_id=12ab34cd,primary_seq=41,occupied=1,target_match=1
+src=INOUT,event=SEQUENCE,result=ENTER_CONFIRMED,event_id=D0,boot_id=12ab34cd,event_seq=41,event_ts_ms=124000
+src=INOUT,event=STATE,occupied=1,boot_id=12ab34cd,event_ts_ms=124100
 src=USD,event=STATUS,uptime=12345,file=LOG/001.CSV,ok=1,batt_valid=1,batt_v=3.980,batt_mv=3980,batt_pct=75,batt_rem_mah=1125,batt_cap_mah=1500,usb=0,chg=1,sd=0
 ```
 
-`src=INOUT` report는 runtime log에 기록되며, `power status`에서도 마지막
-IN/OUT event/state/code/reason으로 확인할 수 있습니다. ENTER/code `10` 또는
-`inside_*` state는 shadow power state를 `RADAR_CONFIRMED_ACTIVE`로
-전환합니다.
+모든 RAW/REPORT/command/ACK/candidate record는 `programdata/reports/*.jsonl`에
+append-only로 저장합니다. 이 record에는 frame MAC, BLE alias, boot/sequence
+ID, 원본 payload hex, Central receipt time, node uptime 보정 offset/오차,
+BLE session 및 estimator before/after state가 포함됩니다. 서로 다른 node의
+`event_ts_ms`는 직접 비교하지 않고 `(MAC, boot_id)`별 clock offset으로
+정규화합니다.
 
 새 PIR+RADAR flow를 하드웨어에서 확인할 때는 다음 명령을 사용합니다.
 
@@ -150,10 +156,19 @@ tail -n 50 programdata/logging.log
 ```
 
 Outbound unitspace command는 NUS RX로 `COMMAND` frame을 보내는 방식입니다.
-Frame MAC은 target node MAC이고, payload는 UTF-8 command인 `enter` 또는
-`exit`입니다. `strong_enter`, `weak_enter`, `strong_exit`, `weak_exit` 같은
-이전 운영자 표현은 frame 생성 전에 정규화되므로, NUS에는 비표준 command
-payload가 기록되지 않습니다.
+현재 배포 firmware와의 호환을 위해 frame MAC은 target node MAC이고 payload는
+여전히 UTF-8 `enter`/`exit`입니다. Central은 노드별 최종 desired state만
+보관해 reconnect FIFO 재생을 방지하며, C0/C1 ACK 또는 reconnect `STATE`로
+수렴합니다. 다음 revision의 `cmd_id`, desired epoch, canonical node ID/alias
+계약은 [docs/command-protocol-v2.md](docs/command-protocol-v2.md)에 정리돼
+있습니다.
+
+## Sound schema
+
+현재 B TFLM schema는 `b-tflm-v1`, `class_count=10`입니다. score 8/9는
+`watering_low`/`watering_high`이고 `microwave`/`cooking`이 아닙니다. SOUND
+REPORT는 `schema_version=b-tflm-v1,class_count=10`을 포함해야 하며, RAWDATA의
+zero padding score는 0.5로 dequantize하지 않고 빈 값으로 기록합니다.
 
 ## Shadow Power State
 
