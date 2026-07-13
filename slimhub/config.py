@@ -56,6 +56,10 @@ class AppPaths:
     def logging_path(self) -> Path:
         return self.programdata_dir / "logging.log"
 
+    @property
+    def deployment_manifest_path(self) -> Path:
+        return self.programdata_dir / "deployment_manifest.json"
+
     def ensure(self) -> None:
         self.programdata_dir.mkdir(parents=True, exist_ok=True)
         self.config_dir.mkdir(parents=True, exist_ok=True)

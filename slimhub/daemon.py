@@ -22,6 +22,7 @@ from slimhub.events import (
     StructuredEvent,
 )
 from slimhub.logging import RawDataLogger
+from slimhub.multimodal import DeploymentManifestStore, MultimodalReportStore
 from slimhub.protocol.nus import (
     DEFAULT_DEVICE_NAME,
     AlertPacket,
@@ -81,6 +82,9 @@ class SlimHubDaemon:
         self.hub_config_store = HubConfigStore(paths)
         self.raw_logger = RawDataLogger(paths)
         self.estimator = SimpleUnitspaceEstimator()
+        self.multimodal = MultimodalReportStore(
+            DeploymentManifestStore(paths.deployment_manifest_path)
+        )
         self.clock_normalizer = NodeClockNormalizer()
         self.report_reorder_buffer: EventReorderBuffer[ReportEvent] = EventReorderBuffer()
         self._report_reorder_task: asyncio.Task[None] | None = None
@@ -322,7 +326,7 @@ class SlimHubDaemon:
             # Reports are diagnostic evidence even when their source is new to
             # this Central build, so retain every well-formed REPORT packet.
             await self.raw_logger.log_report(report_event)
-            if src == "INOUT" and boot_id and event_ts_ms is not None:
+            if src in {"INOUT", "EVENT", "ADL"} and boot_id and event_ts_ms is not None:
                 for ordered_event in self.report_reorder_buffer.push(
                     report_event,
                     normalized.timestamp,
@@ -466,14 +470,41 @@ class SlimHubDaemon:
                 bool(event.connected),
             )
         if src == "INOUT":
+            self.multimodal.handle_inout(event)
             self.power_shadow.update_report(event.mac, event.packet, event.timestamp)
             sent_commands = await self._send_unitspace_commands(
                 self.estimator.handle_report(event)
             )
             await self._log_estimator_records()
             self._log_commands(sent_commands)
-        if src == "SOUND":
+        if src in {"EVENT", "ADL"}:
+            self.multimodal.handle(event)
+            await self._log_multimodal_records()
+        if src == "SOUND" or (
+            src == "EVENT" and event.packet.fields.get("event", "").upper() == "SOUND"
+        ):
             self._remember_sound_schema(event.mac, event.packet)
+
+    async def _log_multimodal_records(self) -> None:
+        for record in self.multimodal.drain_records():
+            errors = record.data.get("errors")
+            if isinstance(errors, list) and any("profile" in str(error) for error in errors):
+                self.logger.warning(
+                    "Deployment profile mismatch mac=%s errors=%s",
+                    record.mac,
+                    ",".join(str(error) for error in errors),
+                )
+            await self.raw_logger.log_structured(
+                StructuredEvent(
+                    timestamp=record.timestamp,
+                    kind=record.kind,
+                    mac=record.mac,
+                    data={
+                        **record.data,
+                        "multimodal_state": self.multimodal.snapshot(),
+                    },
+                )
+            )
 
     def _ensure_report_reorder_flush(self) -> None:
         if self._report_reorder_task is None or self._report_reorder_task.done():
@@ -654,6 +685,8 @@ class SlimHubDaemon:
             )
         if command == "unitspace.status":
             return self._ok(self.estimator.snapshot())
+        if command == "multimodal.status":
+            return self._ok(self.multimodal.snapshot())
         if command == "power.status":
             address = args.get("address")
             return self._ok(
@@ -757,6 +790,8 @@ class SlimHubDaemon:
     def _remember_sound_schema(self, mac: str, report: ReportPacket) -> None:
         fields = report.fields
         version = fields.get("schema_version") or fields.get("sound_schema")
+        if version is None and fields.get("schema") == "1":
+            version = "b-tflm-v1"
         class_count = _int_or_none(fields.get("class_count"))
         if version is None and class_count is None:
             return

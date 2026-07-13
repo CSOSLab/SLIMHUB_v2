@@ -113,6 +113,12 @@ Inbound packet type은 다음과 같습니다.
 - `ALERT`: UTF-8 text payload
 - `REPORT`: UTF-8 comma-separated key/value payload
 
+BLE notification 경계는 NUS frame 경계가 아닙니다. Central은 connection별
+byte accumulator에서 16-byte header의 little-endian payload length와 뒤따르는
+CRLF를 모두 확인한 뒤에만 frame을 파싱합니다. 잘못된 length, packet type,
+CRLF는 bounded resynchronization으로 폐기하므로 MTU 23/247의 header/payload/
+CRLF 분할과 연결된 frame stream도 처리합니다.
+
 ### DEAN_Node_v2 PIR+RADAR IN/OUT
 
 현재 A(NCS) firmware에서 RAWDATA `flag_human_presence=1, detected=10`은
@@ -163,12 +169,37 @@ Outbound unitspace command는 NUS RX로 `COMMAND` frame을 보내는 방식입�
 계약은 [docs/command-protocol-v2.md](docs/command-protocol-v2.md)에 정리돼
 있습니다.
 
+## Multimodal EVENT / ADL reports
+
+`src=EVENT`의 `BASELINE`, `ENV`, `SOUND`와 `src=ADL`의 `PREDETECT`,
+`COMPLETE`, `PARTIAL`, `NO_MATCH`는 `programdata/reports/*.jsonl`에 typed
+record로 추가 저장됩니다. 이 stream은 IN/OUT estimator에 절대 재입력하지
+않습니다. `analysis_seq`는 `(MAC, boot_id, analysis_seq)` replay dedupe key이며
+gap은 허용됩니다. EVENT history는 wrap-aware `event_ts_ms`, 동일 시각에서는
+`analysis_seq`로 정렬합니다.
+
+`D0`는 session을 열고 `D1`는 닫지만 D1의 `event_seq`는 ADL의 `session_seq`와
+같다고 가정하지 않습니다. Central은 같은 MAC/boot의 normalized time boundary와
+`session_seq`로 ENV/SOUND, PREDETECT, final ADL record를 연결합니다. PREDETECT와
+`overflow=1` final record는 ground-truth 집계 대상이 아닙니다. trace report가
+없다고 해서 즉시 `NO_MATCH`로 판단하지 않습니다.
+
+`EVENT/BASELINE`은 `(MAC, boot_id, ready_mask)`를 idempotent upsert하며, 재연결
+subscription snapshot의 더 최신 channel count를 보존합니다. `configured_profile`
+은 `programdata/deployment_manifest.json`의 fixed image 정보 및 node location과
+검증됩니다. template은 [deployment-manifest.example.json](docs/deployment-manifest.example.json)에
+있습니다. ADL report의 `profile`은 AUTO build에서도 winning candidate이므로 image
+profile 판정에 사용하지 않습니다.
+
 ## Sound schema
 
 현재 B TFLM schema는 `b-tflm-v1`, `class_count=10`입니다. score 8/9는
 `watering_low`/`watering_high`이고 `microwave`/`cooking`이 아닙니다. SOUND
-REPORT는 `schema_version=b-tflm-v1,class_count=10`을 포함해야 하며, RAWDATA의
-zero padding score는 0.5로 dequantize하지 않고 빈 값으로 기록합니다.
+REPORT는 `src=EVENT,event=SOUND,schema=1,class_count=10`을 포함해야 하며,
+index 7은 `flushing_end`입니다. RAWDATA의 zero padding score는 0.5로
+dequantize하지 않고 빈 값으로 기록합니다. RAW score window와 firmware가 여러
+window를 합쳐 확정한 `EVENT/SOUND` run은 별도 telemetry이며, Central은 이를
+ADL evidence로 중복 합산하지 않습니다.
 
 ## Shadow Power State
 

@@ -28,7 +28,7 @@ B_TFLM_V1_SCHEMA = SoundSchema(
         "brushing",
         "peeing",
         "flushing",
-        "flush_end",
+        "flushing_end",
         "watering_low",
         "watering_high",
     ),

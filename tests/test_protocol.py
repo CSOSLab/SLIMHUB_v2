@@ -30,6 +30,44 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(assembler.push(frame[4:12]), [])
         self.assertEqual(assembler.push(frame[12:]), [frame])
 
+    def test_assembler_reassembles_mtu23_header_payload_and_crlf_splits(self) -> None:
+        frame = build_frame(
+            "AA:BB:CC:DD:EE:FF",
+            "REPORT",
+            b"src=EVENT,event=ENV,analysis_seq=51,event_id=E1",
+        )
+        assembler = FrameAssembler()
+        chunks = [frame[:3], frame[3:16], frame[16:-1], frame[-1:]]
+        frames = []
+        for chunk in chunks:
+            frames.extend(assembler.push(chunk))
+
+        self.assertEqual(frames, [frame])
+        self.assertEqual(parse_frame(frames[0]).parsed.fields["event_id"], "E1")
+
+    def test_assembler_reassembles_mtu247_stream_with_concatenated_frames(self) -> None:
+        first = build_frame("AA:BB:CC:DD:EE:01", "ALERT", b"one")
+        second = build_frame(
+            "AA:BB:CC:DD:EE:02",
+            "REPORT",
+            b"src=ADL,event=COMPLETE,analysis_seq=9",
+        )
+        stream = first + second
+        assembler = FrameAssembler()
+
+        frames = assembler.push(stream[:23]) + assembler.push(stream[23:247]) + assembler.push(stream[247:])
+
+        self.assertEqual(frames, [first, second])
+
+    def test_assembler_discards_bad_crlf_and_resynchronizes_to_next_frame(self) -> None:
+        valid = build_frame("AA:BB:CC:DD:EE:FF", "ALERT", b"ready")
+        malformed = valid[:-2] + b"\x00\x00"
+        assembler = FrameAssembler()
+
+        frames = assembler.push(malformed + valid)
+
+        self.assertEqual(frames, [valid])
+
     def test_malformed_end_flag_fails(self) -> None:
         frame = build_frame("AA:BB:CC:DD:EE:FF", "ALERT", b"hello")
         bad_frame = frame[: -len(END_FLAG)] + b"\x00\x00"

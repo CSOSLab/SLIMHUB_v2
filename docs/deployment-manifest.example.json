@@ -1,0 +1,39 @@
+{
+  "nodes": {
+    "AA:BB:CC:DD:EE:FF": {
+      "location": "TOILET",
+      "configured_profile": "toilet",
+      "firmware_commit": "<git-commit>",
+      "build_id": "<build-id>",
+      "build_time": "2026-07-13T00:00:00Z",
+      "esp_idf_version": "<version>",
+      "model_sha256": "<private-10-class-model-sha256>",
+      "model_version": "<model-version>",
+      "schema_version": 1,
+      "class_count": 10,
+      "env": {
+        "baseline_samples": 100,
+        "min_delta_levels": 1,
+        "reversal_levels": 1,
+        "max_gap_ms": 15000,
+        "commissioning_hold_ms": 600000,
+        "bsec_min_accuracy": 1,
+        "nvs_save_samples": 600
+      },
+      "sound": {
+        "event_confidence_pct": 80,
+        "min_margin": 0,
+        "min_clips": 1,
+        "max_gap_ms": 2500,
+        "raw_telemetry_threshold_pct": 80
+      },
+      "adl": {
+        "late_event_ms": 10000,
+        "predetect_threshold_pct": 60,
+        "complete_threshold_pct": 60,
+        "continuous_runtime_d0_d1": true,
+        "trace_reports": true
+      }
+    }
+  }
+}

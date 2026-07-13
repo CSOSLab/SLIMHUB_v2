@@ -33,6 +33,7 @@ HEADER_LEN = MAC_LEN + PACKET_TYPE_LEN + PACKET_LEN_LEN
 END_FLAG_LEN = len(END_FLAG)
 RAWDATA_PAYLOAD_LEN = 33
 MAX_FRAME_LEN = 4096
+KNOWN_PACKET_TYPES = {"RAWDATA", "ALERT", "REPORT"}
 
 
 class PacketParseError(ValueError):
@@ -82,12 +83,32 @@ class FrameAssembler:
     def __init__(self, max_frame_len: int = MAX_FRAME_LEN) -> None:
         self._buffer = bytearray()
         self._max_frame_len = max_frame_len
+        self._max_buffer_len = max_frame_len * 2
 
     def push(self, chunk: bytes) -> list[bytes]:
         self._buffer.extend(chunk)
         frames: list[bytes] = []
 
-        while len(self._buffer) >= HEADER_LEN + END_FLAG_LEN:
+        if len(self._buffer) > self._max_buffer_len:
+            dropped = len(self._buffer) - self._max_frame_len
+            del self._buffer[:dropped]
+            logging.warning("Dropping %d bytes while bounding NUS reassembly buffer", dropped)
+
+        while len(self._buffer) >= HEADER_LEN:
+            raw_packet_type = bytes(
+                self._buffer[MAC_LEN : MAC_LEN + PACKET_TYPE_LEN]
+            )
+            try:
+                packet_type = raw_packet_type.rstrip(b"\x00").decode("ascii")
+            except UnicodeDecodeError:
+                packet_type = ""
+            if packet_type not in KNOWN_PACKET_TYPES:
+                bad_byte = self._buffer.pop(0)
+                logging.warning(
+                    "Dropping byte 0x%02x while resynchronizing: invalid packet type",
+                    bad_byte,
+                )
+                continue
             packet_length = int.from_bytes(
                 self._buffer[MAC_LEN + PACKET_TYPE_LEN : HEADER_LEN],
                 byteorder="little",
@@ -106,6 +127,14 @@ class FrameAssembler:
 
             if len(self._buffer) < frame_len:
                 break
+
+            if self._buffer[frame_len - END_FLAG_LEN : frame_len] != END_FLAG:
+                bad_byte = self._buffer.pop(0)
+                logging.warning(
+                    "Dropping byte 0x%02x while resynchronizing: invalid frame CRLF",
+                    bad_byte,
+                )
+                continue
 
             frames.append(bytes(self._buffer[:frame_len]))
             del self._buffer[:frame_len]

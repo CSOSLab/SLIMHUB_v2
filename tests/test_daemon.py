@@ -383,6 +383,31 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(daemon.stop_event.is_set())
             self.assertEqual(session.commands, [])
 
+    async def test_multimodal_env_report_is_typed_logged_and_not_estimator_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            address = "AA:BB:CC:DD:EE:01"
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            session = FakeSession(address)
+            await daemon.registry.add(session)
+            fields = {
+                "src": "EVENT", "event": "ENV", "schema": "1", "boot_id": "boot-a",
+                "session_seq": "7", "analysis_seq": "51", "event_id": "E1",
+                "event_ts_ms": "1100", "confidence": "73", "baseline": "51.00",
+                "peak": "58.00", "delta_levels": "2", "start_ms": "1000", "duration_ms": "100",
+            }
+            message = ",".join(f"{key}={value}" for key, value in fields.items())
+
+            await daemon.handle_frame(address, report_frame(address, message, fields))
+            await daemon.flush_report_reorder_buffer()
+
+            self.assertEqual(session.commands, [])
+            response = await daemon.dispatch({"command": "multimodal.status", "args": {}})
+            session_state = response["data"]["sessions"][f"{address}/boot-a/7"]
+            self.assertEqual(session_state["records"][0]["canonical_name"], "humidity")
+            report_file = next((Path(tmpdir) / "programdata" / "reports").glob("*.jsonl"))
+            rows = [json.loads(line) for line in report_file.read_text(encoding="utf-8").splitlines()]
+            self.assertIn("feature", [row["kind"] for row in rows])
+
 
 if __name__ == "__main__":
     unittest.main()
