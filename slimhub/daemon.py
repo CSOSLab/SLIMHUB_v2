@@ -21,7 +21,7 @@ from slimhub.events import (
     ReportEvent,
     StructuredEvent,
 )
-from slimhub.logging import RawDataLogger
+from slimhub.logging import DisplayWriter, RawDataLogger
 from slimhub.multimodal import DeploymentManifestStore, MultimodalReportStore
 from slimhub.protocol.nus import (
     DEFAULT_DEVICE_NAME,
@@ -81,6 +81,7 @@ class SlimHubDaemon:
         self.config_store = DeviceConfigStore(paths)
         self.hub_config_store = HubConfigStore(paths)
         self.raw_logger = RawDataLogger(paths)
+        self.display_writer = DisplayWriter(paths)
         self.estimator = SimpleUnitspaceEstimator()
         self.multimodal = MultimodalReportStore(
             DeploymentManifestStore(paths.deployment_manifest_path)
@@ -477,6 +478,7 @@ class SlimHubDaemon:
             )
             await self._log_estimator_records()
             self._log_commands(sent_commands)
+            self.display_writer.write_inout(event)
         if src in {"EVENT", "ADL"}:
             self.multimodal.handle(event)
             await self._log_multimodal_records()
@@ -494,6 +496,7 @@ class SlimHubDaemon:
                     record.mac,
                     ",".join(str(error) for error in errors),
                 )
+            self.display_writer.write_multimodal(record)
             await self.raw_logger.log_structured(
                 StructuredEvent(
                     timestamp=record.timestamp,

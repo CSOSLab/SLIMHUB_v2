@@ -60,10 +60,33 @@ class AppPaths:
     def deployment_manifest_path(self) -> Path:
         return self.programdata_dir / "deployment_manifest.json"
 
+    @property
+    def display_path(self) -> Path:
+        """Current operator-facing display feed (append-only text)."""
+        return self.programdata_dir / "display.txt"
+
+    @property
+    def display_dir(self) -> Path:
+        """Daily display archives, compatible with the legacy data/display layout."""
+        return self.data_dir / "display"
+
+    @property
+    def db_sync_dir(self) -> Path:
+        return self.programdata_dir / "db_sync"
+
+    @property
+    def db_ingest_offset_path(self) -> Path:
+        return self.db_sync_dir / "report_offsets.json"
+
+    @property
+    def db_upload_offset_path(self) -> Path:
+        return self.db_sync_dir / "upload_offsets.json"
+
     def ensure(self) -> None:
         self.programdata_dir.mkdir(parents=True, exist_ok=True)
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.db_sync_dir.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass

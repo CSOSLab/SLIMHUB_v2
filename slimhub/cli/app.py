@@ -11,6 +11,7 @@ from pathlib import Path
 
 from slimhub.cli.client import send_request_sync
 from slimhub.config import AppPaths, HubConfigStore
+from slimhub.integrations.database import ReportDatabaseUpdater
 from slimhub.protocol.nus import (
     DEFAULT_DEVICE_NAME,
     MAX_RECORD_SECONDS,
@@ -134,6 +135,16 @@ def build_parser() -> argparse.ArgumentParser:
     battery_status = battery_subparsers.add_parser("status", help="Show latest USD STATUS report.")
     battery_status.add_argument("--address")
 
+    db_parser = subparsers.add_parser(
+        "db",
+        help="Incrementally ingest REPORT JSONL into MySQL and optionally upload it.",
+    )
+    db_subparsers = db_parser.add_subparsers(dest="db_command", required=True)
+    db_update = db_subparsers.add_parser("update", help="Ingest locally, then upload to remote MySQL.")
+    db_update.add_argument("--no-upload", action="store_true", help="Only ingest into local MySQL.")
+    db_subparsers.add_parser("ingest", help="Only ingest into local MySQL.")
+    db_subparsers.add_parser("upload", help="Only upload previously ingested local rows.")
+
     return parser
 
 
@@ -170,6 +181,8 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
 
         if args.hubconfig:
             data = HubConfigStore(paths).set_field(args.hubconfig[0], args.hubconfig[1]).__dict__
+        elif args.subcommand == "db":
+            data = _run_database(paths, args)
         else:
             data = _send(paths, args)
         _print_result(args, data)
@@ -329,6 +342,17 @@ def _send(paths: AppPaths, args: argparse.Namespace) -> object:
     if args.subcommand == "battery" and args.battery_command == "status":
         return send_request_sync(paths, "battery.status", {"address": args.address})
     raise RuntimeError("unhandled CLI command")
+
+
+def _run_database(paths: AppPaths, args: argparse.Namespace) -> dict[str, object]:
+    updater = ReportDatabaseUpdater(paths)
+    if args.db_command == "update":
+        return updater.update(upload=not args.no_upload)
+    if args.db_command == "ingest":
+        return updater.ingest()
+    if args.db_command == "upload":
+        return updater.upload()
+    raise RuntimeError("unhandled database command")
 
 
 def _print_result(args: argparse.Namespace, data: object) -> None:

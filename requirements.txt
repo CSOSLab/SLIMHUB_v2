@@ -1,3 +1,4 @@
 # Runtime dependencies.
 # Keep this in sync with pyproject.toml.
 bleak==3.0.2
+PyMySQL>=1.1,<2

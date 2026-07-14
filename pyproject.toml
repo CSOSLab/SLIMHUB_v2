@@ -9,6 +9,7 @@ description = "NUS-only SLIMHUB daemon and CLI for DEAN_NODE_V2 peripherals"
 requires-python = ">=3.11"
 dependencies = [
     "bleak==3.0.2",
+    "PyMySQL>=1.1,<2",
 ]
 
 [project.scripts]

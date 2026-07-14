@@ -1,0 +1,9 @@
+# SLIMHUB_v2 database update (install with `crontab -e` after reviewing paths).
+#
+# The command reads programdata/reports/*.jsonl incrementally, writes selected
+# IN/OUT and final ADL records to local MySQL, then uploads local rows to remote
+# MySQL when SLIMHUB_REMOTE_DB_* is configured. Put credentials in a protected
+# wrapper or an EnvironmentFile consumed by that wrapper; never place them here.
+#
+# `flock` prevents a slow MySQL upload from overlapping the next schedule.
+*/3 * * * * flock -n /tmp/slimhub-v2-db-update.lock sh -c 'cd /home/rtlab/SLIMHUB_v2 && /home/rtlab/SLIMHUB_v2/.venv/bin/slimhub-v2 --base-dir /home/rtlab/SLIMHUB_v2 db update >> /home/rtlab/SLIMHUB_v2/logs/db-update.log 2>&1'

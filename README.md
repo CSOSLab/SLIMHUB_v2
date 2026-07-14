@@ -94,6 +94,47 @@ Runtime 로그는 `programdata/logging.log`에 기록됩니다.
 유지합니다. 주기 `REPORT` payload와 BLE notify/debug dump는 이 파일에
 쓰지 않으며, report 분석은 `programdata/reports/*.jsonl`을 사용합니다.
 
+운영자용 display는 daemon이 필요한 IN/OUT, ENV/SOUND, ADL, BASELINE event만
+`programdata/display.txt`에 append합니다. 날짜별 호환 archive는
+`data/display/YYYY-MM-DD.txt`에도 같은 내용으로 남습니다. 이 파일은 사람이
+빠르게 보는 보조 출력이며, 정식 원본은 `programdata/reports/*.jsonl`입니다.
+
+## DB 증분 적재와 cron
+
+기존 SLIMHUB의 CSV/debugstr 파일 파싱 대신, v2는 append-only
+`programdata/reports/*.jsonl`을 byte offset 기준으로 증분 처리합니다. RAWDATA 중
+`flag_human_presence=1`은 로컬 MySQL `in_out`에, final ADL 결과는 `event_adl`에
+적재합니다. 이어서 local table의 `id` offset을 기준으로 동일 schema의 원격
+table에 전송합니다.
+
+DB 자격 증명은 저장소나 crontab에 넣지 말고 실행 환경에서 주입합니다.
+
+```bash
+export SLIMHUB_LOCAL_DB_HOST=localhost
+export SLIMHUB_LOCAL_DB_PORT=3306
+export SLIMHUB_LOCAL_DB_USER='...'
+export SLIMHUB_LOCAL_DB_PASS='...'
+export SLIMHUB_LOCAL_DB_NAME=adl_event
+
+# 원격 upload를 사용할 때만 설정합니다.
+export SLIMHUB_REMOTE_DB_HOST='...'
+export SLIMHUB_REMOTE_DB_PORT=3306
+export SLIMHUB_REMOTE_DB_USER='...'
+export SLIMHUB_REMOTE_DB_PASS='...'
+export SLIMHUB_REMOTE_DB_NAME=adl_raw
+
+slimhub-v2 db update            # local ingest + configured remote upload
+slimhub-v2 db update --no-upload
+slimhub-v2 db ingest
+slimhub-v2 db upload
+```
+
+테이블 이름은 필요하면 `SLIMHUB_DB_ADL_TABLE`(기본 `event_adl`)과
+`SLIMHUB_DB_INOUT_TABLE`(기본 `in_out`)로 바꿀 수 있습니다. ingest/upload
+offset은 `programdata/db_sync/`에 보관됩니다. cron 예시는
+[`docs/slimhub-v2.crontab`](docs/slimhub-v2.crontab)에 있으며, 실제 설치 전에는
+해당 환경변수가 cron에서도 안전하게 제공되는지 확인해야 합니다.
+
 여러 `DEAN_NODE_V2` 주변기기는 정규화된 MAC 주소로 관리합니다. BLE 주소와
 NUS frame MAC이 다를 경우, SLIMHUB_v2는 frame MAC을 활성 BLE session에
 alias로 연결합니다. 그래서 unitspace command가 올바른 주변기기로 계속

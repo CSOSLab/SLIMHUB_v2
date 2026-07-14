@@ -164,6 +164,20 @@ class CliAppTests(unittest.TestCase):
                 logging.getLogger().removeHandler(handler)
                 handler.close()
 
+    def test_db_update_runs_locally_without_daemon_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("slimhub.cli.app.ReportDatabaseUpdater") as updater_type:
+                updater_type.return_value.update.return_value = {
+                    "ingest": {"records": 0},
+                    "upload": {"skipped": True},
+                }
+                with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                    status = run_cli(["--base-dir", tmpdir, "db", "update", "--no-upload"])
+
+            self.assertEqual(status, 0)
+            updater_type.return_value.update.assert_called_once_with(upload=False)
+            self.assertIn('"records": 0', stdout.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
