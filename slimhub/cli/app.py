@@ -144,6 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
     db_update.add_argument("--no-upload", action="store_true", help="Only ingest into local MySQL.")
     db_subparsers.add_parser("ingest", help="Only ingest into local MySQL.")
     db_subparsers.add_parser("upload", help="Only upload previously ingested local rows.")
+    db_subparsers.add_parser("status", help="Show cron, local ingest, and remote upload evidence.")
 
     return parser
 
@@ -352,6 +353,8 @@ def _run_database(paths: AppPaths, args: argparse.Namespace) -> dict[str, object
         return updater.ingest()
     if args.db_command == "upload":
         return updater.upload()
+    if args.db_command == "status":
+        return updater.status()
     raise RuntimeError("unhandled database command")
 
 
@@ -484,6 +487,12 @@ def _setup_logging(debug: bool, paths: AppPaths) -> None:
 
 def main(argv: Sequence[str] | None = None) -> None:
     raise SystemExit(run_cli(argv))
+
+
+def background_main(argv: Sequence[str] | None = None) -> None:
+    """Compatibility entry point matching the legacy slimhub-background alias."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    raise SystemExit(run_cli(["--run", "--background", *args]))
 
 
 if __name__ == "__main__":

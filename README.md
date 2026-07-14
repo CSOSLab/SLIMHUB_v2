@@ -134,6 +134,8 @@ slimhub-v2 db upload
 offset은 `programdata/db_sync/`에 보관됩니다. cron 예시는
 [`docs/slimhub-v2.crontab`](docs/slimhub-v2.crontab)에 있으며, 실제 설치 전에는
 해당 환경변수가 cron에서도 안전하게 제공되는지 확인해야 합니다.
+전체 설치·display 확인·cron 반영·local/remote DB 검증·release 절차는
+[`docs/operations-v2.md`](docs/operations-v2.md)에 정리돼 있습니다.
 
 여러 `DEAN_NODE_V2` 주변기기는 정규화된 MAC 주소로 관리합니다. BLE 주소와
 NUS frame MAC이 다를 경우, SLIMHUB_v2는 frame MAC을 활성 BLE session에

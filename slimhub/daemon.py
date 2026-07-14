@@ -112,6 +112,7 @@ class SlimHubDaemon:
 
     async def run(self, *, address: str | None = None, scan: bool = True) -> None:
         self.paths.ensure()
+        self.display_writer.ensure()
         self.hub_config_store.load_or_create()
         await self.raw_logger.start()
         await self._start_server()

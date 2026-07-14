@@ -44,9 +44,41 @@ class ReportDatabaseUpdater:
         _validate_identifier(self.inout_table)
 
     def update(self, *, upload: bool = True) -> dict[str, object]:
-        result = {"ingest": self.ingest()}
-        result["upload"] = self.upload() if upload else {"skipped": True}
+        started_at = _now()
+        try:
+            result = {"ingest": self.ingest()}
+            result["upload"] = self.upload() if upload else {"skipped": True}
+        except Exception as exc:
+            self._write_run_status(
+                {
+                    "command": "update",
+                    "started_at": started_at,
+                    "finished_at": _now(),
+                    "ok": False,
+                    "error": str(exc),
+                }
+            )
+            raise
+        self._write_run_status(
+            {
+                "command": "update",
+                "started_at": started_at,
+                "finished_at": _now(),
+                "ok": True,
+                **result,
+            }
+        )
         return result
+
+    def status(self) -> dict[str, object]:
+        """Return safe local evidence for cron and remote-upload verification."""
+        return {
+            "local_database": self._database_status("LOCAL"),
+            "remote_database": self._database_status("REMOTE"),
+            "ingest_offsets": self._read_json(self.paths.db_ingest_offset_path),
+            "upload_offsets": self._read_json(self.paths.db_upload_offset_path),
+            "last_update": self._read_json(self.paths.db_status_path) or None,
+        }
 
     def ingest(self) -> dict[str, object]:
         records, new_offsets = self._read_new_records()
@@ -213,6 +245,17 @@ class ReportDatabaseUpdater:
             database=database,
         )
 
+    def _database_status(self, name: str) -> dict[str, object]:
+        settings = self._settings(name, required=False)
+        if settings is None:
+            return {"configured": False}
+        return {
+            "configured": bool(settings.user and settings.database),
+            "host": settings.host,
+            "port": settings.port,
+            "database": settings.database or None,
+        }
+
     @staticmethod
     def _connect(settings: MySQLSettings):
         try:
@@ -252,6 +295,9 @@ class ReportDatabaseUpdater:
         temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         temporary.replace(path)
 
+    def _write_run_status(self, value: dict[str, object]) -> None:
+        self._write_json_atomic(self.paths.db_status_path, value)
+
 
 def _validate_identifier(value: str) -> None:
     if not _IDENTIFIER.fullmatch(value):
@@ -282,3 +328,7 @@ def _created_time(record: dict[str, object]) -> str | None:
     except (TypeError, ValueError, OSError):
         value = record.get("time")
         return str(value).replace("T", " ").split(".")[0] if value else None
+
+
+def _now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")

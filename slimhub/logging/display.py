@@ -13,6 +13,12 @@ class DisplayWriter:
     def __init__(self, paths: AppPaths) -> None:
         self.paths = paths
 
+    def ensure(self) -> None:
+        """Make display paths observable as soon as the daemon starts."""
+        self.paths.ensure()
+        self.paths.display_dir.mkdir(parents=True, exist_ok=True)
+        self.paths.display_path.touch(exist_ok=True)
+
     def write_inout(self, event: ReportEvent) -> None:
         fields = event.packet.fields
         event_name = fields.get("event", "").upper()
@@ -66,8 +72,7 @@ class DisplayWriter:
     def _append(self, timestamp: float, message: str) -> None:
         time_value = datetime.fromtimestamp(timestamp)
         line = f"{time_value.strftime('%Y-%m-%d %H:%M:%S')}  {message}\n"
-        self.paths.ensure()
-        self.paths.display_dir.mkdir(parents=True, exist_ok=True)
+        self.ensure()
         daily_path = self.paths.display_dir / f"{time_value.strftime('%Y-%m-%d')}.txt"
         for path in (daily_path, self.paths.display_path):
             with path.open("a", encoding="utf-8") as f:

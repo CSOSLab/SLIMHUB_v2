@@ -82,6 +82,11 @@ class AppPaths:
     def db_upload_offset_path(self) -> Path:
         return self.db_sync_dir / "upload_offsets.json"
 
+    @property
+    def db_status_path(self) -> Path:
+        """Outcome of the most recent combined database update."""
+        return self.db_sync_dir / "last_update.json"
+
     def ensure(self) -> None:
         self.programdata_dir.mkdir(parents=True, exist_ok=True)
         self.config_dir.mkdir(parents=True, exist_ok=True)

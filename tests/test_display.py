@@ -11,6 +11,15 @@ from slimhub.protocol.nus import ReportPacket
 
 
 class DisplayWriterTests(unittest.TestCase):
+    def test_ensure_creates_current_display_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = AppPaths.from_base(tmpdir)
+
+            DisplayWriter(paths).ensure()
+
+            self.assertTrue(paths.display_path.is_file())
+            self.assertTrue(paths.display_dir.is_dir())
+
     def test_writes_current_and_daily_display_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = AppPaths.from_base(tmpdir)

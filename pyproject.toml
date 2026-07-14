@@ -14,6 +14,7 @@ dependencies = [
 
 [project.scripts]
 slimhub-v2 = "slimhub.cli.app:main"
+slimhub-background = "slimhub.cli.app:background_main"
 
 [tool.setuptools.packages.find]
 include = ["slimhub*"]

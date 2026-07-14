@@ -89,6 +89,31 @@ class ReportDatabaseUpdaterTests(unittest.TestCase):
             self.assertEqual(records, [])
             self.assertLess(offsets[str(report_path.resolve())], report_path.stat().st_size)
 
+    def test_status_reports_last_cron_update_without_connecting_to_database(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = AppPaths.from_base(tmpdir)
+            updater = ReportDatabaseUpdater(
+                paths,
+                environ={
+                    "SLIMHUB_LOCAL_DB_HOST": "localhost",
+                    "SLIMHUB_LOCAL_DB_USER": "local-user",
+                    "SLIMHUB_LOCAL_DB_NAME": "adl_event",
+                    "SLIMHUB_REMOTE_DB_HOST": "remote.example",
+                    "SLIMHUB_REMOTE_DB_USER": "remote-user",
+                    "SLIMHUB_REMOTE_DB_NAME": "adl_raw",
+                },
+            )
+            ReportDatabaseUpdater._write_json_atomic(
+                paths.db_status_path,
+                {"ok": True, "upload": {"adl": {"uploaded": 2}}},
+            )
+
+            status = updater.status()
+
+            self.assertTrue(status["local_database"]["configured"])
+            self.assertTrue(status["remote_database"]["configured"])
+            self.assertEqual(status["last_update"], {"ok": True, "upload": {"adl": {"uploaded": 2}}})
+
 
 if __name__ == "__main__":
     unittest.main()

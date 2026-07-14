@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from slimhub.cli.app import build_parser, run_cli
+from slimhub.cli.app import background_main, build_parser, run_cli
 from slimhub.config import AppPaths
 
 
@@ -177,6 +177,32 @@ class CliAppTests(unittest.TestCase):
             self.assertEqual(status, 0)
             updater_type.return_value.update.assert_called_once_with(upload=False)
             self.assertIn('"records": 0', stdout.getvalue())
+
+    def test_db_status_runs_locally_without_daemon_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("slimhub.cli.app.ReportDatabaseUpdater") as updater_type:
+                updater_type.return_value.status.return_value = {"last_update": None}
+                with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                    status = run_cli(["--base-dir", tmpdir, "db", "status"])
+
+            self.assertEqual(status, 0)
+            updater_type.return_value.status.assert_called_once_with()
+            self.assertIn('"last_update": null', stdout.getvalue())
+
+    def test_background_compatibility_entry_point_starts_daemon(self) -> None:
+        class FakeProcess:
+            pid = 24680
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("slimhub.cli.app.subprocess.Popen", return_value=FakeProcess()) as popen:
+                with patch("sys.stdout", new_callable=io.StringIO):
+                    with self.assertRaises(SystemExit) as result:
+                        background_main(["--base-dir", tmpdir])
+
+            self.assertEqual(result.exception.code, 0)
+            command = popen.call_args.args[0]
+            self.assertIn("--run", command)
+            self.assertNotIn("--background", command)
 
 
 if __name__ == "__main__":
