@@ -7,6 +7,7 @@ import logging
 import subprocess
 import sys
 from collections.abc import Sequence
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from slimhub.cli.client import send_request_sync
@@ -536,12 +537,20 @@ def _record_seconds(value: str) -> int:
 
 def _setup_logging(debug: bool, paths: AppPaths) -> None:
     paths.ensure()
-    logging.basicConfig(
-        filename=str(paths.logging_path),
-        level=logging.INFO,
-        format="%(asctime)s: %(levelname)s: %(message)s",
-    )
-    logging.getLogger("slimhub").setLevel(logging.INFO)
+    if not logging.getLogger().handlers:
+        handler = RotatingFileHandler(
+            paths.logging_path,
+            maxBytes=5 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        logging.basicConfig(
+            handlers=[handler],
+            level=logging.INFO,
+            format="%(asctime)s: %(levelname)s: %(message)s",
+        )
+    logging.getLogger().setLevel(logging.INFO)
+    logging.getLogger("slimhub").setLevel(logging.DEBUG if debug else logging.INFO)
     for name in (
         "asyncio",
         "bleak",

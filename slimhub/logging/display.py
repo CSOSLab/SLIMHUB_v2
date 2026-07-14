@@ -25,15 +25,13 @@ class DisplayWriter:
         event_id = (fields.get("event_id") or fields.get("id") or "").upper()
         result = fields.get("result", "").upper()
         location = event.location or "undefined"
-        if event_name == "ENTER" and fields.get("code") == "10":
-            message = "ENTER candidate (RAW10 sidecar)"
-        elif event_name == "SEQUENCE" and result:
-            message = f"{result} {event_id}".strip()
-        elif event_name == "EVENT" and event_id in {"C0", "C1"}:
-            message = f"COMMAND ACK {event_id} occupied={fields.get('occupied', '?')}"
+        if event_name == "SEQUENCE" and result == "ENTER_CONFIRMED" and event_id == "D0":
+            message = "[EVENT] - ENTER value: 10"
+        elif event_name == "SEQUENCE" and result == "EXIT_CONFIRMED" and event_id == "D1":
+            message = "[EVENT] - EXIT value: 20"
         else:
             return
-        self._append(event.receipt_timestamp or event.timestamp, f"{location} [INOUT] {message}")
+        self._append(event.receipt_timestamp or event.timestamp, f"{location} {message}")
 
     def write_multimodal(self, record: MultimodalRecord) -> None:
         data = record.data
@@ -42,32 +40,27 @@ class DisplayWriter:
         if kind == "feature":
             name = str(data.get("event") or "")
             if name == "ENV":
-                message = (
-                    f"ENV {data.get('event_id', '?')} "
-                    f"({data.get('canonical_name') or 'unknown'}) confidence={data.get('confidence', '?')}"
-                )
+                label = data.get("canonical_name") or "N/A"
+                message = f"[EVENT] - '{label}' event was detected"
             elif name == "SOUND":
-                message = (
-                    f"SOUND {data.get('event_id', '?')} "
-                    f"({data.get('label') or 'unknown'}) count={data.get('count', '?')}"
-                )
+                label = str(data.get("label") or "unknown")
+                if label.strip().lower() in {"background", "unknown"}:
+                    return
+                message = f"[EVENT] - Sound '{label}' was detected"
             else:
                 return
-            self._append(record.timestamp, f"{location} [EVENT] {message}")
+            self._append(record.timestamp, f"{location} {message}")
         elif kind == "adl_result":
-            event_name = str(data.get("event") or "")
-            qualifier = "provisional" if data.get("provisional") else "final"
+            status = str(data.get("event") or "")
+            adl = data.get("adl") or "NO_MATCH"
+            sequence = data.get("sequence") or "N/A"
+            truth = _display_truth(data.get("truth"))
+            missing = data.get("missing")
             message = (
-                f"ADL {qualifier} {event_name}: {data.get('adl') or 'NO_MATCH'} "
-                f"truth={data.get('truth', '?')}"
+                f"{location} [INFERENCE] {status}: {adl}, sequence: {sequence}, "
+                f"truth: {truth}, missing: {missing if missing is not None else 'None'}"
             )
-            self._append(record.timestamp, f"{location} [ADL] {message}")
-        elif kind == "baseline":
-            self._append(
-                record.timestamp,
-                f"{location} [BASELINE] {data.get('status') or '?'} "
-                f"ready={data.get('ready_mask') or '?'}",
-            )
+            self._append(record.timestamp, message)
 
     def _append(self, timestamp: float, message: str) -> None:
         time_value = datetime.fromtimestamp(timestamp)
@@ -77,3 +70,13 @@ class DisplayWriter:
         for path in (daily_path, self.paths.display_path):
             with path.open("a", encoding="utf-8") as f:
                 f.write(line)
+
+
+def _display_truth(value: object) -> str:
+    try:
+        truth = float(str(value))
+    except (TypeError, ValueError):
+        return "N/A"
+    if truth > 1:
+        truth /= 100
+    return f"{truth:.2f}"

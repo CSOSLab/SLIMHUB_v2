@@ -4,6 +4,7 @@ import asyncio
 import sys
 import types
 import unittest
+from unittest.mock import MagicMock, patch
 
 from slimhub.events import CommandEvent
 
@@ -23,7 +24,7 @@ bleak_exc_module = sys.modules.get("bleak.exc") or types.ModuleType("bleak.exc")
 bleak_exc_module.BleakError = FakeBleakError
 sys.modules["bleak.exc"] = bleak_exc_module
 
-from slimhub.ble.device_session import DeviceSession
+from slimhub.ble.device_session import BleakError, DeviceSession
 
 
 async def ignore_frame(_: str, __: object) -> None:
@@ -40,7 +41,42 @@ class FlakyClient:
             raise RuntimeError("link lost")
 
 
+class ConnectFailureClient:
+    is_connected = False
+
+    def __init__(self, *_: object, **__: object) -> None:
+        pass
+
+    async def connect(self) -> None:
+        raise BleakError("failed to discover services, device disconnected")
+
+    async def disconnect(self) -> None:
+        return None
+
+
 class DeviceSessionQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_transient_ble_failure_is_concise_and_not_a_false_disconnect(self) -> None:
+        states: list[bool] = []
+
+        async def on_state(_: str, connected: bool, __: float) -> None:
+            states.append(connected)
+
+        logger = MagicMock()
+        session = DeviceSession(
+            "AA:BB:CC:DD:EE:01",
+            on_frame=ignore_frame,
+            on_connection_state=on_state,
+            logger=logger,
+        )
+        with patch("slimhub.ble.device_session.BleakClient", ConnectFailureClient):
+            session.start()
+            await asyncio.sleep(0.01)
+            await session.stop()
+
+        self.assertEqual(states, [])
+        logger.warning.assert_called_once()
+        logger.exception.assert_not_called()
+
     async def test_offline_commands_coalesce_to_final_desired_state(self) -> None:
         session = DeviceSession("AA:BB:CC:DD:EE:01", on_frame=ignore_frame)
 

@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from slimhub.config import AppPaths
+from slimhub.config import AppPaths, HubConfigStore
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -38,8 +38,15 @@ class ReportDatabaseUpdater:
     def __init__(self, paths: AppPaths, environ: dict[str, str] | None = None) -> None:
         self.paths = paths
         self.environ = dict(os.environ if environ is None else environ)
-        self.adl_table = self.environ.get("SLIMHUB_DB_ADL_TABLE", "event_adl")
+        self.adl_table = self.environ.get(
+            "SLIMHUB_DB_ADL_TABLE",
+            self.environ.get("ADL_TABLE", "event_adl"),
+        )
         self.inout_table = self.environ.get("SLIMHUB_DB_INOUT_TABLE", "in_out")
+        self.house_mac = (
+            self.environ.get("SLIMHUB_HOUSE_MAC")
+            or HubConfigStore(paths).load_or_create().address
+        )
         _validate_identifier(self.adl_table)
         _validate_identifier(self.inout_table)
 
@@ -77,12 +84,37 @@ class ReportDatabaseUpdater:
             "remote_database": self._database_status("REMOTE"),
             "ingest_offsets": self._read_json(self.paths.db_ingest_offset_path),
             "upload_offsets": self._read_json(self.paths.db_upload_offset_path),
+            "last_ingest": self._read_json(self.paths.db_ingest_status_path) or None,
+            "last_upload": self._read_json(self.paths.db_upload_status_path) or None,
             "last_update": self._read_json(self.paths.db_status_path) or None,
         }
 
     def ingest(self) -> dict[str, object]:
+        started_at = _now()
+        try:
+            result = self._ingest()
+        except Exception as exc:
+            self._write_operation_status(
+                self.paths.db_ingest_status_path,
+                command="ingest",
+                started_at=started_at,
+                error=exc,
+            )
+            raise
+        self._write_operation_status(
+            self.paths.db_ingest_status_path,
+            command="ingest",
+            started_at=started_at,
+            result=result,
+        )
+        return result
+
+    def _ingest(self) -> dict[str, object]:
         records, new_offsets = self._read_new_records()
-        adl_rows, inout_rows = self.rows_from_records(records)
+        adl_rows, inout_rows = self.rows_from_records(
+            records,
+            house_mac=self.house_mac,
+        )
         if adl_rows or inout_rows:
             local = self._settings("LOCAL", required=True)
             with self._connect(local) as connection:
@@ -110,6 +142,26 @@ class ReportDatabaseUpdater:
         }
 
     def upload(self) -> dict[str, object]:
+        started_at = _now()
+        try:
+            result = self._upload()
+        except Exception as exc:
+            self._write_operation_status(
+                self.paths.db_upload_status_path,
+                command="upload",
+                started_at=started_at,
+                error=exc,
+            )
+            raise
+        self._write_operation_status(
+            self.paths.db_upload_status_path,
+            command="upload",
+            started_at=started_at,
+            result=result,
+        )
+        return result
+
+    def _upload(self) -> dict[str, object]:
         remote = self._settings("REMOTE", required=False)
         if remote is None:
             return {"skipped": True, "reason": "SLIMHUB_REMOTE_DB_HOST is not configured"}
@@ -128,7 +180,14 @@ class ReportDatabaseUpdater:
                     cursor.execute(
                         f"SELECT id, {column_list} FROM `{table}` "
                         "WHERE id > %s ORDER BY id ASC LIMIT %s",
-                        (last_id, _as_int(self.environ.get("SLIMHUB_DB_UPLOAD_BATCH_SIZE"), 1000)),
+                        (
+                            last_id,
+                            _as_int(
+                                self.environ.get("SLIMHUB_DB_UPLOAD_BATCH_SIZE")
+                                or self.environ.get("UPLOAD_BATCH_SIZE"),
+                                1000,
+                            ),
+                        ),
                     )
                     rows = cursor.fetchall()
                 if not rows:
@@ -142,6 +201,9 @@ class ReportDatabaseUpdater:
                     )
                 remote_connection.commit()
                 offsets[stream] = rows[-1][0]
+                # Persist each stream independently. If the following table
+                # fails, a committed stream must not be uploaded twice.
+                self._write_json_atomic(self.paths.db_upload_offset_path, offsets)
                 result[stream.lower()] = {"uploaded": len(rows), "last_id": rows[-1][0]}
         self._write_json_atomic(self.paths.db_upload_offset_path, offsets)
         return result
@@ -149,6 +211,8 @@ class ReportDatabaseUpdater:
     @staticmethod
     def rows_from_records(
         records: list[dict[str, object]],
+        *,
+        house_mac: str,
     ) -> tuple[list[tuple[object, ...]], list[tuple[object, ...]]]:
         adl_rows: list[tuple[object, ...]] = []
         inout_rows: list[tuple[object, ...]] = []
@@ -165,17 +229,22 @@ class ReportDatabaseUpdater:
                 if not isinstance(parsed, dict) or _as_int(parsed.get("flag_human_presence"), 0) != 1:
                     continue
                 inout_rows.append(
-                    (mac, display_location, created_time, _as_int(parsed.get("detected"), 0))
+                    (
+                        house_mac,
+                        display_location,
+                        created_time,
+                        _as_int(parsed.get("detected"), 0),
+                    )
                 )
             elif kind == "adl_result" and _as_bool(record.get("final")):
                 adl_rows.append(
                     (
+                        house_mac,
                         mac,
-                        display_location,
                         created_time,
                         str(record.get("sequence") or ""),
                         str(record.get("adl") or record.get("event") or "NO_MATCH"),
-                        record.get("truth"),
+                        _truth_value(record.get("truth")),
                     )
                 )
         return adl_rows, inout_rows
@@ -184,12 +253,19 @@ class ReportDatabaseUpdater:
         offsets = {key: _as_int(value, 0) for key, value in self._read_json(self.paths.db_ingest_offset_path).items()}
         records: list[dict[str, object]] = []
         updated = dict(offsets)
+        today = datetime.now().strftime("%Y-%m-%d")
+        backfill = _as_bool(self.environ.get("SLIMHUB_DB_BACKFILL"))
         for path in sorted((self.paths.programdata_dir / "reports").glob("*.jsonl")):
             key = str(path.resolve())
             offset = offsets.get(key, 0)
             try:
                 size = path.stat().st_size
             except FileNotFoundError:
+                continue
+            if key not in offsets and not backfill and path.stem != today:
+                # The deployed v1 cron only discovered today's files. Preserve
+                # that first-run behavior unless an explicit backfill is requested.
+                updated[key] = size
                 continue
             if offset > size:
                 offset = 0
@@ -217,31 +293,39 @@ class ReportDatabaseUpdater:
 
     def _settings(self, name: str, *, required: bool) -> MySQLSettings | None:
         prefix = f"SLIMHUB_{name}_DB_"
-        host = self.environ.get(prefix + "HOST")
-        if name == "LOCAL" and host is None:
-            host = self.environ.get("ADL_DB_HOST")
+        prefixes = [prefix]
+        if name == "LOCAL":
+            prefixes.extend(("LOCAL_DB_", "ADL_DB_"))
+        else:
+            prefixes.append("REMOTE_DB_")
+
+        def configured_value(*suffixes: str) -> str | None:
+            return next(
+                (
+                    value
+                    for candidate in prefixes
+                    for suffix in suffixes
+                    if (value := self.environ.get(candidate + suffix))
+                ),
+                None,
+            )
+
+        host = configured_value("HOST")
         if not host:
             if required:
                 raise DatabaseConfigurationError(f"{prefix}HOST must be configured")
             return None
-        fallback_prefix = "ADL_DB_" if name == "LOCAL" else prefix
-        user = self.environ.get(prefix + "USER") or self.environ.get(fallback_prefix + "USER") or ""
-        database = self.environ.get(prefix + "NAME") or self.environ.get(fallback_prefix + "NAME") or ""
+        user = configured_value("USER") or ""
+        database = configured_value("NAME") or ""
         if required and not user:
             raise DatabaseConfigurationError(f"{prefix}USER must be configured")
         if required and not database:
             raise DatabaseConfigurationError(f"{prefix}NAME must be configured")
         return MySQLSettings(
             host=host,
-            port=_as_int(self.environ.get(prefix + "PORT") or self.environ.get(fallback_prefix + "PORT"), 3306),
+            port=_as_int(configured_value("PORT"), 3306),
             user=user,
-            password=(
-                self.environ.get(prefix + "PASS")
-                or self.environ.get(prefix + "PASSWORD")
-                or self.environ.get(fallback_prefix + "PASS")
-                or self.environ.get(fallback_prefix + "PASSWORD")
-                or ""
-            ),
+            password=configured_value("PASS", "PASSWORD") or "",
             database=database,
         )
 
@@ -298,6 +382,27 @@ class ReportDatabaseUpdater:
     def _write_run_status(self, value: dict[str, object]) -> None:
         self._write_json_atomic(self.paths.db_status_path, value)
 
+    def _write_operation_status(
+        self,
+        path: Path,
+        *,
+        command: str,
+        started_at: str,
+        result: dict[str, object] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        value: dict[str, object] = {
+            "command": command,
+            "started_at": started_at,
+            "finished_at": _now(),
+            "ok": error is None,
+        }
+        if result is not None:
+            value["result"] = result
+        if error is not None:
+            value["error"] = str(error)
+        self._write_json_atomic(path, value)
+
 
 def _validate_identifier(value: str) -> None:
     if not _IDENTIFIER.fullmatch(value):
@@ -317,6 +422,14 @@ def _as_bool(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _truth_value(value: object) -> float | None:
+    try:
+        truth = float(str(value))
+    except (TypeError, ValueError):
+        return None
+    return truth / 100 if truth > 1 else truth
 
 
 def _created_time(record: dict[str, object]) -> str | None:

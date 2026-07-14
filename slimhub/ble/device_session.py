@@ -112,6 +112,7 @@ class DeviceSession:
         await self._wait_for_target_update()
         while not self._stop_event.is_set():
             disconnected_event = asyncio.Event()
+            reported_connected = False
             loop = asyncio.get_running_loop()
 
             def on_disconnect(_: BleakClient) -> None:
@@ -130,7 +131,6 @@ class DeviceSession:
                     self._client = client
                     self.connected = bool(client.is_connected)
                     self.waiting_for_advertisement = False
-                    self._unavailable_logged = False
 
                     assembler = FrameAssembler()
                     await asyncio.wait_for(
@@ -145,6 +145,8 @@ class DeviceSession:
                     self.last_seen = time.time()
                     if self.on_connection_state is not None:
                         await self.on_connection_state(self.address, True, self.last_seen)
+                        reported_connected = True
+                    self._unavailable_logged = False
 
                 command_task = asyncio.create_task(
                     self._command_worker(client),
@@ -178,10 +180,11 @@ class DeviceSession:
                 self.last_error = str(exc)
                 if self._is_expected_connect_failure(exc):
                     if not self._unavailable_logged:
+                        detail = str(exc).strip() or exc.__class__.__name__
                         self.logger.warning(
-                            "%s unavailable; waiting for next advertisement before reconnect: %s",
+                            "%s BLE connection pending: %s",
                             self.address,
-                            exc,
+                            detail,
                         )
                         self._unavailable_logged = True
                 else:
@@ -194,7 +197,7 @@ class DeviceSession:
                             await client.disconnect()
                 self.connected = False
                 self._client = None
-                if self.on_connection_state is not None:
+                if reported_connected and self.on_connection_state is not None:
                     await self.on_connection_state(self.address, False, time.time())
 
             if not self._stop_event.is_set():
@@ -233,11 +236,12 @@ class DeviceSession:
                 await self._notify_command_result(command, True, None)
             except Exception as exc:
                 self.last_error = str(exc)
-                self.logger.exception(
-                    "%s command failed target=%s command=%s",
+                self.logger.warning(
+                    "%s command write failed target=%s command=%s error=%s",
                     self.address,
                     command.address,
                     command.command,
+                    exc,
                 )
                 await self._notify_command_result(command, False, str(exc))
                 async with self._command_lock:
@@ -277,9 +281,6 @@ class DeviceSession:
                     task.result()
 
     def _is_expected_connect_failure(self, exc: Exception) -> bool:
-        if isinstance(exc, TimeoutError):
+        if isinstance(exc, (TimeoutError, ConnectionError)):
             return True
-        if isinstance(exc, BleakError):
-            message = str(exc).lower()
-            return "not found" in message or "not available" in message
-        return False
+        return isinstance(exc, BleakError)

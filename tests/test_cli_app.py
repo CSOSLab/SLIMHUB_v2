@@ -184,9 +184,12 @@ class CliAppTests(unittest.TestCase):
             _setup_logging(True, AppPaths.from_base(tmpdir))
 
             self.assertEqual(logging.getLogger().level, logging.INFO)
-            self.assertEqual(logging.getLogger("slimhub").level, logging.INFO)
+            self.assertEqual(logging.getLogger("slimhub").level, logging.DEBUG)
             self.assertEqual(logging.getLogger("bleak").level, logging.WARNING)
             self.assertEqual(logging.getLogger("dbus_fast").level, logging.WARNING)
+            handler = logging.getLogger().handlers[0]
+            self.assertEqual(handler.maxBytes, 5 * 1024 * 1024)
+            self.assertEqual(handler.backupCount, 5)
             for handler in logging.getLogger().handlers[:]:
                 logging.getLogger().removeHandler(handler)
                 handler.close()

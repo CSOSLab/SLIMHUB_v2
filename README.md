@@ -93,11 +93,16 @@ Runtime 로그는 `programdata/logging.log`에 기록됩니다.
 `logging.log`는 연결/해제, command 전송, warning/error 중심으로 작게
 유지합니다. 주기 `REPORT` payload와 BLE notify/debug dump는 이 파일에
 쓰지 않으며, report 분석은 `programdata/reports/*.jsonl`을 사용합니다.
+일시적인 BLE 연결 실패는 traceback 없이 한 번의 warning으로 요약하고,
+`logging.log`는 5 MiB 단위로 최대 5개 backup까지 순환합니다. typed multimodal
+record에는 해당 event만 저장하며 누적 session 전체를 반복 복사하지 않습니다.
 
-운영자용 display는 daemon이 필요한 IN/OUT, ENV/SOUND, ADL, BASELINE event만
+운영자용 display는 daemon이 확정한 IN/OUT(D0/D1), ENV/SOUND, ADL event만
 `programdata/display.txt`에 append합니다. 날짜별 호환 archive는
 `data/display/YYYY-MM-DD.txt`에도 같은 내용으로 남습니다. 이 파일은 사람이
 빠르게 보는 보조 출력이며, 정식 원본은 `programdata/reports/*.jsonl`입니다.
+candidate, command ACK, timeout, baseline은 원본 JSONL에는 보존하지만 display에는
+표시하지 않습니다.
 
 ## DB 증분 적재와 cron
 
@@ -107,7 +112,15 @@ Runtime 로그는 `programdata/logging.log`에 기록됩니다.
 적재합니다. 이어서 local table의 `id` offset을 기준으로 동일 schema의 원격
 table에 전송합니다.
 
+`house_mac`은 기본적으로 `programdata/config.json`의 Hub `address`를 사용하며,
+배포 식별자를 별도로 써야 하면 `SLIMHUB_HOUSE_MAC`으로 재정의합니다. `in_out`의
+`location`은 `<room>:<node MAC>`, `event_adl`의 `location`은 node MAC으로 저장해
+기존 운영 DB 의미를 유지합니다. firmware의 0–100 ADL truth는 기존 DB의 0–1
+범위로 변환합니다.
+
 DB 자격 증명은 저장소나 crontab에 넣지 말고 실행 환경에서 주입합니다.
+백업 SLIMHUB에서 사용하던 `ADL_DB_*`, `LOCAL_DB_*`, `REMOTE_DB_*` 이름도
+fallback으로 인식하지만, 새 배포에는 아래 `SLIMHUB_*` 이름을 권장합니다.
 
 ```bash
 export SLIMHUB_LOCAL_DB_HOST=localhost
@@ -115,6 +128,8 @@ export SLIMHUB_LOCAL_DB_PORT=3306
 export SLIMHUB_LOCAL_DB_USER='...'
 export SLIMHUB_LOCAL_DB_PASS='...'
 export SLIMHUB_LOCAL_DB_NAME=adl_event
+# 필요할 때만 Hub address 대신 배포용 house identifier를 지정합니다.
+export SLIMHUB_HOUSE_MAC='...'
 
 # 원격 upload를 사용할 때만 설정합니다.
 export SLIMHUB_REMOTE_DB_HOST='...'
@@ -127,6 +142,7 @@ slimhub-v2 db update            # local ingest + configured remote upload
 slimhub-v2 db update --no-upload
 slimhub-v2 db ingest
 slimhub-v2 db upload
+slimhub-v2 db status
 ```
 
 테이블 이름은 필요하면 `SLIMHUB_DB_ADL_TABLE`(기본 `event_adl`)과
@@ -134,6 +150,9 @@ slimhub-v2 db upload
 offset은 `programdata/db_sync/`에 보관됩니다. cron 예시는
 [`docs/slimhub-v2.crontab`](docs/slimhub-v2.crontab)에 있으며, 실제 설치 전에는
 해당 환경변수가 cron에서도 안전하게 제공되는지 확인해야 합니다.
+기본 ingest는 백업 SLIMHUB처럼 오늘 파일부터 시작합니다. 과거 JSONL까지 의도적으로
+적재할 때만 `SLIMHUB_DB_BACKFILL=1`을 사용합니다. cron은 local ingest를 3분마다,
+remote upload를 10분마다 독립 실행합니다.
 전체 설치·display 확인·cron 반영·local/remote DB 검증·release 절차는
 [`docs/operations-v2.md`](docs/operations-v2.md)에 정리돼 있습니다.
 

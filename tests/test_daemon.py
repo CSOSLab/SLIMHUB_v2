@@ -407,6 +407,8 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             report_file = next((Path(tmpdir) / "programdata" / "reports").glob("*.jsonl"))
             rows = [json.loads(line) for line in report_file.read_text(encoding="utf-8").splitlines()]
             self.assertIn("feature", [row["kind"] for row in rows])
+            feature = next(row for row in rows if row["kind"] == "feature")
+            self.assertNotIn("multimodal_state", feature)
 
 
 if __name__ == "__main__":

@@ -42,8 +42,9 @@ Stop it after a deployment check with `slimhub-v2 --quit`.
 ## 3. Confirm collection and IN/OUT data
 
 The daemon creates `programdata/display.txt` immediately at startup. It is an
-operator feed for IN/OUT, ENV/SOUND, ADL, and BASELINE records; JSONL remains
-the complete forensic source.
+operator feed for confirmed IN/OUT, ENV/SOUND, and ADL records. Candidate,
+ACK, timeout, and baseline diagnostics stay in JSONL and do not clutter the
+operator display. JSONL remains the complete forensic source.
 
 ```bash
 tail -F programdata/display.txt
@@ -61,20 +62,23 @@ directly in the crontab. Required local variables are
 `SLIMHUB_LOCAL_DB_HOST`, `SLIMHUB_LOCAL_DB_USER`, and
 `SLIMHUB_LOCAL_DB_NAME`; `SLIMHUB_LOCAL_DB_PASS` is supported. Configure the
 corresponding `SLIMHUB_REMOTE_DB_*` variables when remote upload is required.
+`house_mac` defaults to the Hub address in `programdata/config.json`; set
+`SLIMHUB_HOUSE_MAC` only when the deployment uses a separate house identifier.
 
-Copy the entry in [`slimhub-v2.crontab`](slimhub-v2.crontab) into `crontab -e`.
-It runs every three minutes, protects against overlap with `flock`, runs local
-ingest, then uploads to the configured remote database. Adjust `*/3` to
-`*/5` or `*/10` for five- or ten-minute operation.
+Copy the entries in [`slimhub-v2.crontab`](slimhub-v2.crontab) into `crontab -e`.
+They mirror the deployed SLIMHUB cadence: local ingest every three minutes and
+remote upload every ten minutes. A shared `flock` serializes coincident runs.
+Change the first expression to `*/5` when five-minute local ingest is desired.
 
 ```bash
 crontab -l
-tail -F logs/db-update.log
+tail -F logs/db-ingest.log
+tail -F logs/db-upload.log
 ```
 
 ## 5. Confirm local database ingestion
 
-After the selected cron interval, use the status command. `last_update.ok`
+After the selected cron interval, use the status command. `last_ingest.ok`
 means the local MySQL transaction completed and the source offset was written.
 
 ```bash
@@ -82,22 +86,25 @@ slimhub-v2 db status
 ```
 
 The command reports the safe database configuration state, source JSONL
-offsets, local upload offsets, and the last combined update result. It never
-prints passwords.
+offsets, local upload offsets, and the last ingest/upload results. It never
+prints passwords. By default the first run starts with today's JSONL, matching
+the legacy cron. Set `SLIMHUB_DB_BACKFILL=1` only for an intentional historical
+import.
 
 ## 6. Confirm remote upload
 
-For an enabled remote database, `last_update.upload.adl` and
-`last_update.upload.inout` show `uploaded` row counts and the local `last_id`
-that advanced only after the remote transaction committed. Verify the same
-new rows in the remote `event_adl` and `in_out` tables using the normal DB
+For an enabled remote database, `last_upload.result.adl` and
+`last_upload.result.inout` show `uploaded` row counts and the local `last_id`.
+Each stream offset advances immediately after its own remote transaction
+commits, so a later stream failure does not resend committed rows. Verify the
+same new rows in the remote `event_adl` and `in_out` tables using the normal DB
 operator account.
 
 ## 7. Release checklist
 
 - Node is connected and its location configuration is correct.
 - `display.txt` shows expected collection and IN/OUT events.
-- `db status` has a successful recent update and advancing offsets.
+- `db status` has successful recent ingest/upload runs and advancing offsets.
 - Remote table rows have been independently checked.
-- Preserve `programdata/reports/*.jsonl`, `programdata/db_sync/last_update.json`,
-  and `logs/db-update.log` as release evidence.
+- Preserve `programdata/reports/*.jsonl`, `programdata/db_sync/last_ingest.json`,
+  `programdata/db_sync/last_upload.json`, and the DB cron logs as release evidence.

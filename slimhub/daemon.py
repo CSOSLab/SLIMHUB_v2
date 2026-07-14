@@ -503,10 +503,10 @@ class SlimHubDaemon:
                     timestamp=record.timestamp,
                     kind=record.kind,
                     mac=record.mac,
-                    data={
-                        **record.data,
-                        "multimodal_state": self.multimodal.snapshot(),
-                    },
+                    # The record already contains its session identity and
+                    # linkage. Repeating the full accumulated session history
+                    # here made the append-only JSONL grow quadratically.
+                    data=dict(record.data),
                 )
             )
 
