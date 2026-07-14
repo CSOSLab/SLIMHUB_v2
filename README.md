@@ -40,8 +40,8 @@ tail -f logs/slimhub-v2.out
 slimhub-v2 --quit
 ```
 
-SLIMHUB 호환 flag 스타일도 지원하며, 운영자용 인터페이스로는 이 방식을
-권장합니다.
+SLIMHUB v1 호환 flag 스타일도 유지하지만, 새 운영에는 계층형 v2 command를
+권장합니다. 호환 option 목록은 `slimhub-v2 --legacy-help`로 확인할 수 있습니다.
 
 ```bash
 slimhub-v2 --run

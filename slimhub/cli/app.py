@@ -23,41 +23,78 @@ from slimhub.protocol.nus import (
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="slimhub-v2", description="SLIMHUB v2 CLI")
+    parser = argparse.ArgumentParser(
+        prog="slimhub-v2",
+        description="SLIMHUB v2 daemon, device, and database operations.",
+        epilog=(
+            "Common workflow:\n"
+            "  slimhub-v2 run --background\n"
+            "  slimhub-v2 devices\n"
+            "  slimhub-v2 db status\n\n"
+            "Use 'slimhub-v2 <command> --help' for command-specific options."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--base-dir", help="Runtime base directory. Default: current directory.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
-    parser.add_argument("--background", action="store_true", help="Run daemon in the background.")
+    parser.add_argument(
+        "--legacy-help",
+        action="store_true",
+        help="Show compatibility options retained from SLIMHUB v1.",
+    )
 
-    parser.add_argument("-r", "--run", dest="run_flag", action="store_true", help="Run slimhub client.")
-    parser.add_argument("-c", "--config", dest="legacy_config", nargs=3, metavar=("address", "target", "data"))
+    # Keep v1 flat options parseable for installed deployments, but direct new
+    # operators to the structured v2 commands listed by the normal help text.
+    parser.add_argument("--background", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("-r", "--run", dest="run_flag", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "-c",
+        "--config",
+        dest="legacy_config",
+        nargs=3,
+        metavar=("address", "target", "data"),
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "-s",
         "--service",
         dest="legacy_service",
         nargs=4,
         metavar=("address", "enable/disable", "service", "characteristic"),
+        help=argparse.SUPPRESS,
     )
-    parser.add_argument("-f", "--feature", dest="legacy_feature", nargs=2, metavar=("address", "start/stop"))
-    parser.add_argument("-a", "--apply", dest="apply_flag", action="store_true", help="Apply config file.")
-    parser.add_argument("-l", "--list", dest="list_flag", action="store_true", help="List registered devices.")
-    parser.add_argument("-q", "--quit", dest="quit_flag", action="store_true", help="Quit slimhub client.")
-    parser.add_argument("--hubconfig", nargs=2, metavar=("key", "value"), help="Update hub configuration.")
-    parser.add_argument("--reset", dest="legacy_reset", nargs=1, metavar=("address",))
-    parser.add_argument("--model", dest="legacy_model", nargs=2, metavar=("address", "command"))
-    parser.add_argument("--file", dest="legacy_file", nargs=3, metavar=("address", "file_path", "save_path"))
+    parser.add_argument(
+        "-f",
+        "--feature",
+        dest="legacy_feature",
+        nargs=2,
+        metavar=("address", "start/stop"),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("-a", "--apply", dest="apply_flag", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("-l", "--list", dest="list_flag", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("-q", "--quit", dest="quit_flag", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--hubconfig", nargs=2, metavar=("key", "value"), help=argparse.SUPPRESS)
+    parser.add_argument("--reset", dest="legacy_reset", nargs=1, metavar=("address",), help=argparse.SUPPRESS)
+    parser.add_argument("--model", dest="legacy_model", nargs=2, metavar=("address", "command"), help=argparse.SUPPRESS)
+    parser.add_argument("--file", dest="legacy_file", nargs=3, metavar=("address", "file_path", "save_path"), help=argparse.SUPPRESS)
 
-    parser.add_argument("--address", help="Optional BLE address to connect immediately when using --run.")
-    parser.add_argument("--name", default=DEFAULT_DEVICE_NAME, help="BLE device name to scan.")
-    parser.add_argument("--no-scan", action="store_true", help="Disable BLE scan loop.")
-    parser.add_argument("--scan-timeout", type=float, default=5.0, help="BLE scan duration in seconds.")
-    parser.add_argument("--scan-interval", type=float, default=10.0, help="Delay between BLE scans in seconds.")
-    parser.add_argument("--reconnect-delay", type=float, default=3.0)
-    parser.add_argument("--connect-timeout", type=float, default=10.0, help="BLE connect timeout in seconds.")
-    parser.add_argument("--notify-timeout", type=float, default=5.0, help="NUS notify subscription timeout in seconds.")
+    parser.add_argument("--address", help=argparse.SUPPRESS)
+    parser.add_argument("--name", default=DEFAULT_DEVICE_NAME, help=argparse.SUPPRESS)
+    parser.add_argument("--no-scan", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--scan-timeout", type=float, default=5.0, help=argparse.SUPPRESS)
+    parser.add_argument("--scan-interval", type=float, default=10.0, help=argparse.SUPPRESS)
+    parser.add_argument("--reconnect-delay", type=float, default=3.0, help=argparse.SUPPRESS)
+    parser.add_argument("--connect-timeout", type=float, default=10.0, help=argparse.SUPPRESS)
+    parser.add_argument("--notify-timeout", type=float, default=5.0, help=argparse.SUPPRESS)
 
     subparsers = parser.add_subparsers(dest="subcommand")
 
-    run_parser = subparsers.add_parser("run", help="Run the SLIMHUB daemon.")
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Start the BLE daemon.",
+        description="Start the SLIMHUB v2 BLE daemon.",
+    )
     run_parser.add_argument("--background", action="store_true", help="Run daemon in the background.")
     run_parser.add_argument("--address", help="Optional BLE address to connect immediately.")
     run_parser.add_argument("--name", default=DEFAULT_DEVICE_NAME, help="BLE device name to scan.")
@@ -152,6 +189,9 @@ def build_parser() -> argparse.ArgumentParser:
 def run_cli(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.legacy_help:
+        print(_legacy_help())
+        return 0
     if not _has_action(args):
         parser.print_help(sys.stderr)
         return 0
@@ -219,6 +259,35 @@ def _has_action(args: argparse.Namespace) -> bool:
 
 def _is_run_command(args: argparse.Namespace) -> bool:
     return bool(args.run_flag or args.subcommand == "run")
+
+
+def _legacy_help() -> str:
+    return """SLIMHUB v1 compatibility options
+
+The structured v2 commands are preferred. These flat options remain available
+for existing scripts and aliases:
+
+  -r, --run [--background] [scan options]  Start the daemon
+  -q, --quit                               Stop the daemon
+  -l, --list                               List devices
+  -c, --config ADDRESS FIELD VALUE         Set device configuration
+  -a, --apply                              Apply device configuration
+  -s, --service ADDRESS ACTION SERVICE CHARACTERISTIC
+  -f, --feature ADDRESS START_OR_STOP
+  --hubconfig KEY VALUE
+  --reset ADDRESS
+  --model ADDRESS COMMAND
+  --file ADDRESS FILE_PATH SAVE_PATH
+
+Modern equivalents include:
+
+  slimhub-v2 run --background
+  slimhub-v2 stop
+  slimhub-v2 devices
+  slimhub-v2 config set ADDRESS {type,name,location} VALUE
+  slimhub-v2 command send --address ADDRESS --command {enter,exit,record,record_stop}
+
+Run 'slimhub-v2 <command> --help' to see modern command options."""
 
 
 def _run_background(argv: Sequence[str] | None, paths: AppPaths) -> int:

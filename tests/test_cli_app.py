@@ -78,6 +78,33 @@ class CliAppTests(unittest.TestCase):
         self.assertEqual(enter.nus_command, "enter")
         self.assertEqual(exit_.nus_command, "exit")
 
+    def test_normal_help_hides_legacy_flat_options(self) -> None:
+        parser = build_parser()
+
+        help_text = parser.format_help()
+
+        self.assertIn("slimhub-v2 <command> --help", help_text)
+        self.assertIn("--legacy-help", help_text)
+        self.assertNotIn("-r, --run", help_text)
+        self.assertNotIn("--scan-timeout", help_text)
+
+    def test_legacy_help_explains_hidden_compatibility_options(self) -> None:
+        with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            status = run_cli(["--legacy-help"])
+
+        self.assertEqual(status, 0)
+        self.assertIn("-r, --run", stdout.getvalue())
+        self.assertIn("slimhub-v2 run --background", stdout.getvalue())
+
+    def test_hidden_legacy_options_remain_parseable(self) -> None:
+        args = build_parser().parse_args(
+            ["--run", "--background", "--scan-timeout", "8"]
+        )
+
+        self.assertTrue(args.run_flag)
+        self.assertTrue(args.background)
+        self.assertEqual(args.scan_timeout, 8.0)
+
     def test_battery_status_requests_and_prints_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             response = {
