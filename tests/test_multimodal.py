@@ -184,6 +184,64 @@ class MultimodalStoreTests(unittest.TestCase):
         self.assertEqual([record["event"] for record in session["records"][:2]], ["ENV", "SOUND"])
         self.assertTrue(session["predetect"]["provisional"])
         self.assertTrue(session["final"]["ground_truth_eligible"])
+        self.assertFalse(
+            any(record.kind == "derived_inference" for record in store.drain_records())
+        )
+
+    def test_derives_conservative_display_inference_when_firmware_final_is_absent(self) -> None:
+        store = self.make_store()
+        store.handle_inout(
+            report(
+                MAC_A,
+                "INOUT",
+                "SEQUENCE",
+                location="BEDROOM",
+                result="ENTER_CONFIRMED",
+                event_id="D0",
+                event_seq=41,
+            )
+        )
+        store.handle(
+            report(
+                MAC_A,
+                "EVENT",
+                "SOUND",
+                location="BEDROOM",
+                schema=1,
+                session_seq=41,
+                analysis_seq=52,
+                event_id="S2",
+                class_count=10,
+                **{"class": 2},
+                count=5,
+                max="0.91",
+                mean="0.87",
+                start_ms=1100,
+                duration_ms=50,
+                confidence=87,
+                event_ts_ms=1200,
+            )
+        )
+        store.handle_inout(
+            report(
+                MAC_A,
+                "INOUT",
+                "SEQUENCE",
+                location="BEDROOM",
+                result="EXIT_CONFIRMED",
+                event_id="D1",
+                event_seq=88,
+                event_ts_ms=1300,
+            )
+        )
+
+        derived = next(
+            record for record in store.drain_records() if record.kind == "derived_inference"
+        )
+        self.assertEqual(derived.data["adl"], "watchTV")
+        self.assertEqual(derived.data["sequence"], "D0_S2_D1_")
+        self.assertEqual(derived.data["truth"], 0.87)
+        self.assertFalse(derived.data["ground_truth_eligible"])
 
     def test_partial_overflow_is_final_but_not_ground_truth_and_malformed_is_safe(self) -> None:
         store = self.make_store()

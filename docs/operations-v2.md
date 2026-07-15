@@ -42,9 +42,18 @@ Stop it after a deployment check with `slimhub-v2 --quit`.
 ## 3. Confirm collection and IN/OUT data
 
 The daemon creates `programdata/display.txt` immediately at startup. It is an
-operator feed for confirmed IN/OUT, ENV/SOUND, and ADL records. Candidate,
-ACK, timeout, and baseline diagnostics stay in JSONL and do not clutter the
-operator display. JSONL remains the complete forensic source.
+operator feed containing only confirmed IN/OUT and final inference records.
+Individual ENV/SOUND events, candidates, ACKs, timeouts, and baselines stay in
+JSONL and do not clutter the operator display. The matching legacy-compatible
+JSON is written under each node's `inference/debugstr/YYYY-MM-DD.txt`; JSONL
+remains the complete forensic source. On startup, existing feature-only lines
+are also removed from the current display and today's text archive; JSONL is
+never rewritten.
+
+If a deployed Node v2 image omits final `src=ADL` reports, Central emits only
+the conservative location/event signatures learned from the deployed legacy
+history. These records have kind `derived_inference` and
+`ground_truth_eligible=false`; they must not be treated as firmware truth.
 
 ```bash
 tail -F programdata/display.txt
@@ -103,7 +112,7 @@ operator account.
 ## 7. Release checklist
 
 - Node is connected and its location configuration is correct.
-- `display.txt` shows expected collection and IN/OUT events.
+- `display.txt` shows only expected IN/OUT and final inference records.
 - `db status` has successful recent ingest/upload runs and advancing offsets.
 - Remote table rows have been independently checked.
 - Preserve `programdata/reports/*.jsonl`, `programdata/db_sync/last_ingest.json`,

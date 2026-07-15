@@ -480,6 +480,9 @@ class SlimHubDaemon:
             await self._log_estimator_records()
             self._log_commands(sent_commands)
             self.display_writer.write_inout(event)
+            # Session-boundary and host-derived inference records are produced
+            # by handle_inout as well as by EVENT/ADL reports.
+            await self._log_multimodal_records()
         if src in {"EVENT", "ADL"}:
             self.multimodal.handle(event)
             await self._log_multimodal_records()

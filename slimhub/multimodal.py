@@ -30,6 +30,27 @@ SOUND_CLASSES = {
 }
 FINAL_ADL_EVENTS = {"COMPLETE", "PARTIAL", "NO_MATCH"}
 
+# The field firmware is expected to emit src=ADL final reports. Some deployed
+# DEAN Node v2 images only emit the underlying EVENT stream, however. These
+# deliberately conservative signatures preserve the small set of strong,
+# location-specific matches observed in the legacy debugstr history. They are
+# display fallbacks, not firmware ground truth.
+DERIVED_ADL_RULES: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
+    "BEDROOM": (("watchTV", ("S2",)),),
+    "TOILET": (
+        ("toothbrush", ("S4", "E1")),
+        ("toothbrush", ("S4",)),
+        ("pee", ("S5",)),
+        ("handwash", ("S9",)),
+        ("handwash", ("S8",)),
+    ),
+    "KITCHEN": (
+        ("dishwashing", ("S9",)),
+        ("dishwashing", ("S8",)),
+        ("makeMeal", ("E1",)),
+    ),
+}
+
 
 @dataclass(frozen=True)
 class MultimodalRecord:
@@ -63,8 +84,9 @@ class MultimodalReportStore:
     """Typed, replay-safe storage for firmware-extracted EVENT/ADL reports.
 
     This store intentionally never returns movement commands. Firmware has
-    already performed the multimodal match; Central records and groups it for
-    diagnostics/offline analysis only.
+    normally performed the multimodal match. Central records and groups it for
+    diagnostics/offline analysis and emits a clearly marked, non-ground-truth
+    display fallback for known signatures when a deployed image omits ADL.
     """
 
     def __init__(self, manifests: DeploymentManifestStore) -> None:
@@ -122,7 +144,8 @@ class MultimodalReportStore:
             key = self._open_session.pop((mac, boot_id), None)
             boundary = self._boundary(event, "D1")
             if key is not None:
-                self._session(key)["d1"] = boundary
+                session = self._session(key)
+                session["d1"] = boundary
             else:
                 self._pending_d1[(mac, boot_id)] = boundary
             self._record(
@@ -133,6 +156,8 @@ class MultimodalReportStore:
                 inout_event_seq=_integer(fields.get("event_seq")),
                 event_ts_ms=event_ts,
             )
+            if key is not None:
+                self._record_derived_inference(event, key, session)
 
     def drain_records(self) -> list[MultimodalRecord]:
         records, self._records = self._records, []
@@ -356,10 +381,42 @@ class MultimodalReportStore:
             "inout_event_seq": _integer(event.packet.fields.get("event_seq")),
         }
 
+    def _record_derived_inference(
+        self,
+        event: ReportEvent,
+        key: tuple[str, str, int],
+        session: dict[str, object],
+    ) -> None:
+        # Prefer a real firmware final and never create the fallback twice for
+        # a replayed D1 report.
+        if session.get("final") is not None or session.get("derived_final") is not None:
+            return
+        result = _derive_adl(event.location, session.get("records"))
+        if result is None:
+            return
+        data: dict[str, object] = {
+            "source": "CENTRAL_DERIVED",
+            "event": "COMPLETE",
+            "boot_id": key[1],
+            "session_seq": key[2],
+            "event_ts_ms": _uint32(event.packet.fields.get("event_ts_ms")),
+            "adl": result["adl"],
+            "truth": result["truth"],
+            "missing": "",
+            "sequence": result["sequence"],
+            "final": True,
+            "ground_truth_eligible": False,
+            "derived": True,
+            "derived_from": "legacy_location_event_signature",
+        }
+        session["derived_final"] = data
+        self._record(event, "derived_inference", **data)
+
     def _record(self, report_event: ReportEvent, kind: str, **data: object) -> None:
         context = {
             "ble_address": report_event.source_address,
             "location": report_event.location,
+            "device_type": report_event.device_type,
             "session_id": report_event.session_id,
             "connected": report_event.connected,
             "packet_type": "REPORT",
@@ -379,6 +436,40 @@ class MultimodalReportStore:
                 data=context,
             )
         )
+
+
+def _derive_adl(location: str, records: object) -> dict[str, object] | None:
+    if not isinstance(records, list):
+        return None
+    evidence: dict[str, float] = {}
+    for record in records:
+        if not isinstance(record, dict) or record.get("source") != "EVENT":
+            continue
+        event_id = str(record.get("event_id") or "").upper()
+        if not event_id or _has_schema_error(record.get("errors")):
+            continue
+        confidence = _number(record.get("confidence"))
+        if confidence is None:
+            continue
+        evidence[event_id] = max(evidence.get(event_id, 0.0), confidence)
+
+    for adl, signature in DERIVED_ADL_RULES.get(location.upper(), ()):
+        if all(event_id in evidence for event_id in signature):
+            truth = min(evidence[event_id] for event_id in signature)
+            if truth > 1:
+                truth /= 100
+            return {
+                "adl": adl,
+                "truth": round(truth, 2),
+                "sequence": f"D0_{'_'.join(signature)}_D1_",
+            }
+    return None
+
+
+def _has_schema_error(errors: object) -> bool:
+    if not isinstance(errors, list):
+        return False
+    return any("schema" in str(error) or "unknown_" in str(error) for error in errors)
 
 
 def _event_order(event: ReportEvent, event_ts: int | None, analysis_seq: int | None) -> tuple[int, int]:

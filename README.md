@@ -97,12 +97,20 @@ Runtime 로그는 `programdata/logging.log`에 기록됩니다.
 `logging.log`는 5 MiB 단위로 최대 5개 backup까지 순환합니다. typed multimodal
 record에는 해당 event만 저장하며 누적 session 전체를 반복 복사하지 않습니다.
 
-운영자용 display는 daemon이 확정한 IN/OUT(D0/D1), ENV/SOUND, ADL event만
-`programdata/display.txt`에 append합니다. 날짜별 호환 archive는
-`data/display/YYYY-MM-DD.txt`에도 같은 내용으로 남습니다. 이 파일은 사람이
-빠르게 보는 보조 출력이며, 정식 원본은 `programdata/reports/*.jsonl`입니다.
-candidate, command ACK, timeout, baseline은 원본 JSONL에는 보존하지만 display에는
-표시하지 않습니다.
+운영자용 display는 daemon이 확정한 IN/OUT(D0/D1)과 최종 inference만
+`programdata/display.txt`에 append합니다. 개별 ENV/SOUND, candidate, command
+ACK, timeout, baseline은 원본 JSONL에는 보존하지만 display에는 표시하지 않습니다.
+동일한 IN/OUT 및 inference 원문 JSON은 node별
+`inference/debugstr/YYYY-MM-DD.txt`에 저장되며, 날짜별 평문 archive는
+`data/display/YYYY-MM-DD.txt`에도 같은 내용으로 남습니다. daemon 시작 시 기존
+`programdata/display.txt`와 당일 archive의 ENV/SOUND 줄도 제거하며 원본 JSONL은
+변경하지 않습니다.
+
+현재 배포된 Node v2처럼 `src=ADL` final report를 보내지 않는 image에서는 과거
+debugstr에서 확인된 보수적인 location/event signature만 `derived_inference`로
+보완합니다. 예를 들어 BEDROOM session의 S2는 watchTV로 변환됩니다.
+이 fallback은 `ground_truth_eligible=false`로 기록되어 firmware ADL truth와
+구분됩니다.
 
 ## DB 증분 적재와 cron
 
