@@ -218,6 +218,31 @@ class DataDirectoryDatabaseUpdaterTests(unittest.TestCase):
             self.assertEqual(local.commits, 1)
             self.assertIn(str(raw.resolve()), updater._read_json(paths.db_ingest_offset_path))
 
+    def test_preview_writes_pending_db_rows_without_db_or_offset_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = AppPaths.from_base(tmpdir)
+            raw = data_path(paths, "rawdata")
+            raw.write_text(
+                "time,GridEye,Direction\n2026-07-15 10:00:00,1,20\n",
+                encoding="utf-8",
+            )
+            updater = DataDirectoryDatabaseUpdater(
+                paths,
+                environ={"SLIMHUB_HOUSE_MAC": "house"},
+            )
+            preview_path = paths.programdata_dir / "preview.txt"
+
+            with patch.object(updater, "_connect") as connect:
+                result = updater.write_db_rows_preview(preview_path)
+
+            preview = preview_path.read_text(encoding="utf-8")
+            self.assertEqual(result["inout_rows"], 1)
+            self.assertIn("[event_adl]", preview)
+            self.assertIn("[in_out]", preview)
+            self.assertIn(f"house\tENTRY:{MAC}\t2026-07-15 10:00:00\t20", preview)
+            self.assertFalse(paths.db_ingest_offset_path.exists())
+            connect.assert_not_called()
+
     def test_upload_persists_each_stream_offset_after_remote_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = AppPaths.from_base(tmpdir)

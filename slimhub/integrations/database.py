@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 import re
@@ -111,6 +112,9 @@ class DataDirectoryDatabaseUpdater:
         )
         return result
 
+    # ========================================================================
+    # 기존 코드: data/ 파일을 읽어 실제 local DB에 입력하고 offset을 갱신합니다.
+    # ========================================================================
     def _ingest(self) -> dict[str, object]:
         reader = DataDirectoryReader(
             self.paths,
@@ -145,6 +149,67 @@ class DataDirectoryDatabaseUpdater:
             "lines": batch.lines,
             "adl_inserted": len(adl_rows),
             "inout_inserted": len(inout_rows),
+        }
+
+    # ========================================================================
+    # 신규 코드: 다음 DB 입력 대상만 TXT로 미리 봅니다.
+    # - DB에 연결하거나 데이터를 입력하지 않습니다.
+    # - ingest/upload offset 및 status 파일을 변경하지 않습니다.
+    # - 호출 예시는 이 함수의 docstring에 있습니다.
+    # ========================================================================
+    def write_db_rows_preview(
+        self,
+        output_path: str | Path | None = None,
+    ) -> dict[str, object]:
+        """Write pending DB rows as tab-separated text without touching the DB.
+
+        Example::
+
+            updater.write_db_rows_preview()
+        """
+        destination = (
+            Path(output_path)
+            if output_path is not None
+            else self.paths.db_sync_dir / "db_rows_preview.txt"
+        )
+        reader = DataDirectoryReader(
+            self.paths,
+            offsets=self._read_json(self.paths.db_ingest_offset_path),
+            environ=self.environ,
+        )
+        batch = reader.read(house_mac=self.house_mac)
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        with temporary.open("w", encoding="utf-8", newline="") as output:
+            output.write(f"# generated_at\t{_now()}\n")
+            output.write("# mode\tpreview_only_no_db_no_offset_update\n")
+            writer = csv.writer(output, delimiter="\t", lineterminator="\n")
+
+            output.write(f"\n[{self.adl_table}]\n")
+            writer.writerow(
+                (
+                    "house_mac",
+                    "location",
+                    "created_time",
+                    "event_sequence",
+                    "adl",
+                    "truth_value",
+                )
+            )
+            writer.writerows(batch.adl_rows)
+
+            output.write(f"\n[{self.inout_table}]\n")
+            writer.writerow(("house_mac", "location", "created_time", "direction"))
+            writer.writerows(batch.inout_rows)
+        temporary.replace(destination)
+
+        return {
+            "path": str(destination),
+            "files": batch.files,
+            "lines": batch.lines,
+            "adl_rows": len(batch.adl_rows),
+            "inout_rows": len(batch.inout_rows),
         }
 
     def upload(self) -> dict[str, object]:
