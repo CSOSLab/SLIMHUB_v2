@@ -233,51 +233,81 @@ class DataDirectoryDatabaseUpdater:
         return result
 
     def _upload(self) -> dict[str, object]:
-        remote = self._settings("REMOTE", required=False)
-        if remote is None:
-            return {"skipped": True, "reason": "SLIMHUB_REMOTE_DB_HOST is not configured"}
-        local = self._settings("LOCAL", required=True)
-        offsets = self._read_json(self.paths.db_upload_offset_path)
-        result: dict[str, object] = {}
-        with self._connect(local) as local_connection, self._connect(remote) as remote_connection:
-            for stream, table in (("ADL", self.adl_table), ("INOUT", self.inout_table)):
-                last_id = _as_int(offsets.get(stream), 0)
-                columns = self._columns_without_id(local_connection, table)
-                if not columns:
-                    result[stream.lower()] = {"uploaded": 0, "last_id": last_id}
-                    continue
-                column_list = ", ".join(f"`{column}`" for column in columns)
-                with local_connection.cursor() as cursor:
-                    cursor.execute(
-                        f"SELECT id, {column_list} FROM `{table}` "
-                        "WHERE id > %s ORDER BY id ASC LIMIT %s",
-                        (
-                            last_id,
-                            _as_int(
-                                self.environ.get("SLIMHUB_DB_UPLOAD_BATCH_SIZE")
-                                or self.environ.get("UPLOAD_BATCH_SIZE"),
-                                1000,
-                            ),
-                        ),
-                    )
-                    rows = cursor.fetchall()
-                if not rows:
-                    result[stream.lower()] = {"uploaded": 0, "last_id": last_id}
-                    continue
-                placeholders = ", ".join(["%s"] * len(columns))
-                with remote_connection.cursor() as cursor:
-                    cursor.executemany(
-                        f"INSERT INTO `{table}` ({column_list}) VALUES ({placeholders})",
-                        [row[1:] for row in rows],
-                    )
-                remote_connection.commit()
-                offsets[stream] = rows[-1][0]
-                # Persist each stream independently. If the following table
-                # fails, a committed stream must not be uploaded twice.
-                self._write_json_atomic(self.paths.db_upload_offset_path, offsets)
-                result[stream.lower()] = {"uploaded": len(rows), "last_id": rows[-1][0]}
-        self._write_json_atomic(self.paths.db_upload_offset_path, offsets)
-        return result
+        # ====================================================================
+        # REMOTE DB 전송 임시 비활성화: local DB 단독 테스트 기간에 사용합니다.
+        # 아래 return을 유지하는 동안 remote DB 연결/조회/INSERT는 실행되지 않습니다.
+        # 재활성화할 때 이 return을 제거하고 아래의 기존 코드를 주석 해제합니다.
+        # ====================================================================
+        return {
+            "skipped": True,
+            "reason": "remote DB upload is temporarily disabled for local-only testing",
+        }
+
+        # 기존 remote DB 전송 코드
+        # remote = self._settings("REMOTE", required=False)
+        # if remote is None:
+        #     return {
+        #         "skipped": True,
+        #         "reason": "SLIMHUB_REMOTE_DB_HOST is not configured",
+        #     }
+        # local = self._settings("LOCAL", required=True)
+        # offsets = self._read_json(self.paths.db_upload_offset_path)
+        # result: dict[str, object] = {}
+        # with (
+        #     self._connect(local) as local_connection,
+        #     self._connect(remote) as remote_connection,
+        # ):
+        #     for stream, table in (
+        #         ("ADL", self.adl_table),
+        #         ("INOUT", self.inout_table),
+        #     ):
+        #         last_id = _as_int(offsets.get(stream), 0)
+        #         columns = self._columns_without_id(local_connection, table)
+        #         if not columns:
+        #             result[stream.lower()] = {
+        #                 "uploaded": 0,
+        #                 "last_id": last_id,
+        #             }
+        #             continue
+        #         column_list = ", ".join(f"`{column}`" for column in columns)
+        #         with local_connection.cursor() as cursor:
+        #             cursor.execute(
+        #                 f"SELECT id, {column_list} FROM `{table}` "
+        #                 "WHERE id > %s ORDER BY id ASC LIMIT %s",
+        #                 (
+        #                     last_id,
+        #                     _as_int(
+        #                         self.environ.get("SLIMHUB_DB_UPLOAD_BATCH_SIZE")
+        #                         or self.environ.get("UPLOAD_BATCH_SIZE"),
+        #                         1000,
+        #                     ),
+        #                 ),
+        #             )
+        #             rows = cursor.fetchall()
+        #         if not rows:
+        #             result[stream.lower()] = {
+        #                 "uploaded": 0,
+        #                 "last_id": last_id,
+        #             }
+        #             continue
+        #         placeholders = ", ".join(["%s"] * len(columns))
+        #         with remote_connection.cursor() as cursor:
+        #             cursor.executemany(
+        #                 f"INSERT INTO `{table}` "
+        #                 f"({column_list}) VALUES ({placeholders})",
+        #                 [row[1:] for row in rows],
+        #             )
+        #         remote_connection.commit()
+        #         offsets[stream] = rows[-1][0]
+        #         # Persist each stream independently. If the following table
+        #         # fails, a committed stream must not be uploaded twice.
+        #         self._write_json_atomic(self.paths.db_upload_offset_path, offsets)
+        #         result[stream.lower()] = {
+        #             "uploaded": len(rows),
+        #             "last_id": rows[-1][0],
+        #         }
+        # self._write_json_atomic(self.paths.db_upload_offset_path, offsets)
+        # return result
 
     def _settings(self, name: str, *, required: bool) -> MySQLSettings | None:
         prefix = f"SLIMHUB_{name}_DB_"

@@ -243,7 +243,7 @@ class DataDirectoryDatabaseUpdaterTests(unittest.TestCase):
             self.assertFalse(paths.db_ingest_offset_path.exists())
             connect.assert_not_called()
 
-    def test_upload_persists_each_stream_offset_after_remote_commit(self) -> None:
+    def test_upload_is_disabled_without_remote_connection(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = AppPaths.from_base(tmpdir)
             updater = DataDirectoryDatabaseUpdater(
@@ -257,17 +257,15 @@ class DataDirectoryDatabaseUpdaterTests(unittest.TestCase):
                     "SLIMHUB_REMOTE_DB_NAME": "adl_raw",
                 },
             )
-            local = FakeConnection()
-            remote = FakeConnection(fail_table="in_out")
 
-            with patch.object(updater, "_connect", side_effect=[local, remote]):
-                with self.assertRaisesRegex(RuntimeError, "simulated remote failure"):
-                    updater.upload()
+            with patch.object(updater, "_connect") as connect:
+                result = updater.upload()
 
-            offsets = updater._read_json(paths.db_upload_offset_path)
-            self.assertEqual(offsets, {"ADL": 5})
-            self.assertEqual(remote.commits, 1)
-            self.assertFalse(updater._read_json(paths.db_upload_status_path)["ok"])
+            self.assertTrue(result["skipped"])
+            self.assertIn("temporarily disabled", result["reason"])
+            self.assertFalse(paths.db_upload_offset_path.exists())
+            self.assertTrue(updater._read_json(paths.db_upload_status_path)["ok"])
+            connect.assert_not_called()
 
     def test_status_reports_ingest_and_upload_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
