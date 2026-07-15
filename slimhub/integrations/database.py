@@ -33,8 +33,9 @@ class DataDirectoryDatabaseUpdater:
     """Cron-friendly data/ → local MySQL → remote MySQL pipeline.
 
     Collection and DB synchronization are deliberately separate: the daemon
-    writes legacy-compatible rawdata CSV and debugstr JSONL files, while this
-    class incrementally consumes those files. Credentials are read only from
+    writes legacy-compatible rawdata CSV and debugstr JSONL files. This class
+    incrementally consumes confirmed EVENT and INFERENCE records from debugstr;
+    rawdata remains collection evidence only. Credentials are read only from
     environment variables.
     """
 

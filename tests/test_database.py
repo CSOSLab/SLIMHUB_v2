@@ -106,7 +106,7 @@ class DataDirectoryDatabaseUpdaterTests(unittest.TestCase):
             self.assertEqual(remote.port, 4404)
             self.assertEqual(updater.adl_table, "legacy_adl")
 
-    def test_data_reader_maps_rawdata_and_final_debugstr_only(self) -> None:
+    def test_data_reader_maps_confirmed_event_and_final_inference_from_debugstr(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = AppPaths.from_base(tmpdir)
             raw = data_path(paths, "rawdata")
@@ -142,6 +142,27 @@ class DataDirectoryDatabaseUpdaterTests(unittest.TestCase):
                     "value": 10,
                     "timestamp": "2026-07-15 10:00:03",
                 },
+                {
+                    "device": MAC,
+                    "type": "EVENT",
+                    "event": "EXIT",
+                    "value": 20,
+                    "timestamp": "2026-07-15 10:00:04",
+                },
+                {
+                    "device": MAC,
+                    "type": "EVENT",
+                    "event": "EXIT",
+                    "value": 10,
+                    "timestamp": "2026-07-15 10:00:05",
+                },
+                {
+                    "device": MAC,
+                    "type": "DEBUG",
+                    "event": "EXIT",
+                    "value": 20,
+                    "timestamp": "2026-07-15 10:00:06",
+                },
             ]
             debug.write_text(
                 "".join(json.dumps(record) + "\n" for record in records),
@@ -152,8 +173,22 @@ class DataDirectoryDatabaseUpdaterTests(unittest.TestCase):
 
             self.assertEqual(
                 batch.inout_rows,
-                [("11:22:33:44:55:66", f"ENTRY:{MAC}", "2026-07-15 10:00:01", 10)],
+                [
+                    (
+                        "11:22:33:44:55:66",
+                        f"ENTRY:{MAC}",
+                        "2026-07-15 10:00:03",
+                        10,
+                    ),
+                    (
+                        "11:22:33:44:55:66",
+                        f"ENTRY:{MAC}",
+                        "2026-07-15 10:00:04",
+                        20,
+                    ),
+                ],
             )
+            self.assertEqual(batch.files, 1)
             self.assertEqual(
                 batch.adl_rows,
                 [
@@ -195,9 +230,18 @@ class DataDirectoryDatabaseUpdaterTests(unittest.TestCase):
     def test_ingest_commits_data_rows_then_writes_data_offsets(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = AppPaths.from_base(tmpdir)
-            raw = data_path(paths, "rawdata")
-            raw.write_text(
-                "time,GridEye,Direction\n2026-07-15 10:00:00,1,20\n",
+            debug = data_path(paths, "debugstr")
+            debug.write_text(
+                json.dumps(
+                    {
+                        "device": MAC,
+                        "type": "EVENT",
+                        "event": "EXIT",
+                        "value": 20,
+                        "timestamp": "2026-07-15 10:00:00",
+                    }
+                )
+                + "\n",
                 encoding="utf-8",
             )
             updater = DataDirectoryDatabaseUpdater(
@@ -216,14 +260,26 @@ class DataDirectoryDatabaseUpdaterTests(unittest.TestCase):
 
             self.assertEqual(result["inout_inserted"], 1)
             self.assertEqual(local.commits, 1)
-            self.assertIn(str(raw.resolve()), updater._read_json(paths.db_ingest_offset_path))
+            self.assertIn(
+                str(debug.resolve()),
+                updater._read_json(paths.db_ingest_offset_path),
+            )
 
     def test_preview_writes_pending_db_rows_without_db_or_offset_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = AppPaths.from_base(tmpdir)
-            raw = data_path(paths, "rawdata")
-            raw.write_text(
-                "time,GridEye,Direction\n2026-07-15 10:00:00,1,20\n",
+            debug = data_path(paths, "debugstr")
+            debug.write_text(
+                json.dumps(
+                    {
+                        "device": MAC,
+                        "type": "EVENT",
+                        "event": "EXIT",
+                        "value": 20,
+                        "timestamp": "2026-07-15 10:00:00",
+                    }
+                )
+                + "\n",
                 encoding="utf-8",
             )
             updater = DataDirectoryDatabaseUpdater(

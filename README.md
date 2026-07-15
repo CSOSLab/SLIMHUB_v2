@@ -114,9 +114,10 @@ debugstr에서 확인된 보수적인 location/event signature만 `derived_infer
 ## DB 증분 적재와 cron
 
 기존 SLIMHUB와 같이 별도 DB 프로그램이 `data/`를 직접 읽습니다.
-`rawdata/YYYY-MM-DD.txt`의 `GridEye=1` 행은 로컬 MySQL `in_out`에,
-`debugstr/YYYY-MM-DD.txt`의 final inference(`POP`, `COMPLETE`, `PARTIAL`,
-`NO_MATCH`)는 `event_adl`에 적재합니다. 파일별 byte offset은
+`debugstr/YYYY-MM-DD.txt`의 검증된 `EVENT`(`ENTER=10`, `EXIT=20`)는 로컬
+MySQL `in_out`에, final inference(`POP`, `COMPLETE`, `PARTIAL`, `NO_MATCH`)는
+`event_adl`에 적재합니다. `rawdata`는 수집 원본으로만 보존하며 DB 입력에는
+사용하지 않습니다. 파일별 byte offset은
 `programdata/db_sync/data_offsets.json`에 저장합니다. 이어서 local table의 `id`
 offset을 기준으로 동일 schema의 원격 table에 전송합니다.
 

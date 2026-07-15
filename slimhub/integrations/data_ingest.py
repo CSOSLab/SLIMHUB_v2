@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import json
 import os
 from dataclasses import dataclass
@@ -51,7 +50,7 @@ class DataDirectoryReader:
             identity = _data_path_identity(self.paths.data_dir, path)
             if identity is None:
                 continue
-            location, mac, stream = identity
+            location, mac = identity
             key = str(path.resolve())
             start = self.offsets.get(key, 0)
             try:
@@ -61,23 +60,18 @@ class DataDirectoryReader:
             if start > size:
                 start = 0
 
-            if stream == "rawdata":
-                rows, end_offset, consumed = _read_rawdata(
-                    path,
-                    start,
-                    house_mac=house_mac,
-                    location=location,
-                    mac=mac,
-                )
-                inout_rows.extend(rows)
-            else:
-                rows, end_offset, consumed = _read_debugstr(
-                    path,
-                    start,
-                    house_mac=house_mac,
-                    path_mac=mac,
-                )
-                adl_rows.extend(rows)
+            # 변경 사항: DB 입력 원천을 debugstr 하나로 통일했습니다.
+            # IN/OUT은 rawdata의 GridEye/Direction을 추정값으로 사용하지 않고,
+            # Node가 확정해 보낸 EVENT ENTER=10 / EXIT=20만 사용합니다.
+            adl, inout, end_offset, consumed = _read_debugstr(
+                path,
+                start,
+                house_mac=house_mac,
+                location=location,
+                path_mac=mac,
+            )
+            adl_rows.extend(adl)
+            inout_rows.extend(inout)
             updated_offsets[key] = end_offset
             files += 1
             lines += consumed
@@ -94,60 +88,13 @@ class DataDirectoryReader:
         backfill = _as_bool(self.environ.get("SLIMHUB_DB_BACKFILL"))
         today = datetime.now().strftime("%Y-%m-%d")
         files: list[Path] = []
-        for stream in ("rawdata", "debugstr"):
-            pattern = f"*/*/*/inference/{stream}/*.txt"
-            for path in self.paths.data_dir.glob(pattern):
-                if backfill or path.stem == today:
-                    files.append(path)
+        # 변경 사항: DB updater는 debugstr만 읽습니다. rawdata는 수집 원본으로
+        # 계속 보존하지만 local DB ingest source에는 포함하지 않습니다.
+        pattern = "*/*/*/inference/debugstr/*.txt"
+        for path in self.paths.data_dir.glob(pattern):
+            if backfill or path.stem == today:
+                files.append(path)
         return sorted(set(files))
-
-
-def _read_rawdata(
-    path: Path,
-    start: int,
-    *,
-    house_mac: str,
-    location: str,
-    mac: str,
-) -> tuple[list[tuple[object, ...]], int, int]:
-    rows: list[tuple[object, ...]] = []
-    consumed = 0
-    with path.open("rb") as source:
-        raw_header = source.readline()
-        if not raw_header.endswith(b"\n"):
-            return rows, start, consumed
-        try:
-            header = next(csv.reader([raw_header.decode("utf-8-sig")]))
-        except (UnicodeDecodeError, csv.Error, StopIteration):
-            return rows, start, consumed
-        header_end = source.tell()
-        source.seek(max(start, header_end))
-        end_offset = source.tell()
-        while True:
-            line_start = source.tell()
-            raw_line = source.readline()
-            if not raw_line:
-                break
-            if not raw_line.endswith(b"\n"):
-                source.seek(line_start)
-                break
-            end_offset = source.tell()
-            consumed += 1
-            try:
-                values = next(csv.reader([raw_line.decode("utf-8-sig")]))
-            except (UnicodeDecodeError, csv.Error, StopIteration):
-                continue
-            row = dict(zip(header, values))
-            if str(row.get("GridEye") or "").strip() != "1":
-                continue
-            created_time = _timestamp_text(row.get("time"))
-            direction = _optional_int(row.get("Direction"))
-            if created_time is None or direction is None:
-                continue
-            rows.append(
-                (house_mac, f"{location}:{mac}", created_time, direction)
-            )
-    return rows, end_offset, consumed
 
 
 def _read_debugstr(
@@ -155,9 +102,16 @@ def _read_debugstr(
     start: int,
     *,
     house_mac: str,
+    location: str,
     path_mac: str,
-) -> tuple[list[tuple[object, ...]], int, int]:
-    rows: list[tuple[object, ...]] = []
+) -> tuple[
+    list[tuple[object, ...]],
+    list[tuple[object, ...]],
+    int,
+    int,
+]:
+    adl_rows: list[tuple[object, ...]] = []
+    inout_rows: list[tuple[object, ...]] = []
     consumed = 0
     with path.open("rb") as source:
         source.seek(start)
@@ -178,13 +132,32 @@ def _read_debugstr(
                 continue
             if not isinstance(document, dict):
                 continue
-            if str(document.get("type") or "").upper() != "INFERENCE":
+            created_time = _timestamp_text(document.get("timestamp"))
+            if created_time is None:
+                continue
+            record_type = str(document.get("type") or "").upper()
+
+            # 변경 사항: debugstr의 확정 EVENT만 IN/OUT DB row로 변환합니다.
+            # DEBUG record는 같은 EVENT의 legacy duplicate일 수 있어 제외합니다.
+            if record_type == "EVENT":
+                event = str(document.get("event") or "").upper()
+                value = _optional_int(document.get("value"))
+                expected_value = {"ENTER": 10, "EXIT": 20}.get(event)
+                if expected_value is not None and value == expected_value:
+                    inout_rows.append(
+                        (
+                            house_mac,
+                            f"{location}:{path_mac}",
+                            created_time,
+                            expected_value,
+                        )
+                    )
+                continue
+
+            if record_type != "INFERENCE":
                 continue
             status = str(document.get("status") or "").upper()
             if status not in FINAL_INFERENCE_STATUSES:
-                continue
-            created_time = _timestamp_text(document.get("timestamp"))
-            if created_time is None:
                 continue
             device = str(document.get("device") or path_mac)
             try:
@@ -194,7 +167,7 @@ def _read_debugstr(
             adl = str(document.get("ADL") or ("NO_MATCH" if status == "NO_MATCH" else ""))
             if not adl:
                 continue
-            rows.append(
+            adl_rows.append(
                 (
                     house_mac,
                     device,
@@ -204,13 +177,13 @@ def _read_debugstr(
                     _truth_value(document.get("truth")),
                 )
             )
-    return rows, end_offset, consumed
+    return adl_rows, inout_rows, end_offset, consumed
 
 
 def _data_path_identity(
     data_dir: Path,
     path: Path,
-) -> tuple[str, str, str] | None:
+) -> tuple[str, str] | None:
     try:
         relative = path.relative_to(data_dir)
     except ValueError:
@@ -219,13 +192,13 @@ def _data_path_identity(
     if len(parts) != 6 or parts[3] != "inference":
         return None
     location, _device_type, mac, _inference, stream, _filename = parts
-    if stream not in {"rawdata", "debugstr"}:
+    if stream != "debugstr":
         return None
     try:
         mac = normalize_mac(mac)
     except ValueError:
         return None
-    return location, mac, stream
+    return location, mac
 
 
 def _timestamp_text(value: object) -> str | None:
