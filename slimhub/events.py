@@ -47,6 +47,7 @@ class ReportEvent:
     clock_error_ms: float | None = None
     wrap_epoch: int | None = None
     normalized_timestamp: float | None = None
+    identity_warning: str | None = None
 
 
 @dataclass(frozen=True)

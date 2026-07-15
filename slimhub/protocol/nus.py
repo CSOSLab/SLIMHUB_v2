@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import string
 import struct
@@ -65,6 +66,10 @@ class AlertPacket:
 class ReportPacket:
     message: str
     fields: dict[str, str]
+    format: str = "csv"
+    document: dict[str, object] | None = None
+    parse_error: str | None = None
+    duplicate_fields: dict[str, list[str]] | None = None
 
 
 @dataclass(frozen=True)
@@ -276,12 +281,58 @@ def parse_alert(payload: bytes) -> AlertPacket:
 
 def parse_report(payload: bytes) -> ReportPacket:
     message = payload.decode("utf-8", errors="replace")
-    fields = {}
+    if payload.lstrip().startswith(b"{"):
+        try:
+            document = json.loads(message)
+        except json.JSONDecodeError as exc:
+            return ReportPacket(
+                message=message,
+                fields={},
+                format="json",
+                parse_error=f"invalid_json: {exc.msg}",
+            )
+        if not isinstance(document, dict):
+            return ReportPacket(
+                message=message,
+                fields={},
+                format="json",
+                parse_error="json_report_must_be_an_object",
+            )
+        fields = {
+            str(key): _json_field_text(value)
+            for key, value in document.items()
+            if isinstance(value, (str, int, float, bool)) or value is None
+        }
+        return ReportPacket(
+            message=message,
+            fields=fields,
+            format="json",
+            document=document,
+        )
+    fields: dict[str, str] = {}
+    duplicate_fields: dict[str, list[str]] = {}
     for part in message.split(","):
         key, separator, value = part.partition("=")
         if separator:
-            fields[key.strip()] = value.strip()
-    return ReportPacket(message=message, fields=fields)
+            normalized_key = key.strip()
+            normalized_value = value.strip()
+            if normalized_key in fields:
+                duplicate_fields.setdefault(normalized_key, []).append(normalized_value)
+            else:
+                fields[normalized_key] = normalized_value
+    return ReportPacket(
+        message=message,
+        fields=fields,
+        duplicate_fields=duplicate_fields or None,
+    )
+
+
+def _json_field_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 def parse_frame(data: bytes) -> ParsedFrame:

@@ -97,7 +97,7 @@ Runtime 로그는 `programdata/logging.log`에 기록됩니다.
 `logging.log`는 5 MiB 단위로 최대 5개 backup까지 순환합니다. typed multimodal
 record에는 해당 event만 저장하며 누적 session 전체를 반복 복사하지 않습니다.
 
-운영자용 display는 daemon이 확정한 IN/OUT(D0/D1)과 최종 inference만
+운영자용 display는 daemon이 확정한 IN/OUT(D0/D1)과 inference 상태 전이만
 `programdata/display.txt`에 append합니다. 개별 ENV/SOUND, candidate, command
 ACK, timeout, baseline은 원본 JSONL에는 보존하지만 display에는 표시하지 않습니다.
 동일한 IN/OUT 및 inference 원문 JSON은 node별
@@ -181,7 +181,7 @@ Inbound packet type은 다음과 같습니다.
 
 - `RAWDATA`: 33-byte little-endian payload
 - `ALERT`: UTF-8 text payload
-- `REPORT`: UTF-8 comma-separated key/value payload
+- `REPORT`: UTF-8 comma-separated key/value 또는 NCS-compatible JSON payload
 
 BLE notification 경계는 NUS frame 경계가 아닙니다. Central은 connection별
 byte accumulator에서 16-byte header의 little-endian payload length와 뒤따르는
@@ -241,7 +241,7 @@ Outbound unitspace command는 NUS RX로 `COMMAND` frame을 보내는 방식입�
 
 ## Multimodal EVENT / ADL reports
 
-`src=EVENT`의 `BASELINE`, `ENV`, `SOUND`와 `src=ADL`의 `PREDETECT`,
+`src=EVENT`의 `BASELINE`, `ENV`, `SOUND`와 `src=ADL`의 `PREDETECT`, `POP`,
 `COMPLETE`, `PARTIAL`, `NO_MATCH`는 `programdata/reports/*.jsonl`에 typed
 record로 추가 저장됩니다. 이 stream은 IN/OUT estimator에 절대 재입력하지
 않습니다. `analysis_seq`는 `(MAC, boot_id, analysis_seq)` replay dedupe key이며
@@ -260,6 +260,34 @@ subscription snapshot의 더 최신 channel count를 보존합니다. `configure
 검증됩니다. template은 [deployment-manifest.example.json](docs/deployment-manifest.example.json)에
 있습니다. ADL report의 `profile`은 AUTO build에서도 winning candidate이므로 image
 profile 판정에 사용하지 않습니다.
+
+### NCS-compatible JSON migration reports
+
+`REPORT` payload의 첫 non-whitespace byte가 `{`이면 comma-separated REPORT가
+아닌 one-frame JSON record로 파싱합니다. notification 분할/합침은 기존
+connection별 frame accumulator에서 먼저 복원하므로 ATT notification 경계와
+JSON 경계를 같다고 가정하지 않습니다. JSON의 uppercase colon `device`와 frame
+MAC이 다르면 security warning을 기록하고 frame MAC을 authoritative node identity로
+사용합니다.
+
+Schema 2 JSON `EVENT`(`ENTER=10`, `EXIT=20`)는 legacy UI timeline에만 기록하고
+movement estimator에는 다시 입력하지 않습니다. 값 또는 identity가 유효하지 않은
+record는 원문 JSONL에는 남지만 movement timeline에서는 제외합니다. JSON
+`INFERENCE`의 `PRE-DETECT`, `POP`, `COMPLETE`, `PARTIAL`, `NO_MATCH`는
+`(frame MAC,bid,aid)`로 activity upsert됩니다. 같은 key의 typed `src=ADL`
+record가 도착하면 score/coverage/margin/reset을 가진 typed detail을 canonical로
+보존하고 activity를 두 번 세지 않습니다. POP은 final activity이며 같은 `sid`의
+D1 terminal 결과와 별도 activity로 유지합니다.
+
+현재 schema 2 compact ADL의 `cov/m/dur/rst/seq` alias도 canonical detail로
+정규화합니다. payload가 routing용 `src=ADL` 뒤에 source-count metric `src=N`을
+다시 포함하면 첫 `src`를 routing identity로 유지하고 두 번째 값은
+`source_count`와 `duplicate_fields`에 보존합니다.
+
+JSON schema 2의 `truth`는 adaptive matcher의 0–1 score ratio이고 display에
+`(adaptive)`로 표시합니다. 기존 heap truth는 `(legacy)`로 구분합니다. unknown
+JSON key, future schema, 31자를 넘은 sequence와 malformed JSON도 parser를
+중단시키지 않고 원문과 validation error를 forensic JSONL에 보존합니다.
 
 ## Sound schema
 

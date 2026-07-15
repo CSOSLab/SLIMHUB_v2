@@ -295,10 +295,16 @@ class RawDataLogger:
             "wrap_epoch": event.wrap_epoch,
             "packet_type": "REPORT",
             "raw_payload_hex": event.payload.hex(),
-            "src": fields.get("src", ""),
-            "event": fields.get("event", ""),
+            "src": fields.get("src", "")
+            or ("LEGACY_JSON" if event.packet.format == "json" else ""),
+            "event": fields.get("event", "") or fields.get("status", ""),
             "message": event.packet.message,
             "fields": fields,
+            "report_format": event.packet.format,
+            "json_document": event.packet.document,
+            "parse_error": event.packet.parse_error,
+            "duplicate_fields": event.packet.duplicate_fields,
+            "identity_warning": event.identity_warning,
         }
         for key in USD_STATUS_FIELDS:
             if key in fields:

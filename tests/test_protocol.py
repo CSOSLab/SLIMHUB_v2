@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import struct
 import unittest
 
@@ -58,6 +59,41 @@ class ProtocolTests(unittest.TestCase):
         frames = assembler.push(stream[:23]) + assembler.push(stream[23:247]) + assembler.push(stream[247:])
 
         self.assertEqual(frames, [first, second])
+
+    def test_assembler_reassembles_fragmented_json_and_coalesced_csv_reports(self) -> None:
+        document = {
+            "device": "AA:BB:CC:DD:EE:01",
+            "type": "EVENT",
+            "event": "ENTER",
+            "value": 10,
+            "schema": 2,
+            "bid": "12ab34cd",
+            "eid": 41,
+            "ts": 840000,
+        }
+        json_frame = build_frame(
+            "AA:BB:CC:DD:EE:01",
+            "REPORT",
+            ("  " + json.dumps(document)).encode(),
+        )
+        csv_frame = build_frame(
+            "AA:BB:CC:DD:EE:01",
+            "REPORT",
+            b"src=EVENT,event=ENV,schema=2,bid=12ab34cd,aid=42,ts=840100",
+        )
+        assembler = FrameAssembler()
+
+        frames = []
+        for chunk in (json_frame[:7], json_frame[7:-1], json_frame[-1:] + csv_frame):
+            frames.extend(assembler.push(chunk))
+
+        self.assertEqual(frames, [json_frame, csv_frame])
+        json_packet = parse_frame(frames[0]).parsed
+        csv_packet = parse_frame(frames[1]).parsed
+        self.assertEqual(json_packet.format, "json")
+        self.assertEqual(json_packet.document, document)
+        self.assertEqual(csv_packet.format, "csv")
+        self.assertEqual(csv_packet.fields["src"], "EVENT")
 
     def test_assembler_discards_bad_crlf_and_resynchronizes_to_next_frame(self) -> None:
         valid = build_frame("AA:BB:CC:DD:EE:FF", "ALERT", b"ready")
@@ -120,6 +156,37 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(frame.parsed.fields["src"], "SOUND")
         self.assertEqual(frame.parsed.fields["event"], "RECORD_START")
         self.assertEqual(frame.parsed.fields["path"], "SOUND/001.wav")
+
+    def test_csv_report_keeps_first_routing_source_and_preserves_duplicate_metric(self) -> None:
+        payload = b"src=ADL,event=POP,schema=2,src=3,score=98"
+
+        packet = parse_frame(
+            build_frame("AA:BB:CC:DD:EE:FF", "REPORT", payload)
+        ).parsed
+
+        self.assertEqual(packet.fields["src"], "ADL")
+        self.assertEqual(packet.duplicate_fields, {"src": ["3"]})
+
+    def test_json_report_preserves_unknown_keys_and_parse_errors(self) -> None:
+        document = {
+            "device": "AA:BB:CC:DD:EE:FF",
+            "type": "INFERENCE",
+            "status": "POP",
+            "future_detail": {"weight": 3},
+        }
+        parsed = parse_frame(
+            build_frame("AA:BB:CC:DD:EE:FF", "REPORT", json.dumps(document).encode())
+        ).parsed
+        malformed = parse_frame(
+            build_frame("AA:BB:CC:DD:EE:FF", "REPORT", b'{"type":"EVENT"')
+        ).parsed
+
+        self.assertEqual(parsed.format, "json")
+        self.assertEqual(parsed.document["future_detail"], {"weight": 3})
+        self.assertIsNone(parsed.parse_error)
+        self.assertEqual(malformed.format, "json")
+        self.assertIn("invalid_json", malformed.parse_error)
+        self.assertEqual(malformed.message, '{"type":"EVENT"')
 
     def test_inout_report_frame_parses_state_payload(self) -> None:
         payload = (

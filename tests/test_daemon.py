@@ -9,7 +9,14 @@ from pathlib import Path
 
 from slimhub.config import AppPaths
 from slimhub.events import CommandEvent
-from slimhub.protocol.nus import ParsedFrame, RawDataPacket, ReportPacket, mac_to_bytes
+from slimhub.protocol.nus import (
+    ParsedFrame,
+    RawDataPacket,
+    ReportPacket,
+    build_frame,
+    mac_to_bytes,
+    parse_frame,
+)
 
 
 class FakeBleakClient:
@@ -98,6 +105,12 @@ def report_frame(address: str, message: str, fields: dict[str, str]) -> ParsedFr
     )
 
 
+def json_report_frame(address: str, document: dict[str, object]) -> ParsedFrame:
+    return parse_frame(
+        build_frame(address, "REPORT", json.dumps(document).encode("utf-8"))
+    )
+
+
 def inout_report_frame(address: str, action: str = "ENTER") -> ParsedFrame:
     is_enter = action.upper() == "ENTER"
     message = (
@@ -150,6 +163,81 @@ def usd_report_frame(address: str) -> ParsedFrame:
 
 
 class DaemonTests(unittest.IsolatedAsyncioTestCase):
+    def test_json_device_requires_canonical_uppercase_colon_mac(self) -> None:
+        address = "AA:BB:CC:DD:EE:01"
+        frame = json_report_frame(
+            address,
+            {"device": "aa:bb:cc:dd:ee:01", "type": "EVENT"},
+        )
+
+        self.assertEqual(
+            SlimHubDaemon._json_identity_warning(frame),
+            "noncanonical_device:aa:bb:cc:dd:ee:01",
+        )
+
+    async def test_json_event_validates_device_identity_and_never_feeds_estimator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            frame_mac = "AA:BB:CC:DD:EE:01"
+            document = {
+                "device": "11:22:33:44:55:66",
+                "type": "EVENT",
+                "event": "ENTER",
+                "value": 10,
+                "schema": 2,
+                "bid": "12ab34cd",
+                "eid": 41,
+                "ts": 840000,
+            }
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            daemon.config_store.set_field(frame_mac, "location", "ENTRY")
+
+            with self.assertLogs("slimhub.daemon", level="WARNING") as captured:
+                await daemon.handle_frame(frame_mac, json_report_frame(frame_mac, document))
+                await daemon.flush_report_reorder_buffer()
+
+            self.assertIn("device_mismatch:11:22:33:44:55:66", "\n".join(captured.output))
+            self.assertIsNone(daemon.estimator.snapshot()["last_address"])
+            timeline = daemon.multimodal.snapshot()["legacy_events"]
+            self.assertIn(f"{frame_mac}/12ab34cd/840000/ENTER", timeline)
+            report_file = next((Path(tmpdir) / "programdata" / "reports").glob("*.jsonl"))
+            rows = [
+                json.loads(line)
+                for line in report_file.read_text(encoding="utf-8").splitlines()
+            ]
+            raw = next(row for row in rows if row["kind"] == "report")
+            self.assertEqual(raw["mac"], frame_mac)
+            self.assertEqual(raw["report_format"], "json")
+            self.assertEqual(raw["json_document"]["device"], "11:22:33:44:55:66")
+            self.assertIn("device_mismatch", raw["identity_warning"])
+
+    async def test_invalid_json_enter_value_is_preserved_but_not_timeline_movement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            address = "AA:BB:CC:DD:EE:01"
+            document = {
+                "device": address,
+                "type": "EVENT",
+                "event": "ENTER",
+                "value": 20,
+                "schema": 2,
+                "bid": "12ab34cd",
+                "eid": 41,
+                "ts": 840000,
+                "future_key": "preserved",
+            }
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+
+            await daemon.handle_frame(address, json_report_frame(address, document))
+            await daemon.flush_report_reorder_buffer()
+
+            self.assertEqual(daemon.multimodal.snapshot()["legacy_events"], {})
+            report_file = next((Path(tmpdir) / "programdata" / "reports").glob("*.jsonl"))
+            rows = [
+                json.loads(line)
+                for line in report_file.read_text(encoding="utf-8").splitlines()
+            ]
+            invalid = next(row for row in rows if row["kind"] == "legacy_event_invalid")
+            self.assertEqual(invalid["raw_document"]["future_key"], "preserved")
+
     async def test_new_node_enter_sends_exit_command_to_previous_node(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))

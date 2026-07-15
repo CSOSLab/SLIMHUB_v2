@@ -7,7 +7,7 @@ from pathlib import Path
 
 from slimhub.events import ReportEvent
 from slimhub.multimodal import DeploymentManifestStore, MultimodalReportStore
-from slimhub.protocol.nus import ReportPacket
+from slimhub.protocol.nus import ReportPacket, parse_report
 
 
 MAC_A = "AA:BB:CC:DD:EE:01"
@@ -42,6 +42,36 @@ def report(
         packet=ReportPacket(message, values),
         payload=message.encode(),
         wrap_epoch=0,
+    )
+
+
+def json_report(
+    document: dict[str, object],
+    *,
+    mac: str = MAC_A,
+    location: str = "TOILET",
+    identity_warning: str | None = None,
+) -> ReportEvent:
+    message = json.dumps(document)
+    fields = {
+        key: str(value)
+        for key, value in document.items()
+        if isinstance(value, (str, int, float))
+    }
+    return ReportEvent(
+        timestamp=1.0,
+        receipt_timestamp=1.0,
+        mac=mac,
+        source_address=mac,
+        location=location,
+        packet=ReportPacket(
+            message=message,
+            fields=fields,
+            format="json",
+            document=document,
+        ),
+        payload=message.encode(),
+        identity_warning=identity_warning,
     )
 
 
@@ -257,6 +287,196 @@ class MultimodalStoreTests(unittest.TestCase):
         result = next(record for record in store.drain_records() if record.kind == "adl_result")
         self.assertTrue(result.data["final"])
         self.assertFalse(result.data["ground_truth_eligible"])
+
+    def test_invalid_legacy_event_value_is_not_added_to_timeline(self) -> None:
+        store = self.make_store()
+        document = {
+            "device": MAC_A,
+            "type": "EVENT",
+            "event": "ENTER",
+            "value": 20,
+            "schema": 2,
+            "bid": "12ab34cd",
+            "eid": 41,
+            "ts": 840000,
+        }
+
+        store.handle_legacy_json(json_report(document))
+
+        self.assertEqual(store.snapshot()["legacy_events"], {})
+        invalid = next(
+            record
+            for record in store.drain_records()
+            if record.kind == "legacy_event_invalid"
+        )
+        self.assertIn("invalid_event_value", invalid.data["errors"])
+
+    def test_json_and_typed_schema2_adl_upsert_one_canonical_activity(self) -> None:
+        store = self.make_store()
+        document = {
+            "device": MAC_A,
+            "type": "INFERENCE",
+            "ADL": "pee",
+            "status": "POP",
+            "sequence": "D0_S5_",
+            "truth": 0.88,
+            "missing": "0",
+            "schema": 2,
+            "bid": "12ab34cd",
+            "sid": 7,
+            "aid": 53,
+            "why": "threshold_pop",
+        }
+        store.handle_legacy_json(json_report(document))
+        store.handle(
+            report(
+                MAC_A,
+                "ADL",
+                "POP",
+                boot_id="12ab34cd",
+                event_ts_ms=840000,
+                schema=2,
+                sid=7,
+                aid=53,
+                adl="pee",
+                score=88,
+                coverage=100,
+                margin=12,
+                missing=0,
+                overflow=0,
+                sequence="D0_S5_",
+                why="threshold_pop",
+            )
+        )
+
+        activities = store.snapshot()["activities"]
+        self.assertEqual(len(activities), 1)
+        activity = activities[f"{MAC_A}/12ab34cd/53"]
+        self.assertEqual(activity["sources"], ["legacy_json", "typed_adl"])
+        self.assertEqual(activity["canonical_source"], "typed_adl")
+        self.assertEqual(activity["canonical_detail"]["coverage"], 100.0)
+
+    def test_typed_schema2_compact_identity_aliases_match_json_activity_key(self) -> None:
+        store = self.make_store()
+        message = (
+            "src=ADL,event=POP,schema=2,bid=12ab34cd,sid=7,aid=53,act=4,"
+            "pop=1,ts=840000,room=toilet,adl=pee,score=88,cov=100,"
+            "margin=12,m=3/3,env=2,src=3,why=threshold_pop,dur=500,"
+            "rst=1,seq=D0_S5_"
+        )
+        packet = parse_report(message.encode())
+
+        store.handle(
+            ReportEvent(
+                timestamp=840.0,
+                mac=MAC_A,
+                source_address=MAC_A,
+                location="TOILET",
+                packet=packet,
+                payload=message.encode(),
+            )
+        )
+
+        activity = store.snapshot()["activities"][f"{MAC_A}/12ab34cd/53"]
+        self.assertEqual(activity["canonical_source"], "typed_adl")
+        self.assertEqual(activity["canonical_detail"]["session_seq"], 7)
+        self.assertEqual(activity["canonical_detail"]["event_ts_ms"], 840000)
+        self.assertEqual(activity["canonical_detail"]["coverage"], 100.0)
+        self.assertEqual(activity["canonical_detail"]["stages"], {"matched": 3, "total": 3})
+        self.assertEqual(activity["canonical_detail"]["source_count"], 3)
+        self.assertEqual(activity["canonical_detail"]["duration_ms"], 500)
+        self.assertEqual(activity["canonical_detail"]["pop_reset"], "1")
+
+    def test_invalid_schema2_inference_identity_and_truth_are_not_activities(self) -> None:
+        store = self.make_store()
+        for aid, bid, truth in ((61, "bad", 0.5), (62, "12ab34cd", 1.5)):
+            store.handle_legacy_json(
+                json_report(
+                    {
+                        "device": MAC_A,
+                        "type": "INFERENCE",
+                        "ADL": "pee",
+                        "status": "POP",
+                        "sequence": "D0_S5_",
+                        "truth": truth,
+                        "missing": "0",
+                        "schema": 2,
+                        "bid": bid,
+                        "sid": 7,
+                        "aid": aid,
+                        "why": "threshold_pop",
+                    }
+                )
+            )
+
+        self.assertEqual(store.snapshot()["activities"], {})
+        invalid = [
+            record
+            for record in store.drain_records()
+            if record.kind == "legacy_inference_invalid"
+        ]
+        self.assertIn("invalid_bid", invalid[0].data["errors"])
+        self.assertIn("invalid_truth", invalid[1].data["errors"])
+
+    def test_legacy_inference_state_transitions_keep_pop_and_terminal_separate(self) -> None:
+        store = self.make_store()
+        for aid, status, why in (
+            (51, "PRE-DETECT", "new_session"),
+            (52, "POP", "threshold_pop"),
+            (53, "COMPLETE", "d1_complete"),
+        ):
+            store.handle_legacy_json(
+                json_report(
+                    {
+                        "device": MAC_A,
+                        "type": "INFERENCE",
+                        "ADL": "pee",
+                        "status": status,
+                        "sequence": "D0_S5_D1_",
+                        "truth": 0.88,
+                        "missing": "0",
+                        "schema": 2,
+                        "bid": "12ab34cd",
+                        "sid": 7,
+                        "aid": aid,
+                        "why": why,
+                    }
+                )
+            )
+
+        snapshot = store.snapshot()
+        self.assertEqual(len(snapshot["activities"]), 3)
+        session = snapshot["sessions"][f"{MAC_A}/12ab34cd/7"]
+        self.assertEqual(len(session["activity_states"]), 3)
+        self.assertEqual(session["legacy_pops"][0]["event"], "POP")
+        self.assertEqual(session["legacy_final"]["event"], "COMPLETE")
+
+    def test_future_schema_and_long_sequence_preserve_raw_json(self) -> None:
+        store = self.make_store()
+        document = {
+            "device": MAC_A,
+            "type": "INFERENCE",
+            "ADL": "future",
+            "status": "PARTIAL",
+            "sequence": "D0_" + ("E1_" * 20),
+            "truth": 0.5,
+            "missing": "2",
+            "schema": 99,
+            "bid": "12ab34cd",
+            "sid": 8,
+            "aid": 60,
+            "why": "d1_partial",
+            "future_key": {"x": 1},
+        }
+
+        store.handle_legacy_json(json_report(document))
+
+        record = next(
+            record for record in store.drain_records() if record.kind == "legacy_activity"
+        )
+        self.assertIn("future_or_legacy_schema", record.data["errors"])
+        self.assertIn("sequence_contract_violation", record.data["errors"])
+        self.assertEqual(record.data["raw_document"]["future_key"], {"x": 1})
 
 
 if __name__ == "__main__":

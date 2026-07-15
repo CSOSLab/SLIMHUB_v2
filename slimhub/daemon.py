@@ -301,8 +301,17 @@ class SlimHubDaemon:
             timestamp = time.time()
             src = frame.parsed.fields.get("src", "").upper()
             connected = await self._source_connected(source_address)
-            boot_id = frame.parsed.fields.get("boot_id")
-            event_ts_ms = _int_or_none(frame.parsed.fields.get("event_ts_ms"))
+            identity_warning = self._json_identity_warning(frame)
+            if identity_warning is not None:
+                self.logger.warning(
+                    "REPORT JSON identity warning frame_mac=%s detail=%s",
+                    frame.mac,
+                    identity_warning,
+                )
+            boot_id = frame.parsed.fields.get("boot_id") or frame.parsed.fields.get("bid")
+            event_ts_ms = _int_or_none(
+                frame.parsed.fields.get("event_ts_ms") or frame.parsed.fields.get("ts")
+            )
             normalized = self.clock_normalizer.normalize(
                 frame.mac,
                 boot_id,
@@ -324,11 +333,13 @@ class SlimHubDaemon:
                 clock_error_ms=normalized.error_ms,
                 wrap_epoch=normalized.wrap_epoch,
                 normalized_timestamp=normalized.timestamp,
+                identity_warning=identity_warning,
             )
             # Reports are diagnostic evidence even when their source is new to
             # this Central build, so retain every well-formed REPORT packet.
             await self.raw_logger.log_report(report_event)
-            if src in {"INOUT", "EVENT", "ADL"} and boot_id and event_ts_ms is not None:
+            orderable = src in {"INOUT", "EVENT", "ADL"} or frame.parsed.format == "json"
+            if orderable and boot_id and event_ts_ms is not None:
                 for ordered_event in self.report_reorder_buffer.push(
                     report_event,
                     normalized.timestamp,
@@ -338,6 +349,24 @@ class SlimHubDaemon:
             else:
                 await self._process_report_event(report_event)
             self._log_report(frame)
+
+    @staticmethod
+    def _json_identity_warning(frame: ParsedFrame) -> str | None:
+        packet = frame.parsed
+        if not isinstance(packet, ReportPacket) or packet.format != "json":
+            return None
+        device = packet.fields.get("device")
+        if not device:
+            return "missing_device"
+        try:
+            normalized = normalize_mac(device)
+        except ValueError:
+            return f"invalid_device:{device}"
+        if device != normalized:
+            return f"noncanonical_device:{device}"
+        if normalized != normalize_mac(frame.mac):
+            return f"device_mismatch:{normalized}"
+        return None
 
     async def handle_connection_state(
         self,
@@ -460,6 +489,10 @@ class SlimHubDaemon:
             )
 
     async def _process_report_event(self, event: ReportEvent) -> None:
+        if event.packet.format == "json":
+            self.multimodal.handle_legacy_json(event)
+            await self._log_multimodal_records()
+            return
         src = event.packet.fields.get("src", "").upper()
         if src == "USD":
             self._remember_usd_status(

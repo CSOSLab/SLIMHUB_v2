@@ -196,6 +196,159 @@ class DisplayWriterTests(unittest.TestCase):
 
             self.assertEqual(paths.display_path.read_text(encoding="utf-8"), "")
 
+    def test_displays_json_inference_states_with_adaptive_truth_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = AppPaths.from_base(tmpdir)
+            writer = DisplayWriter(paths)
+            for aid, status in ((51, "PRE-DETECT"), (52, "POP"), (53, "COMPLETE")):
+                document = {
+                    "device": "AA:BB:CC:DD:EE:FF",
+                    "type": "INFERENCE",
+                    "ADL": "pee",
+                    "status": status,
+                    "sequence": "D0_S5_D1_",
+                    "truth": 0.88,
+                    "missing": "0",
+                    "schema": 2,
+                    "bid": "12ab34cd",
+                    "sid": 7,
+                    "aid": aid,
+                    "why": "threshold_pop" if status == "POP" else "d1_complete",
+                }
+                writer.write_multimodal(
+                    MultimodalRecord(
+                        kind="legacy_activity",
+                        mac="AA:BB:CC:DD:EE:FF",
+                        timestamp=float(aid),
+                        data={
+                            "location": "TOILET",
+                            "activity_key": f"AA:BB:CC:DD:EE:FF/12ab34cd/{aid}",
+                            "truth_semantics": "adaptive_score_ratio",
+                            "raw_document": document,
+                        },
+                    )
+                )
+
+            current = paths.display_path.read_text(encoding="utf-8")
+            self.assertIn("[INFERENCE] PRE-DETECT: pee", current)
+            self.assertIn("[INFERENCE] POP: pee", current)
+            self.assertIn("[INFERENCE] COMPLETE: pee", current)
+            self.assertEqual(current.count("truth: 0.88 (adaptive), missing: 0"), 3)
+
+    def test_schema2_typed_adl_is_not_displayed_twice_with_json_timeline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = AppPaths.from_base(tmpdir)
+            writer = DisplayWriter(paths)
+            writer.ensure()
+
+            writer.write_multimodal(
+                MultimodalRecord(
+                    kind="adl_result",
+                    mac="AA:BB:CC:DD:EE:FF",
+                    timestamp=1.0,
+                    data={
+                        "location": "TOILET",
+                        "event": "POP",
+                        "adl": "pee",
+                        "schema": 2,
+                        "truth": 88,
+                    },
+                )
+            )
+
+            self.assertEqual(paths.display_path.read_text(encoding="utf-8"), "")
+
+    def test_json_and_typed_inout_pair_is_displayed_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = AppPaths.from_base(tmpdir)
+            writer = DisplayWriter(paths)
+            writer.write_inout(
+                ReportEvent(
+                    timestamp=2.0,
+                    mac="AA:BB:CC:DD:EE:FF",
+                    source_address="AA:BB:CC:DD:EE:FF",
+                    location="ENTRY",
+                    payload=b"",
+                    packet=ReportPacket(
+                        message="",
+                        fields={
+                            "src": "INOUT",
+                            "event": "SEQUENCE",
+                            "result": "ENTER_CONFIRMED",
+                            "event_id": "D0",
+                            "schema": "2",
+                            "bid": "12ab34cd",
+                            "ts": "840000",
+                        },
+                    ),
+                )
+            )
+            writer.write_multimodal(
+                MultimodalRecord(
+                    kind="legacy_event",
+                    mac="AA:BB:CC:DD:EE:FF",
+                    timestamp=1.0,
+                    data={
+                        "location": "ENTRY",
+                        "boot_id": "12ab34cd",
+                        "event_ts_ms": 840000,
+                        "event": "ENTER",
+                        "raw_document": {
+                            "device": "AA:BB:CC:DD:EE:FF",
+                            "type": "EVENT",
+                            "event": "ENTER",
+                            "value": 10,
+                            "bid": "12ab34cd",
+                            "ts": 840000,
+                        },
+                    },
+                )
+            )
+
+            current = paths.display_path.read_text(encoding="utf-8")
+            self.assertEqual(current.count("[EVENT] - ENTER value: 10"), 1)
+            debug_path = (
+                paths.data_dir
+                / "ENTRY"
+                / "DEAN_NODE_V2"
+                / "AA:BB:CC:DD:EE:FF"
+                / "inference"
+                / "debugstr"
+                / "1970-01-01.txt"
+            )
+            debug = debug_path.read_text(encoding="utf-8")
+            self.assertIn('"type": "EVENT"', debug)
+            self.assertEqual(debug.count('"event": "ENTER"'), 1)
+
+    def test_legacy_and_adaptive_truth_are_visibly_distinct(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = AppPaths.from_base(tmpdir)
+            writer = DisplayWriter(paths)
+            for aid, semantics in ((1, "legacy_heap_truth"), (2, "adaptive_score_ratio")):
+                writer.write_multimodal(
+                    MultimodalRecord(
+                        kind="legacy_activity",
+                        mac="AA:BB:CC:DD:EE:FF",
+                        timestamp=float(aid),
+                        data={
+                            "location": "TOILET",
+                            "activity_key": f"activity/{aid}",
+                            "truth_semantics": semantics,
+                            "raw_document": {
+                                "type": "INFERENCE",
+                                "status": "COMPLETE",
+                                "ADL": "pee",
+                                "truth": 0.5,
+                                "missing": "0",
+                            },
+                        },
+                    )
+                )
+
+            current = paths.display_path.read_text(encoding="utf-8")
+            self.assertIn("truth: 0.50 (legacy), missing: ", current)
+            self.assertIn("truth: 0.50 (adaptive), missing: 0", current)
+
 
 if __name__ == "__main__":
     unittest.main()
