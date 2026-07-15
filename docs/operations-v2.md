@@ -44,11 +44,15 @@ Stop it after a deployment check with `slimhub-v2 --quit`.
 The daemon creates `programdata/display.txt` immediately at startup. It is an
 operator feed containing only confirmed IN/OUT and inference state records.
 Individual ENV/SOUND events, candidates, ACKs, timeouts, and baselines stay in
-JSONL and do not clutter the operator display. The matching legacy-compatible
-JSON is written under each node's `inference/debugstr/YYYY-MM-DD.txt`; JSONL
-remains the complete forensic source. On startup, existing feature-only lines
-are also removed from the current display and today's text archive; JSONL is
-never rewritten.
+memory and do not clutter the operator display or routine audit storage. The
+matching legacy-compatible JSON is written under each node's
+`inference/debugstr/YYYY-MM-DD.txt`. Normal RAWDATA is written only to the
+node's `inference/rawdata/YYYY-MM-DD.txt`. On startup, existing feature-only
+lines are removed from the current display and today's text archive.
+
+`SLIMHUB_AUDIT_JSONL=minimal` is the default and writes only malformed/security
+or processing errors under `programdata/reports/`. Use `full` only for a short
+diagnostic session; normal RAW/REPORT duplication is intentionally disabled.
 
 During the schema 2 migration, JSON `EVENT` and `INFERENCE` records share the
 same framed NUS `REPORT` transport as typed CSV records. The display uses the
@@ -56,7 +60,7 @@ JSON activity timeline, while `(frame MAC,bid,aid)` dedupe keeps the richer
 typed ADL detail canonical. Adaptive JSON truth is labeled `(adaptive)` and is
 not calibrated as legacy heap truth. A JSON/frame MAC mismatch is a security
 warning; the frame MAC remains authoritative. Invalid JSON EVENT values remain
-in forensic JSONL but never enter the movement timeline or estimator.
+in minimal audit JSONL but never enter the movement timeline or estimator.
 Compact typed ADL aliases (`cov/m/dur/rst/seq`) are normalized, and a repeated
 numeric `src` metric cannot overwrite the leading `src=ADL` routing field.
 
@@ -67,7 +71,7 @@ history. These records have kind `derived_inference` and
 
 ```bash
 tail -F programdata/display.txt
-tail -F programdata/reports/$(date +%F).jsonl
+tail -F data/*/*/*/inference/debugstr/$(date +%F).txt
 ```
 
 The daily, legacy-compatible display archive is
@@ -75,18 +79,19 @@ The daily, legacy-compatible display archive is
 
 ## 4. Configure the database cron job
 
-Provide database credentials to the cron environment through a protected
-wrapper or service environment file. Do not put secrets in the repository or
-directly in the crontab. Required local variables are
+Copy `docs/db.env.example` to `/home/rtlab/.config/slimhub-v2/db.env`, fill it,
+and set mode 600. Do not put secrets in the repository or directly in the
+crontab. Required local variables are
 `SLIMHUB_LOCAL_DB_HOST`, `SLIMHUB_LOCAL_DB_USER`, and
 `SLIMHUB_LOCAL_DB_NAME`; `SLIMHUB_LOCAL_DB_PASS` is supported. Configure the
 corresponding `SLIMHUB_REMOTE_DB_*` variables when remote upload is required.
 `house_mac` defaults to the Hub address in `programdata/config.json`; set
 `SLIMHUB_HOUSE_MAC` only when the deployment uses a separate house identifier.
 
-Copy the entries in [`slimhub-v2.crontab`](slimhub-v2.crontab) into `crontab -e`.
-They mirror the deployed SLIMHUB cadence: local ingest every three minutes and
-remote upload every ten minutes. A shared `flock` serializes coincident runs.
+Copy the two short entries in [`slimhub-v2.crontab`](slimhub-v2.crontab) into
+`crontab -e`. They call `scripts/db_ingest.sh` every three minutes and
+`scripts/db_upload.sh` every ten minutes. The shell wrappers load the protected
+environment and serialize coincident runs.
 Change the first expression to `*/5` when five-minute local ingest is desired.
 
 ```bash
@@ -104,9 +109,9 @@ means the local MySQL transaction completed and the source offset was written.
 slimhub-v2 db status
 ```
 
-The command reports the safe database configuration state, source JSONL
+The command reports the safe database configuration state, source data-file
 offsets, local upload offsets, and the last ingest/upload results. It never
-prints passwords. By default the first run starts with today's JSONL, matching
+prints passwords. By default the first run starts with today's data files, matching
 the legacy cron. Set `SLIMHUB_DB_BACKFILL=1` only for an intentional historical
 import.
 
@@ -125,5 +130,5 @@ operator account.
 - `display.txt` shows only expected IN/OUT and inference state records.
 - `db status` has successful recent ingest/upload runs and advancing offsets.
 - Remote table rows have been independently checked.
-- Preserve `programdata/reports/*.jsonl`, `programdata/db_sync/last_ingest.json`,
+- Preserve `data/`, `programdata/db_sync/last_ingest.json`,
   `programdata/db_sync/last_upload.json`, and the DB cron logs as release evidence.

@@ -196,9 +196,9 @@ class CliAppTests(unittest.TestCase):
 
     def test_db_update_runs_locally_without_daemon_socket(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("slimhub.cli.app.ReportDatabaseUpdater") as updater_type:
+            with patch("slimhub.cli.app.DataDirectoryDatabaseUpdater") as updater_type:
                 updater_type.return_value.update.return_value = {
-                    "ingest": {"records": 0},
+                    "ingest": {"lines": 0},
                     "upload": {"skipped": True},
                 }
                 with patch("sys.stdout", new_callable=io.StringIO) as stdout:
@@ -206,11 +206,11 @@ class CliAppTests(unittest.TestCase):
 
             self.assertEqual(status, 0)
             updater_type.return_value.update.assert_called_once_with(upload=False)
-            self.assertIn('"records": 0', stdout.getvalue())
+            self.assertIn('"lines": 0', stdout.getvalue())
 
     def test_db_status_runs_locally_without_daemon_socket(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("slimhub.cli.app.ReportDatabaseUpdater") as updater_type:
+            with patch("slimhub.cli.app.DataDirectoryDatabaseUpdater") as updater_type:
                 updater_type.return_value.status.return_value = {"last_update": None}
                 with patch("sys.stdout", new_callable=io.StringIO) as stdout:
                     status = run_cli(["--base-dir", tmpdir, "db", "status"])

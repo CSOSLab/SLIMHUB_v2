@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -47,10 +48,26 @@ USD_STATUS_FIELDS = (
     "ok",
 )
 
+AUDIT_MODES = {"off", "minimal", "full"}
+MINIMAL_AUDIT_KINDS = {
+    "command_failed",
+    "legacy_event_invalid",
+    "legacy_inference_invalid",
+    "legacy_json_invalid",
+    "multimodal_error",
+}
+
 
 class RawDataLogger:
-    def __init__(self, paths: AppPaths) -> None:
+    def __init__(self, paths: AppPaths, *, audit_mode: str | None = None) -> None:
         self.paths = paths
+        self.audit_mode = (
+            audit_mode or os.environ.get("SLIMHUB_AUDIT_JSONL", "minimal")
+        ).strip().lower()
+        if self.audit_mode not in AUDIT_MODES:
+            raise ValueError(
+                "SLIMHUB_AUDIT_JSONL must be one of: off, minimal, full"
+            )
         self._queue: asyncio.Queue[
             RawDataEvent
             | AlertEvent
@@ -128,29 +145,30 @@ class RawDataLogger:
             if needs_header:
                 writer.writeheader()
             writer.writerow(self._row_for(event))
-        await self.write_structured(
-            StructuredEvent(
-                timestamp=event.receipt_timestamp or event.timestamp,
-                kind="raw",
-                mac=event.mac,
-                data={
-                    "ble_address": event.source_address,
-                    "location": event.location or DEFAULT_LOCATION,
-                    "device_type": event.device_type or DEFAULT_DEVICE_TYPE,
-                    "session_id": event.session_id,
-                    "packet_type": "RAWDATA",
-                    "raw_payload_hex": event.payload.hex(),
-                    "parsed": {
-                        "flag_human_presence": event.packet.flag_human_presence,
-                        "detected": event.packet.detected,
-                        "flag_env": event.packet.flag_env,
-                        "flag_sound": event.packet.flag_sound,
+        if self.audit_mode == "full":
+            await self.write_structured(
+                StructuredEvent(
+                    timestamp=event.receipt_timestamp or event.timestamp,
+                    kind="raw",
+                    mac=event.mac,
+                    data={
+                        "ble_address": event.source_address,
+                        "location": event.location or DEFAULT_LOCATION,
+                        "device_type": event.device_type or DEFAULT_DEVICE_TYPE,
+                        "session_id": event.session_id,
+                        "packet_type": "RAWDATA",
+                        "raw_payload_hex": event.payload.hex(),
+                        "parsed": {
+                            "flag_human_presence": event.packet.flag_human_presence,
+                            "detected": event.packet.detected,
+                            "flag_env": event.packet.flag_env,
+                            "flag_sound": event.packet.flag_sound,
+                        },
+                        "sound_schema_version": event.sound_schema_version,
+                        "sound_class_count": event.sound_class_count,
                     },
-                    "sound_schema_version": event.sound_schema_version,
-                    "sound_class_count": event.sound_class_count,
-                },
+                )
             )
-        )
 
     async def write_alert(self, event: AlertEvent) -> None:
         path = self._alert_path_for(event)
@@ -159,6 +177,12 @@ class RawDataLogger:
             f.write(self._alert_line_for(event) + "\n")
 
     async def write_report(self, event: ReportEvent) -> None:
+        if self.audit_mode == "off":
+            return
+        if self.audit_mode == "minimal" and not (
+            event.packet.parse_error or event.identity_warning
+        ):
+            return
         path = self._structured_path_for(event.timestamp)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
@@ -172,6 +196,8 @@ class RawDataLogger:
             )
 
     async def write_connection_state(self, event: ConnectionStateEvent) -> None:
+        if self.audit_mode != "full":
+            return
         path = self._structured_path_for(event.timestamp)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
@@ -185,6 +211,10 @@ class RawDataLogger:
             )
 
     async def write_structured(self, event: StructuredEvent) -> None:
+        if self.audit_mode == "off":
+            return
+        if self.audit_mode == "minimal" and event.kind not in MINIMAL_AUDIT_KINDS:
+            return
         path = self._structured_path_for(event.timestamp)
         path.parent.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.fromtimestamp(event.timestamp)

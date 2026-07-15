@@ -12,7 +12,7 @@ from pathlib import Path
 
 from slimhub.cli.client import send_request_sync
 from slimhub.config import AppPaths, HubConfigStore
-from slimhub.integrations.database import ReportDatabaseUpdater
+from slimhub.integrations.database import DataDirectoryDatabaseUpdater
 from slimhub.protocol.nus import (
     DEFAULT_DEVICE_NAME,
     MAX_RECORD_SECONDS,
@@ -175,7 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     db_parser = subparsers.add_parser(
         "db",
-        help="Incrementally ingest REPORT JSONL into MySQL and optionally upload it.",
+        help="Incrementally ingest data/ files into MySQL and optionally upload them.",
     )
     db_subparsers = db_parser.add_subparsers(dest="db_command", required=True)
     db_update = db_subparsers.add_parser("update", help="Ingest locally, then upload to remote MySQL.")
@@ -416,7 +416,7 @@ def _send(paths: AppPaths, args: argparse.Namespace) -> object:
 
 
 def _run_database(paths: AppPaths, args: argparse.Namespace) -> dict[str, object]:
-    updater = ReportDatabaseUpdater(paths)
+    updater = DataDirectoryDatabaseUpdater(paths)
     if args.db_command == "update":
         return updater.update(upload=not args.no_upload)
     if args.db_command == "ingest":

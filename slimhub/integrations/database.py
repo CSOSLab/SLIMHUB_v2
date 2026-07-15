@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from slimhub.config import AppPaths, HubConfigStore
+from slimhub.integrations.data_ingest import DataDirectoryReader
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -27,12 +28,13 @@ class MySQLSettings:
     database: str
 
 
-class ReportDatabaseUpdater:
-    """Cron-friendly JSONL → local MySQL → remote MySQL incremental pipeline.
+class DataDirectoryDatabaseUpdater:
+    """Cron-friendly data/ → local MySQL → remote MySQL pipeline.
 
-    It deliberately consumes v2's structured JSONL rather than the legacy CSV
-    files. Credentials are read only from environment variables; no database
-    secret is kept in the repository or cron template.
+    Collection and DB synchronization are deliberately separate: the daemon
+    writes legacy-compatible rawdata CSV and debugstr JSONL files, while this
+    class incrementally consumes those files. Credentials are read only from
+    environment variables.
     """
 
     def __init__(self, paths: AppPaths, environ: dict[str, str] | None = None) -> None:
@@ -110,11 +112,14 @@ class ReportDatabaseUpdater:
         return result
 
     def _ingest(self) -> dict[str, object]:
-        records, new_offsets = self._read_new_records()
-        adl_rows, inout_rows = self.rows_from_records(
-            records,
-            house_mac=self.house_mac,
+        reader = DataDirectoryReader(
+            self.paths,
+            offsets=self._read_json(self.paths.db_ingest_offset_path),
+            environ=self.environ,
         )
+        batch = reader.read(house_mac=self.house_mac)
+        adl_rows = batch.adl_rows
+        inout_rows = batch.inout_rows
         if adl_rows or inout_rows:
             local = self._settings("LOCAL", required=True)
             with self._connect(local) as connection:
@@ -134,9 +139,10 @@ class ReportDatabaseUpdater:
                             inout_rows,
                         )
                 connection.commit()
-        self._write_json_atomic(self.paths.db_ingest_offset_path, new_offsets)
+        self._write_json_atomic(self.paths.db_ingest_offset_path, batch.offsets)
         return {
-            "records": len(records),
+            "files": batch.files,
+            "lines": batch.lines,
             "adl_inserted": len(adl_rows),
             "inout_inserted": len(inout_rows),
         }
@@ -207,89 +213,6 @@ class ReportDatabaseUpdater:
                 result[stream.lower()] = {"uploaded": len(rows), "last_id": rows[-1][0]}
         self._write_json_atomic(self.paths.db_upload_offset_path, offsets)
         return result
-
-    @staticmethod
-    def rows_from_records(
-        records: list[dict[str, object]],
-        *,
-        house_mac: str,
-    ) -> tuple[list[tuple[object, ...]], list[tuple[object, ...]]]:
-        adl_rows: list[tuple[object, ...]] = []
-        inout_rows: list[tuple[object, ...]] = []
-        for record in records:
-            kind = str(record.get("kind") or "")
-            mac = str(record.get("mac") or "")
-            location = str(record.get("location") or "undefined")
-            created_time = _created_time(record)
-            if not mac or created_time is None:
-                continue
-            display_location = f"{location}:{mac}"
-            if kind == "raw":
-                parsed = record.get("parsed")
-                if not isinstance(parsed, dict) or _as_int(parsed.get("flag_human_presence"), 0) != 1:
-                    continue
-                inout_rows.append(
-                    (
-                        house_mac,
-                        display_location,
-                        created_time,
-                        _as_int(parsed.get("detected"), 0),
-                    )
-                )
-            elif kind == "adl_result" and _as_bool(record.get("final")):
-                adl_rows.append(
-                    (
-                        house_mac,
-                        mac,
-                        created_time,
-                        str(record.get("sequence") or ""),
-                        str(record.get("adl") or record.get("event") or "NO_MATCH"),
-                        _truth_value(record.get("truth")),
-                    )
-                )
-        return adl_rows, inout_rows
-
-    def _read_new_records(self) -> tuple[list[dict[str, object]], dict[str, int]]:
-        offsets = {key: _as_int(value, 0) for key, value in self._read_json(self.paths.db_ingest_offset_path).items()}
-        records: list[dict[str, object]] = []
-        updated = dict(offsets)
-        today = datetime.now().strftime("%Y-%m-%d")
-        backfill = _as_bool(self.environ.get("SLIMHUB_DB_BACKFILL"))
-        for path in sorted((self.paths.programdata_dir / "reports").glob("*.jsonl")):
-            key = str(path.resolve())
-            offset = offsets.get(key, 0)
-            try:
-                size = path.stat().st_size
-            except FileNotFoundError:
-                continue
-            if key not in offsets and not backfill and path.stem != today:
-                # The deployed v1 cron only discovered today's files. Preserve
-                # that first-run behavior unless an explicit backfill is requested.
-                updated[key] = size
-                continue
-            if offset > size:
-                offset = 0
-            end_offset = offset
-            with path.open("rb") as source:
-                source.seek(offset)
-                while True:
-                    line_start = source.tell()
-                    raw_line = source.readline()
-                    if not raw_line:
-                        break
-                    if not raw_line.endswith(b"\n"):
-                        # The daemon may still be appending this JSONL line.
-                        source.seek(line_start)
-                        break
-                    end_offset = source.tell()
-                    try:
-                        decoded = json.loads(raw_line.decode("utf-8"))
-                    except (UnicodeDecodeError, json.JSONDecodeError):
-                        continue
-                    if isinstance(decoded, dict):
-                        records.append(decoded)
-            updated[key] = end_offset
-        return records, updated
 
     def _settings(self, name: str, *, required: bool) -> MySQLSettings | None:
         prefix = f"SLIMHUB_{name}_DB_"
@@ -418,30 +341,9 @@ def _as_int(value: object, default: int | None = None) -> int:
         return default
 
 
-def _as_bool(value: object) -> bool:
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(value)
-
-
-def _truth_value(value: object) -> float | None:
-    try:
-        truth = float(str(value))
-    except (TypeError, ValueError):
-        return None
-    return truth / 100 if truth > 1 else truth
-
-
-def _created_time(record: dict[str, object]) -> str | None:
-    raw_time = record.get("receipt_ts")
-    if raw_time is None:
-        raw_time = record.get("timestamp")
-    try:
-        return datetime.fromtimestamp(float(raw_time)).strftime("%Y-%m-%d %H:%M:%S")
-    except (TypeError, ValueError, OSError):
-        value = record.get("time")
-        return str(value).replace("T", " ").split(".")[0] if value else None
-
-
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+# Compatibility for callers that imported the earlier JSONL-oriented name.
+ReportDatabaseUpdater = DataDirectoryDatabaseUpdater

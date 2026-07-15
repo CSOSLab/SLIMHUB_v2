@@ -83,28 +83,27 @@ Rawdata 로그는
 `data/<location>/<type>/<MAC>/inference/rawdata/YYYY-MM-DD.txt`에 누적됩니다.
 Alert/debug 텍스트는
 `data/<location>/<type>/<MAC>/inference/debugstr/YYYY-MM-DD.txt`에 누적됩니다.
-모든 `RAWDATA`, `REPORT`, command lifecycle과 BLE 연결/해제 event는
-`programdata/reports/YYYY-MM-DD.jsonl`에 JSONL로 누적됩니다. 각 record에는
-frame MAC, BLE source address, packet receive time, `src`, `event`,
-parsed fields, connected state가 포함됩니다. `USD STATUS`의 `batt_mv`,
-`batt_v`, `batt_pct`, `batt_rem_mah`, `usb`, `chg`, `sd`, `file`, `uptime`,
-`ok`는 top-level field로도 저장됩니다.
+uSD 중복 쓰기를 피하기 위해 정상 `RAWDATA`, 주기 `REPORT`, ENV/SOUND와 내부
+상태 record는 `programdata/reports/`에 다시 복제하지 않습니다. 기본
+`SLIMHUB_AUDIT_JSONL=minimal` 정책은 malformed JSON, identity validation 실패,
+command 실패 같은 오류 record만 JSONL로 보존합니다. 일시적인 상세 진단이 필요할
+때만 `SLIMHUB_AUDIT_JSONL=full`을 지정합니다. 기존 reports 파일은 자동 삭제하지
+않습니다.
 Runtime 로그는 `programdata/logging.log`에 기록됩니다.
 `logging.log`는 연결/해제, command 전송, warning/error 중심으로 작게
 유지합니다. 주기 `REPORT` payload와 BLE notify/debug dump는 이 파일에
-쓰지 않으며, report 분석은 `programdata/reports/*.jsonl`을 사용합니다.
+쓰지 않습니다.
 일시적인 BLE 연결 실패는 traceback 없이 한 번의 warning으로 요약하고,
 `logging.log`는 5 MiB 단위로 최대 5개 backup까지 순환합니다. typed multimodal
 record에는 해당 event만 저장하며 누적 session 전체를 반복 복사하지 않습니다.
 
 운영자용 display는 daemon이 확정한 IN/OUT(D0/D1)과 inference 상태 전이만
 `programdata/display.txt`에 append합니다. 개별 ENV/SOUND, candidate, command
-ACK, timeout, baseline은 원본 JSONL에는 보존하지만 display에는 표시하지 않습니다.
+ACK, timeout, baseline은 display와 기본 audit JSONL에 표시하지 않습니다.
 동일한 IN/OUT 및 inference 원문 JSON은 node별
 `inference/debugstr/YYYY-MM-DD.txt`에 저장되며, 날짜별 평문 archive는
 `data/display/YYYY-MM-DD.txt`에도 같은 내용으로 남습니다. daemon 시작 시 기존
-`programdata/display.txt`와 당일 archive의 ENV/SOUND 줄도 제거하며 원본 JSONL은
-변경하지 않습니다.
+`programdata/display.txt`와 당일 archive의 ENV/SOUND 줄도 제거합니다.
 
 현재 배포된 Node v2처럼 `src=ADL` final report를 보내지 않는 image에서는 과거
 debugstr에서 확인된 보수적인 location/event signature만 `derived_inference`로
@@ -114,11 +113,12 @@ debugstr에서 확인된 보수적인 location/event signature만 `derived_infer
 
 ## DB 증분 적재와 cron
 
-기존 SLIMHUB의 CSV/debugstr 파일 파싱 대신, v2는 append-only
-`programdata/reports/*.jsonl`을 byte offset 기준으로 증분 처리합니다. RAWDATA 중
-`flag_human_presence=1`은 로컬 MySQL `in_out`에, final ADL 결과는 `event_adl`에
-적재합니다. 이어서 local table의 `id` offset을 기준으로 동일 schema의 원격
-table에 전송합니다.
+기존 SLIMHUB와 같이 별도 DB 프로그램이 `data/`를 직접 읽습니다.
+`rawdata/YYYY-MM-DD.txt`의 `GridEye=1` 행은 로컬 MySQL `in_out`에,
+`debugstr/YYYY-MM-DD.txt`의 final inference(`POP`, `COMPLETE`, `PARTIAL`,
+`NO_MATCH`)는 `event_adl`에 적재합니다. 파일별 byte offset은
+`programdata/db_sync/data_offsets.json`에 저장합니다. 이어서 local table의 `id`
+offset을 기준으로 동일 schema의 원격 table에 전송합니다.
 
 `house_mac`은 기본적으로 `programdata/config.json`의 Hub `address`를 사용하며,
 배포 식별자를 별도로 써야 하면 `SLIMHUB_HOUSE_MAC`으로 재정의합니다. `in_out`의
@@ -129,6 +129,8 @@ table에 전송합니다.
 DB 자격 증명은 저장소나 crontab에 넣지 말고 실행 환경에서 주입합니다.
 백업 SLIMHUB에서 사용하던 `ADL_DB_*`, `LOCAL_DB_*`, `REMOTE_DB_*` 이름도
 fallback으로 인식하지만, 새 배포에는 아래 `SLIMHUB_*` 이름을 권장합니다.
+환경 파일 template은 [`docs/db.env.example`](docs/db.env.example)이며 기본 wrapper는
+`/home/rtlab/.config/slimhub-v2/db.env`를 읽습니다.
 
 ```bash
 export SLIMHUB_LOCAL_DB_HOST=localhost
@@ -158,7 +160,7 @@ slimhub-v2 db status
 offset은 `programdata/db_sync/`에 보관됩니다. cron 예시는
 [`docs/slimhub-v2.crontab`](docs/slimhub-v2.crontab)에 있으며, 실제 설치 전에는
 해당 환경변수가 cron에서도 안전하게 제공되는지 확인해야 합니다.
-기본 ingest는 백업 SLIMHUB처럼 오늘 파일부터 시작합니다. 과거 JSONL까지 의도적으로
+기본 ingest는 백업 SLIMHUB처럼 오늘 data 파일부터 시작합니다. 과거 파일까지 의도적으로
 적재할 때만 `SLIMHUB_DB_BACKFILL=1`을 사용합니다. cron은 local ingest를 3분마다,
 remote upload를 10분마다 독립 실행합니다.
 전체 설치·display 확인·cron 반영·local/remote DB 검증·release 절차는
@@ -213,10 +215,9 @@ src=INOUT,event=STATE,occupied=1,boot_id=12ab34cd,event_ts_ms=124100
 src=USD,event=STATUS,uptime=12345,file=LOG/001.CSV,ok=1,batt_valid=1,batt_v=3.980,batt_mv=3980,batt_pct=75,batt_rem_mah=1125,batt_cap_mah=1500,usb=0,chg=1,sd=0
 ```
 
-모든 RAW/REPORT/command/ACK/candidate record는 `programdata/reports/*.jsonl`에
-append-only로 저장합니다. 이 record에는 frame MAC, BLE alias, boot/sequence
-ID, 원본 payload hex, Central receipt time, node uptime 보정 offset/오차,
-BLE session 및 estimator before/after state가 포함됩니다. 서로 다른 node의
+frame MAC, BLE alias, boot/sequence ID와 node uptime은 메모리 상태에서 처리하고,
+확정 IN/OUT과 inference만 `data/`에 저장합니다. full audit를 명시적으로 켠 경우에만
+RAW/REPORT/command record를 `programdata/reports/*.jsonl`에 저장합니다. 서로 다른 node의
 `event_ts_ms`는 직접 비교하지 않고 `(MAC, boot_id)`별 clock offset으로
 정규화합니다.
 
@@ -242,8 +243,8 @@ Outbound unitspace command는 NUS RX로 `COMMAND` frame을 보내는 방식입�
 ## Multimodal EVENT / ADL reports
 
 `src=EVENT`의 `BASELINE`, `ENV`, `SOUND`와 `src=ADL`의 `PREDETECT`, `POP`,
-`COMPLETE`, `PARTIAL`, `NO_MATCH`는 `programdata/reports/*.jsonl`에 typed
-record로 추가 저장됩니다. 이 stream은 IN/OUT estimator에 절대 재입력하지
+`COMPLETE`, `PARTIAL`, `NO_MATCH`는 메모리에서 typed record로 처리됩니다.
+확정 inference만 `data/.../debugstr`에 기록되며 이 stream은 IN/OUT estimator에 절대 재입력하지
 않습니다. `analysis_seq`는 `(MAC, boot_id, analysis_seq)` replay dedupe key이며
 gap은 허용됩니다. EVENT history는 wrap-aware `event_ts_ms`, 동일 시각에서는
 `analysis_seq`로 정렬합니다.
@@ -272,7 +273,7 @@ MAC이 다르면 security warning을 기록하고 frame MAC을 authoritative nod
 
 Schema 2 JSON `EVENT`(`ENTER=10`, `EXIT=20`)는 legacy UI timeline에만 기록하고
 movement estimator에는 다시 입력하지 않습니다. 값 또는 identity가 유효하지 않은
-record는 원문 JSONL에는 남지만 movement timeline에서는 제외합니다. JSON
+record는 minimal audit JSONL에는 남지만 movement timeline에서는 제외합니다. JSON
 `INFERENCE`의 `PRE-DETECT`, `POP`, `COMPLETE`, `PARTIAL`, `NO_MATCH`는
 `(frame MAC,bid,aid)`로 activity upsert됩니다. 같은 key의 typed `src=ADL`
 record가 도착하면 score/coverage/margin/reset을 가진 typed detail을 canonical로
@@ -287,7 +288,7 @@ D1 terminal 결과와 별도 activity로 유지합니다.
 JSON schema 2의 `truth`는 adaptive matcher의 0–1 score ratio이고 display에
 `(adaptive)`로 표시합니다. 기존 heap truth는 `(legacy)`로 구분합니다. unknown
 JSON key, future schema, 31자를 넘은 sequence와 malformed JSON도 parser를
-중단시키지 않고 원문과 validation error를 forensic JSONL에 보존합니다.
+중단시키지 않고 원문과 validation error를 minimal audit JSONL에 보존합니다.
 
 ## Sound schema
 

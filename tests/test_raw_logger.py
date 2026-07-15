@@ -125,7 +125,7 @@ class RawLoggerTests(unittest.IsolatedAsyncioTestCase):
     async def test_report_logger_writes_structured_jsonl_with_connection_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = AppPaths.from_base(tmpdir)
-            logger = RawDataLogger(paths)
+            logger = RawDataLogger(paths, audit_mode="full")
             report = ReportPacket(
                 message="src=INOUT,event=ENTER,signal=enter,code=10",
                 fields={
@@ -173,7 +173,7 @@ class RawLoggerTests(unittest.IsolatedAsyncioTestCase):
     async def test_usd_status_report_promotes_battery_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = AppPaths.from_base(tmpdir)
-            logger = RawDataLogger(paths)
+            logger = RawDataLogger(paths, audit_mode="full")
             report = ReportPacket(
                 message=(
                     "src=USD,event=STATUS,uptime=12345,file=LOG/001.CSV,ok=1,"
@@ -222,6 +222,47 @@ class RawLoggerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row["file"], "LOG/001.CSV")
             self.assertEqual(row["uptime"], "12345")
             self.assertEqual(row["ok"], "1")
+
+    async def test_minimal_audit_does_not_duplicate_routine_raw_or_report_data(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = AppPaths.from_base(tmpdir)
+            logger = RawDataLogger(paths, audit_mode="minimal")
+            packet = RawDataPacket(
+                flag_human_presence=1,
+                detected=10,
+                flag_env=0,
+                temperature_c=0.0,
+                humidity=0,
+                iaq=0,
+                eco2=0,
+                bvoc=0,
+                accuracy=0,
+                flag_sound=0,
+                sound=[0] * 16,
+                is_pir_human_detection_event=False,
+            )
+            await logger.write_event(
+                RawDataEvent(
+                    timestamp=0.0,
+                    mac="AA:BB:CC:DD:EE:FF",
+                    location="ENTRY",
+                    packet=packet,
+                    payload=b"raw",
+                )
+            )
+            await logger.write_report(
+                ReportEvent(
+                    timestamp=0.0,
+                    mac="AA:BB:CC:DD:EE:FF",
+                    source_address="AA:BB:CC:DD:EE:FF",
+                    location="ENTRY",
+                    packet=ReportPacket("src=USD,event=STATUS", {"src": "USD"}),
+                    payload=b"report",
+                )
+            )
+
+            self.assertTrue(next(paths.data_dir.glob("*/*/*/inference/rawdata/*.txt")))
+            self.assertFalse((paths.programdata_dir / "reports").exists())
 
 
 if __name__ == "__main__":

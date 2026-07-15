@@ -76,7 +76,7 @@ class AppPaths:
 
     @property
     def db_ingest_offset_path(self) -> Path:
-        return self.db_sync_dir / "report_offsets.json"
+        return self.db_sync_dir / "data_offsets.json"
 
     @property
     def db_upload_offset_path(self) -> Path:

@@ -354,7 +354,7 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(session.commands, [])
 
-    async def test_usd_status_report_is_logged_and_available_as_battery_status(self) -> None:
+    async def test_usd_status_is_available_without_routine_audit_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             address = "AA:BB:CC:DD:EE:01"
             daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
@@ -364,18 +364,7 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
 
             await daemon.handle_frame(address, usd_report_frame(address))
 
-            report_files = list((Path(tmpdir) / "programdata" / "reports").glob("*.jsonl"))
-            self.assertEqual(len(report_files), 1)
-            rows = [
-                json.loads(line)
-                for line in report_files[0].read_text(encoding="utf-8").splitlines()
-            ]
-            self.assertEqual(rows[0]["src"], "USD")
-            self.assertEqual(rows[0]["event"], "STATUS")
-            self.assertEqual(rows[0]["batt_mv"], "3980")
-            self.assertEqual(rows[0]["batt_v"], "3.980")
-            self.assertEqual(rows[0]["batt_pct"], "75")
-            self.assertEqual(rows[0]["file"], "LOG/001.CSV")
+            self.assertFalse((Path(tmpdir) / "programdata" / "reports").exists())
 
             response = await daemon.dispatch(
                 {"command": "battery.status", "args": {"address": address}}
@@ -492,11 +481,7 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             response = await daemon.dispatch({"command": "multimodal.status", "args": {}})
             session_state = response["data"]["sessions"][f"{address}/boot-a/7"]
             self.assertEqual(session_state["records"][0]["canonical_name"], "humidity")
-            report_file = next((Path(tmpdir) / "programdata" / "reports").glob("*.jsonl"))
-            rows = [json.loads(line) for line in report_file.read_text(encoding="utf-8").splitlines()]
-            self.assertIn("feature", [row["kind"] for row in rows])
-            feature = next(row for row in rows if row["kind"] == "feature")
-            self.assertNotIn("multimodal_state", feature)
+            self.assertFalse((Path(tmpdir) / "programdata" / "reports").exists())
 
 
 if __name__ == "__main__":
