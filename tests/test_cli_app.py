@@ -186,9 +186,39 @@ class CliAppTests(unittest.TestCase):
         help_text = parser.format_help()
 
         self.assertIn("slimhub-v2 <command> --help", help_text)
+        self.assertIn("Typical deployment workflow", help_text)
+        self.assertIn("Database commands run directly", help_text)
+        self.assertIn("slimhub-v2 db ingest", help_text)
         self.assertIn("--legacy-help", help_text)
         self.assertNotIn("-r, --run", help_text)
         self.assertNotIn("--scan-timeout", help_text)
+
+    def test_nested_help_explains_sound_and_database_behavior(self) -> None:
+        parser = build_parser()
+        choices = parser._subparsers._group_actions[0].choices
+
+        sound_help = choices["sound"].format_help()
+        db_help = choices["db"].format_help()
+        update_help = choices["db"]._subparsers._group_actions[0].choices[
+            "update"
+        ].format_help()
+
+        self.assertIn("16 kHz mono PCM", sound_help)
+        self.assertIn("ARMED", sound_help)
+        self.assertIn("Remote upload is currently disabled", db_help)
+        self.assertIn("Prefer 'db ingest'", update_help)
+        self.assertNotIn("--no-upload", update_help)
+
+    def test_duplicate_db_no_upload_option_remains_compatible_but_hidden(self) -> None:
+        args = build_parser().parse_args(["db", "update", "--no-upload"])
+
+        self.assertTrue(args.no_upload)
+
+    def test_config_apply_has_structured_modern_command(self) -> None:
+        status, call_args = self.run_command_cli(["config", "apply"])
+
+        self.assertEqual(status, 0)
+        self.assertEqual(call_args.args[1], "config.apply")
 
     def test_legacy_help_explains_hidden_compatibility_options(self) -> None:
         with patch("sys.stdout", new_callable=io.StringIO) as stdout:

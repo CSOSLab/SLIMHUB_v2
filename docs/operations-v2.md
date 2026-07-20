@@ -102,7 +102,9 @@ and set mode 600. Do not put secrets in the repository or directly in the
 crontab. Required local variables are
 `SLIMHUB_LOCAL_DB_HOST`, `SLIMHUB_LOCAL_DB_USER`, and
 `SLIMHUB_LOCAL_DB_NAME`; `SLIMHUB_LOCAL_DB_PASS` is supported. Configure the
-corresponding `SLIMHUB_REMOTE_DB_*` variables when remote upload is required.
+corresponding `SLIMHUB_REMOTE_DB_*` variables only after remote upload is
+re-enabled in source. The current local-only branch deliberately returns
+`skipped` without opening a remote connection.
 `house_mac` defaults to the Hub address in `programdata/config.json`; set
 `SLIMHUB_HOUSE_MAC` only when the deployment uses a separate house identifier.
 
@@ -133,9 +135,11 @@ prints passwords. By default the first run starts with today's data files, match
 the legacy cron. Set `SLIMHUB_DB_BACKFILL=1` only for an intentional historical
 import.
 
-## 6. Confirm remote upload
+## 6. Confirm remote upload (after re-enabling it)
 
-For an enabled remote database, `last_upload.result.adl` and
+The current local-only build records a skipped upload and does not connect to the
+remote database. After the guarded remote upload implementation is re-enabled,
+`last_upload.result.adl` and
 `last_upload.result.inout` show `uploaded` row counts and the local `last_id`.
 Each stream offset advances immediately after its own remote transaction
 commits, so a later stream failure does not resend committed rows. Verify the
@@ -146,7 +150,8 @@ operator account.
 
 - Node is connected and its location configuration is correct.
 - `display.txt` shows only expected IN/OUT and inference state records.
-- `db status` has successful recent ingest/upload runs and advancing offsets.
-- Remote table rows have been independently checked.
+- `db status` has a successful recent ingest; upload is either explicitly
+  `skipped` in local-only mode or successful after re-enablement.
+- Remote table rows have been independently checked when remote upload is enabled.
 - Preserve `data/`, `programdata/db_sync/last_ingest.json`,
   `programdata/db_sync/last_upload.json`, and the DB cron logs as release evidence.

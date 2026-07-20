@@ -29,21 +29,61 @@ from slimhub.protocol.nus import (
 )
 
 
+class _HelpFormatter(
+    argparse.ArgumentDefaultsHelpFormatter,
+    argparse.RawDescriptionHelpFormatter,
+):
+    """Keep examples readable while showing meaningful option defaults."""
+
+    def _get_help_string(self, action: argparse.Action) -> str:
+        help_text = action.help or ""
+        if (
+            action.option_strings
+            and action.default not in (None, False, argparse.SUPPRESS)
+            and "%(default)" not in help_text
+        ):
+            help_text += " (default: %(default)s)"
+        return help_text
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="slimhub-v2",
-        description="SLIMHUB v2 daemon, device, and database operations.",
+        description=(
+            "Operate the SLIMHUB v2 BLE collector, connected DEAN Node v2 devices,\n"
+            "captured data, and the separate database synchronization pipeline.\n\n"
+            "The daemon must be running for device, command, sound, and status commands.\n"
+            "Database commands run directly and do not require the daemon socket."
+        ),
         epilog=(
-            "Common workflow:\n"
+            "Typical deployment workflow:\n"
             "  slimhub-v2 run --background\n"
             "  slimhub-v2 devices\n"
+            "  slimhub-v2 config set AA:BB:CC:DD:EE:FF location TOILET\n"
+            "  slimhub-v2 sound status --address AA:BB:CC:DD:EE:FF\n"
+            "  slimhub-v2 db ingest\n"
             "  slimhub-v2 db status\n\n"
-            "Use 'slimhub-v2 <command> --help' for command-specific options."
+            "Help navigation:\n"
+            "  slimhub-v2 <command> --help\n"
+            "  slimhub-v2 <command> <action> --help\n"
+            "  slimhub-v2 --legacy-help\n\n"
+            "Global options such as --base-dir and --debug must appear before the command."
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_HelpFormatter,
     )
-    parser.add_argument("--base-dir", help="Runtime base directory. Default: current directory.")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
+    parser.add_argument(
+        "--base-dir",
+        metavar="PATH",
+        help=(
+            "Runtime root containing data/, programdata/, logs/, and the daemon socket. "
+            "Default: SLIMHUB_HOME or the current directory."
+        ),
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable SLIMHUB debug logs; noisy BLE/DBus dependency logs remain filtered.",
+    )
     parser.add_argument(
         "--legacy-help",
         action="store_true",
@@ -99,145 +139,418 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser(
         "run",
-        help="Start the BLE daemon.",
-        description="Start the SLIMHUB v2 BLE daemon.",
+        help="Start the BLE collection daemon (foreground or background).",
+        description=(
+            "Start the long-running BLE daemon. It scans for DEAN Node v2 devices,\n"
+            "parses NUS frames, writes data/display files, and serves the local CLI socket."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  slimhub-v2 run\n"
+            "  slimhub-v2 run --background\n"
+            "  slimhub-v2 run --address AA:BB:CC:DD:EE:FF --no-scan"
+        ),
+        formatter_class=_HelpFormatter,
     )
-    run_parser.add_argument("--background", action="store_true", help="Run daemon in the background.")
-    run_parser.add_argument("--address", help="Optional BLE address to connect immediately.")
-    run_parser.add_argument("--name", default=DEFAULT_DEVICE_NAME, help="BLE device name to scan.")
-    run_parser.add_argument("--no-scan", action="store_true", help="Disable BLE scan loop.")
-    run_parser.add_argument("--scan-timeout", type=float, default=5.0, help="BLE scan duration in seconds.")
-    run_parser.add_argument("--scan-interval", type=float, default=10.0, help="Delay between BLE scans in seconds.")
-    run_parser.add_argument("--reconnect-delay", type=float, default=3.0)
-    run_parser.add_argument("--connect-timeout", type=float, default=10.0, help="BLE connect timeout in seconds.")
-    run_parser.add_argument("--notify-timeout", type=float, default=5.0, help="NUS notify subscription timeout in seconds.")
+    run_parser.add_argument(
+        "--background",
+        action="store_true",
+        help="Detach the daemon and write launcher output to logs/slimhub-v2.out.",
+    )
+    run_parser.add_argument(
+        "--address",
+        metavar="MAC",
+        help="Connect this BLE address immediately in addition to normal scanning.",
+    )
+    run_parser.add_argument(
+        "--name",
+        default=DEFAULT_DEVICE_NAME,
+        metavar="NAME",
+        help="Advertised BLE device name accepted by the scanner.",
+    )
+    run_parser.add_argument(
+        "--no-scan",
+        action="store_true",
+        help="Disable periodic scanning; normally combine with --address.",
+    )
+    run_parser.add_argument(
+        "--scan-timeout",
+        type=float,
+        default=5.0,
+        metavar="SECONDS",
+        help="Duration of each BLE scan window.",
+    )
+    run_parser.add_argument(
+        "--scan-interval",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="Delay before starting the next BLE scan.",
+    )
+    run_parser.add_argument(
+        "--reconnect-delay",
+        type=float,
+        default=3.0,
+        metavar="SECONDS",
+        help="Delay before retrying a disconnected BLE session.",
+    )
+    run_parser.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="Maximum time allowed for one BLE connection attempt.",
+    )
+    run_parser.add_argument(
+        "--notify-timeout",
+        type=float,
+        default=5.0,
+        metavar="SECONDS",
+        help="Maximum time allowed to subscribe to NUS notifications.",
+    )
 
-    subparsers.add_parser("stop", help="Stop the running daemon.")
-    subparsers.add_parser("devices", help="List known devices.")
+    subparsers.add_parser(
+        "stop",
+        help="Ask the daemon to shut down cleanly.",
+        description="Stop the daemon through its local Unix socket after pending cleanup.",
+    )
+    subparsers.add_parser(
+        "devices",
+        help="List configured and currently connected devices.",
+        description=(
+            "Show device MAC, type, configured name/location, connection state,\n"
+            "and aliases known by the running daemon."
+        ),
+        formatter_class=_HelpFormatter,
+    )
 
-    connect_parser = subparsers.add_parser("connect", help="Connect to a BLE address.")
-    connect_parser.add_argument("--address", required=True)
+    connect_parser = subparsers.add_parser(
+        "connect",
+        help="Add a BLE address to the running daemon.",
+        description=(
+            "Create or resume a daemon-managed BLE session for one address.\n"
+            "This does not start the daemon; use 'run' first."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    connect_parser.add_argument("--address", required=True, metavar="MAC", help="Node BLE MAC address.")
 
-    command_parser = subparsers.add_parser("command", help="Manual NUS commands.")
+    command_parser = subparsers.add_parser(
+        "command",
+        help="Send low-level NUS control commands.",
+        description=(
+            "Send manual COMMAND frames through the daemon's serialized BLE writer.\n"
+            "Use 'send' for IN/OUT feedback. 'record' and 'record-stop' are legacy,\n"
+            "unlabeled recording commands; use the 'sound' group for new PCM datasets."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  slimhub-v2 command send --address AA:BB:CC:DD:EE:FF --command enter\n"
+            "  slimhub-v2 command record --address AA:BB:CC:DD:EE:FF --seconds 30"
+        ),
+        formatter_class=_HelpFormatter,
+    )
     command_subparsers = command_parser.add_subparsers(
         dest="command_action",
         required=True,
     )
-    command_send = command_subparsers.add_parser("send", help="Send a NUS COMMAND.")
-    command_send.add_argument("--address", required=True)
+    command_send = command_subparsers.add_parser(
+        "send",
+        help="Send an enter/exit feedback command.",
+        description="Queue a manual IN/OUT feedback COMMAND for one connected Node.",
+        formatter_class=_HelpFormatter,
+    )
+    command_send.add_argument("--address", required=True, metavar="MAC", help="Target Node MAC address.")
     command_send.add_argument(
         "--command",
         dest="nus_command",
         choices=VALID_COMMANDS,
         required=True,
+        help="Feedback state to send to the Node.",
     )
     command_record = command_subparsers.add_parser(
         "record",
-        help="Start DEAN Node sound recording.",
+        help="Start legacy unlabeled Node recording (compatibility).",
+        description=(
+            "Send legacy record or record:<seconds>. This does not use the labeled\n"
+            "AUDIO/WAV capture workflow; prefer 'slimhub-v2 sound start'."
+        ),
+        formatter_class=_HelpFormatter,
     )
-    command_record.add_argument("--address", required=True)
-    command_record.add_argument("--seconds", type=_record_seconds)
+    command_record.add_argument("--address", required=True, metavar="MAC", help="Target Node MAC address.")
+    command_record.add_argument(
+        "--seconds",
+        type=_record_seconds,
+        metavar="1..300",
+        help="Optional legacy recording duration; omit for plain 'record'.",
+    )
     command_record_stop = command_subparsers.add_parser(
         "record-stop",
-        help="Stop DEAN Node sound recording.",
+        help="Stop legacy unlabeled Node recording (compatibility).",
+        description="Send the legacy record_stop payload.",
     )
-    command_record_stop.add_argument("--address", required=True)
+    command_record_stop.add_argument("--address", required=True, metavar="MAC", help="Target Node MAC address.")
 
     sound_parser = subparsers.add_parser(
         "sound",
         help="Capture labeled PCM audio for sound domain adaptation.",
+        description=(
+            "Control explicit, labeled 16 kHz mono PCM capture. BLE audio is stored as\n"
+            "data/sound/<NODE_MAC>/<label>/<cid>.wav with a JSON completeness manifest.\n"
+            "Only captures started through this group are written to the local audio store."
+        ),
+        epilog=(
+            "Capture states: ARMED waits for the RMS trigger; ACTIVE receives PCM;\n"
+            "DONE/INCOMPLETE is finalized in the JSON manifest.\n\n"
+            "Examples:\n"
+            "  slimhub-v2 sound start --address AA:BB:CC:DD:EE:FF --label pee\n"
+            "  slimhub-v2 sound background --address AA:BB:CC:DD:EE:FF --dest ble\n"
+            "  slimhub-v2 sound status --address AA:BB:CC:DD:EE:FF\n"
+            "  slimhub-v2 sound stop --address AA:BB:CC:DD:EE:FF"
+        ),
+        formatter_class=_HelpFormatter,
     )
     sound_subparsers = sound_parser.add_subparsers(
         dest="sound_action",
         required=True,
     )
-    sound_start = sound_subparsers.add_parser("start", help="Arm a labeled capture.")
-    sound_start.add_argument("--address", required=True)
-    sound_start.add_argument("--label", required=True, type=_sound_label)
-    sound_start.add_argument("--dest", choices=SOUND_DESTINATIONS, default="both")
+    sound_start = sound_subparsers.add_parser(
+        "start",
+        help="Arm a validated, labeled capture.",
+        description=(
+            "Arm a capture and wait for block RMS to reach the threshold. Setting\n"
+            "--threshold-rms 0 starts without a gate and forces silence seconds to 0."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    sound_start.add_argument("--address", required=True, metavar="MAC", help="Target Node MAC address.")
+    sound_start.add_argument(
+        "--label",
+        required=True,
+        type=_sound_label,
+        metavar="LABEL",
+        help="Dataset label: 1-24 letters, digits, '_' or '-'.",
+    )
+    sound_start.add_argument(
+        "--dest",
+        choices=SOUND_DESTINATIONS,
+        default="both",
+        help="Storage destination: Node SD, Central BLE/WAV, or both.",
+    )
     sound_start.add_argument(
         "--threshold-rms",
         type=_bounded_integer("threshold RMS", 0, 32767),
         default=800,
+        metavar="0..32767",
+        help="Raw PCM16 block RMS gate; 0 disables gating.",
     )
     sound_start.add_argument(
         "--max-seconds",
         type=_bounded_integer("max seconds", 1, 1800),
         default=60,
+        metavar="1..1800",
+        help="Maximum duration after capture becomes ACTIVE.",
     )
     sound_start.add_argument(
         "--silence-seconds",
         type=_bounded_integer("silence seconds", 0, 60),
         default=5,
+        metavar="0..60",
+        help="Continuous below-threshold time that ends an ACTIVE capture; 0 disables it.",
     )
 
     sound_background = sound_subparsers.add_parser(
         "background",
         help="Capture the fixed background label without an RMS gate.",
+        description=(
+            "Capture label=background with threshold=0 and silence=0. The label cannot\n"
+            "be overridden, preventing accidental background dataset fragmentation."
+        ),
+        formatter_class=_HelpFormatter,
     )
-    sound_background.add_argument("--address", required=True)
+    sound_background.add_argument("--address", required=True, metavar="MAC", help="Target Node MAC address.")
     sound_background.add_argument(
         "--dest",
         choices=SOUND_DESTINATIONS,
         default="both",
+        help="Storage destination: Node SD, Central BLE/WAV, or both.",
     )
     sound_background.add_argument(
         "--max-seconds",
         type=_bounded_integer("max seconds", 1, 1800),
         default=300,
+        metavar="1..1800",
+        help="Maximum background capture duration.",
     )
 
     sound_stop = sound_subparsers.add_parser("stop", help="Stop or cancel capture.")
-    sound_stop.add_argument("--address", required=True)
+    sound_stop.add_argument("--address", required=True, metavar="MAC", help="Target Node MAC address.")
     sound_status = sound_subparsers.add_parser("status", help="Request and show capture state.")
-    sound_status.add_argument("--address", required=True)
+    sound_status.add_argument("--address", required=True, metavar="MAC", help="Target Node MAC address.")
 
-    config_parser = subparsers.add_parser("config", help="Manage local device config.")
+    config_parser = subparsers.add_parser(
+        "config",
+        help="Set or apply local device metadata.",
+        description=(
+            "Manage the MAC-to-name/location/type configuration stored under programdata.\n"
+            "'set' writes one field; 'apply' refreshes active daemon sessions."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  slimhub-v2 config set AA:BB:CC:DD:EE:FF location TOILET\n"
+            "  slimhub-v2 config apply"
+        ),
+        formatter_class=_HelpFormatter,
+    )
     config_subparsers = config_parser.add_subparsers(dest="config_command", required=True)
-    config_set = config_subparsers.add_parser("set", help="Set device config field.")
-    config_set.add_argument("address")
-    config_set.add_argument("field", choices=("type", "name", "location"))
-    config_set.add_argument("value")
+    config_set = config_subparsers.add_parser(
+        "set",
+        help="Set one device configuration field.",
+        formatter_class=_HelpFormatter,
+    )
+    config_set.add_argument("address", metavar="MAC", help="Configured Node MAC address.")
+    config_set.add_argument(
+        "field",
+        choices=("type", "name", "location"),
+        help="Field to update.",
+    )
+    config_set.add_argument("value", help="New field value, for example TOILET.")
+    config_subparsers.add_parser(
+        "apply",
+        help="Refresh active sessions from saved device configuration.",
+        description="Apply saved names and metadata to sessions in the running daemon.",
+    )
 
-    raw_parser = subparsers.add_parser("raw", help="Rawdata commands.")
+    raw_parser = subparsers.add_parser(
+        "raw",
+        help="Inspect recently collected legacy-compatible rawdata.",
+        description=(
+            "Read collected data files through the daemon. This is a read-only operator\n"
+            "view and does not alter database ingest offsets."
+        ),
+        formatter_class=_HelpFormatter,
+    )
     raw_subparsers = raw_parser.add_subparsers(dest="raw_command", required=True)
-    raw_tail = raw_subparsers.add_parser("tail", help="Show recent rawdata lines.")
-    raw_tail.add_argument("--address")
-    raw_tail.add_argument("--lines", type=int, default=20)
+    raw_tail = raw_subparsers.add_parser(
+        "tail",
+        help="Show the latest rawdata lines.",
+        formatter_class=_HelpFormatter,
+    )
+    raw_tail.add_argument(
+        "--address",
+        metavar="MAC",
+        help="Restrict output to one Node; omit to use all configured devices.",
+    )
+    raw_tail.add_argument(
+        "--lines",
+        type=int,
+        default=20,
+        metavar="COUNT",
+        help="Maximum number of recent lines to return.",
+    )
 
-    unitspace_parser = subparsers.add_parser("unitspace", help="Unitspace commands.")
+    unitspace_parser = subparsers.add_parser(
+        "unitspace",
+        help="Inspect the cross-room IN/OUT estimator.",
+        description="Show the daemon's current movement-estimator state and evidence.",
+    )
     unitspace_subparsers = unitspace_parser.add_subparsers(
         dest="unitspace_command",
         required=True,
     )
     unitspace_subparsers.add_parser("status", help="Show unitspace estimator status.")
 
-    power_parser = subparsers.add_parser("power", help="Shadow power-state commands.")
+    power_parser = subparsers.add_parser(
+        "power",
+        help="Inspect Central's shadow power-state decisions.",
+        description=(
+            "Show derived presence/power state. This does not directly read or switch\n"
+            "Node hardware power."
+        ),
+        formatter_class=_HelpFormatter,
+    )
     power_subparsers = power_parser.add_subparsers(
         dest="power_command",
         required=True,
     )
     power_status = power_subparsers.add_parser("status", help="Show shadow power-state status.")
-    power_status.add_argument("--address")
+    power_status.add_argument("--address", metavar="MAC", help="Restrict output to one Node.")
 
-    battery_parser = subparsers.add_parser("battery", help="Battery and uSD status commands.")
+    battery_parser = subparsers.add_parser(
+        "battery",
+        help="Inspect the latest Node battery and uSD REPORT.",
+        description=(
+            "Show cached USD STATUS fields such as battery, USB/charging, SD mount,\n"
+            "active file, and uptime. It does not poll hardware directly."
+        ),
+        formatter_class=_HelpFormatter,
+    )
     battery_subparsers = battery_parser.add_subparsers(
         dest="battery_command",
         required=True,
     )
     battery_status = battery_subparsers.add_parser("status", help="Show latest USD STATUS report.")
-    battery_status.add_argument("--address")
+    battery_status.add_argument("--address", metavar="MAC", help="Restrict output to one Node.")
 
     db_parser = subparsers.add_parser(
         "db",
-        help="Incrementally ingest data/ files into MySQL and optionally upload them.",
+        help="Run or inspect the cron-friendly database synchronization pipeline.",
+        description=(
+            "Read confirmed EVENT/INFERENCE records from data/**/inference/debugstr,\n"
+            "insert them incrementally into local MySQL, and maintain offsets under\n"
+            "programdata/db_sync. These commands run without the BLE daemon.\n\n"
+            "Remote upload is currently disabled in source for local-only testing."
+        ),
+        epilog=(
+            "Recommended commands:\n"
+            "  slimhub-v2 db ingest    # data/ -> local MySQL\n"
+            "  slimhub-v2 db status    # inspect config, offsets, and last runs\n"
+            "  slimhub-v2 db upload    # currently reports skipped\n\n"
+            "'db update' is a compatibility shortcut that runs ingest then upload."
+        ),
+        formatter_class=_HelpFormatter,
     )
     db_subparsers = db_parser.add_subparsers(dest="db_command", required=True)
-    db_update = db_subparsers.add_parser("update", help="Ingest locally, then upload to remote MySQL.")
-    db_update.add_argument("--no-upload", action="store_true", help="Only ingest into local MySQL.")
-    db_subparsers.add_parser("ingest", help="Only ingest into local MySQL.")
-    db_subparsers.add_parser("upload", help="Only upload previously ingested local rows.")
-    db_subparsers.add_parser("status", help="Show cron, local ingest, and remote upload evidence.")
+    db_update = db_subparsers.add_parser(
+        "update",
+        help="Compatibility shortcut: run ingest, then the upload stage.",
+        description=(
+            "Run local ingest followed by upload. The upload stage currently returns\n"
+            "skipped because remote DB writes are disabled. Prefer 'db ingest' for\n"
+            "local-only operation."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    # Compatibility only: this is exactly equivalent to `db ingest`, so keep
+    # old cron/scripts parseable without advertising a duplicate workflow.
+    db_update.add_argument("--no-upload", action="store_true", help=argparse.SUPPRESS)
+    db_subparsers.add_parser(
+        "ingest",
+        help="Incrementally insert new debugstr records into local MySQL.",
+        description=(
+            "Canonical local-only DB command. Source offsets advance only after the\n"
+            "corresponding local transaction commits."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    db_subparsers.add_parser(
+        "upload",
+        help="Run the remote-upload stage (currently disabled/skipped).",
+        description=(
+            "Attempt the local-to-remote stage. In this branch it performs no remote\n"
+            "connection or INSERT and records a skipped result."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    db_subparsers.add_parser(
+        "status",
+        help="Show DB configuration, offsets, cron evidence, and last results.",
+        description=(
+            "Print safe operational evidence without passwords. This command does not\n"
+            "connect to MySQL or change any offset."
+        ),
+        formatter_class=_HelpFormatter,
+    )
 
     return parser
 
@@ -341,7 +654,9 @@ Modern equivalents include:
   slimhub-v2 stop
   slimhub-v2 devices
   slimhub-v2 config set ADDRESS {type,name,location} VALUE
-  slimhub-v2 command send --address ADDRESS --command {enter,exit,record,record_stop}
+  slimhub-v2 config apply
+  slimhub-v2 command send --address ADDRESS --command {enter,exit}
+  slimhub-v2 sound start --address ADDRESS --label LABEL
 
 Run 'slimhub-v2 <command> --help' to see modern command options."""
 
@@ -490,6 +805,8 @@ def _send(paths: AppPaths, args: argparse.Namespace) -> object:
             "config.set",
             {"address": args.address, "field": args.field, "value": args.value},
         )
+    if args.subcommand == "config" and args.config_command == "apply":
+        return send_request_sync(paths, "config.apply")
     if args.subcommand == "raw" and args.raw_command == "tail":
         return send_request_sync(
             paths,

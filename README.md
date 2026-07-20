@@ -178,19 +178,23 @@ export SLIMHUB_LOCAL_DB_NAME=adl_event
 # 필요할 때만 Hub address 대신 배포용 house identifier를 지정합니다.
 export SLIMHUB_HOUSE_MAC='...'
 
-# 원격 upload를 사용할 때만 설정합니다.
+# 소스에서 원격 upload를 다시 활성화할 때만 설정합니다.
 export SLIMHUB_REMOTE_DB_HOST='...'
 export SLIMHUB_REMOTE_DB_PORT=3306
 export SLIMHUB_REMOTE_DB_USER='...'
 export SLIMHUB_REMOTE_DB_PASS='...'
 export SLIMHUB_REMOTE_DB_NAME=adl_raw
 
-slimhub-v2 db update            # local ingest + configured remote upload
-slimhub-v2 db update --no-upload
-slimhub-v2 db ingest
-slimhub-v2 db upload
-slimhub-v2 db status
+slimhub-v2 db ingest            # 권장: data/ -> local MySQL
+slimhub-v2 db status            # 설정/offset/최근 실행 결과 확인
+slimhub-v2 db upload            # 현재 local-only 테스트로 skipped
+slimhub-v2 db update            # 호환용: ingest 후 upload stage 실행
 ```
+
+기존 `db update --no-upload`은 스크립트 호환을 위해 계속 인식하지만 `db ingest`와
+동일하므로 일반 CLI 도움말에서는 숨깁니다. 현재 branch의 remote DB 전송 코드는
+명시적으로 비활성화되어 `db upload`과 `db update`의 upload stage가 `skipped`를
+반환합니다.
 
 테이블 이름은 필요하면 `SLIMHUB_DB_ADL_TABLE`(기본 `event_adl`)과
 `SLIMHUB_DB_INOUT_TABLE`(기본 `in_out`)로 바꿀 수 있습니다. ingest/upload
@@ -199,7 +203,8 @@ offset은 `programdata/db_sync/`에 보관됩니다. cron 예시는
 해당 환경변수가 cron에서도 안전하게 제공되는지 확인해야 합니다.
 기본 ingest는 백업 SLIMHUB처럼 오늘 data 파일부터 시작합니다. 과거 파일까지 의도적으로
 적재할 때만 `SLIMHUB_DB_BACKFILL=1`을 사용합니다. cron은 local ingest를 3분마다,
-remote upload를 10분마다 독립 실행합니다.
+remote upload stage를 10분마다 독립 실행합니다. 현재 local-only 테스트 기간에는
+이 stage가 remote에 연결하지 않고 `skipped` 상태만 기록합니다.
 전체 설치·display 확인·cron 반영·local/remote DB 검증·release 절차는
 [`docs/operations-v2.md`](docs/operations-v2.md)에 정리돼 있습니다.
 
