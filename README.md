@@ -60,6 +60,7 @@ slimhub-v2 raw tail --address AA:BB:CC:DD:EE:FF --lines 20
 slimhub-v2 unitspace status
 slimhub-v2 power status --address AA:BB:CC:DD:EE:FF
 slimhub-v2 battery status --address AA:BB:CC:DD:EE:FF
+slimhub-v2 sound status --address AA:BB:CC:DD:EE:FF
 slimhub-v2 --quit
 ```
 
@@ -96,6 +97,41 @@ Runtime 로그는 `programdata/logging.log`에 기록됩니다.
 일시적인 BLE 연결 실패는 traceback 없이 한 번의 warning으로 요약하고,
 `logging.log`는 5 MiB 단위로 최대 5개 backup까지 순환합니다. typed multimodal
 record에는 해당 event만 저장하며 누적 session 전체를 반복 복사하지 않습니다.
+
+## Sound domain-adaptation capture
+
+명시적인 운영자 명령이 있을 때만 Node의 PCM AUDIO를 저장합니다. label은 1–24자의
+영문/숫자/`_`/`-`만 허용하며 path traversal 문자열은 거부합니다.
+
+```bash
+slimhub-v2 sound start --address AA:BB:CC:DD:EE:FF \
+  --label pee --dest both --threshold-rms 1200 --max-seconds 90 \
+  --silence-seconds 5
+
+slimhub-v2 sound background --address AA:BB:CC:DD:EE:FF \
+  --dest ble --max-seconds 600
+
+slimhub-v2 sound status --address AA:BB:CC:DD:EE:FF
+slimhub-v2 sound stop --address AA:BB:CC:DD:EE:FF
+```
+
+`sound start`는 threshold를 넘기 전 `ARMED`, 실제 PCM이 시작되면 `ACTIVE`입니다.
+`--threshold-rms 0`은 gate를 해제하며 silence도 자동으로 0이 됩니다. background
+명령은 임의 label을 받지 않고 항상 `background`, threshold 0, silence 0을
+사용합니다. legacy `command record`와 `record-stop`도 계속 지원합니다.
+
+BLE PCM은 16 kHz, mono, PCM16 WAV와 JSON sidecar로 저장됩니다.
+
+```text
+data/sound/<NODE_MAC>/<label>/<cid>.wav
+data/sound/<NODE_MAC>/<label>/<cid>.json
+```
+
+sidecar에는 명령 파라미터, ARMED/START/DONE 원문 REPORT, 수신 sample/block 수,
+missing range, firmware 정보, queue/ble drop, 종료 원인과 `complete`가 들어갑니다.
+sequence 또는 sample-offset gap, drop, disconnect, timeout이 있으면 WAV는 복구
+가능하게 닫되 `complete=false`로 표시합니다. 원본 WAV는 dataset export 시에도
+수정하지 않습니다.
 
 운영자용 display는 daemon이 확정한 IN/OUT(D0/D1)과 inference 상태 전이만
 `programdata/display.txt`에 append합니다. 개별 ENV/SOUND, candidate, command
@@ -185,12 +221,15 @@ Inbound packet type은 다음과 같습니다.
 - `RAWDATA`: 33-byte little-endian payload
 - `ALERT`: UTF-8 text payload
 - `REPORT`: UTF-8 comma-separated key/value 또는 NCS-compatible JSON payload
+- `AUDIO`: v1 binary header와 512-sample signed PCM16LE block
 
 BLE notification 경계는 NUS frame 경계가 아닙니다. Central은 connection별
 byte accumulator에서 16-byte header의 little-endian payload length와 뒤따르는
 CRLF를 모두 확인한 뒤에만 frame을 파싱합니다. 잘못된 length, packet type,
-CRLF는 bounded resynchronization으로 폐기하므로 MTU 23/247의 header/payload/
-CRLF 분할과 연결된 frame stream도 처리합니다.
+CRLF는 bounded resynchronization으로 폐기하므로 MTU 23/247/517의 header/payload/
+CRLF 분할과 연결된 frame stream도 처리합니다. 연결 직후 가능한 최대 MTU를
+요청하지만 작은 ATT notification에서도 같은 accumulator가 AUDIO frame 전체를
+복원합니다.
 
 ### DEAN_Node_v2 PIR+RADAR IN/OUT
 

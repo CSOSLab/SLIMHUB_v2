@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
 import json
 import struct
 import unittest
+from pathlib import Path
 
 from slimhub.protocol.nus import (
+    AudioPacket,
     END_FLAG,
     FrameAssembler,
     PacketParseError,
@@ -13,6 +16,8 @@ from slimhub.protocol.nus import (
     build_command_frame,
     build_frame,
     build_record_command,
+    build_sound_background_command,
+    build_sound_start_command,
     parse_frame,
 )
 
@@ -22,6 +27,34 @@ class ProtocolTests(unittest.TestCase):
         frame = build_command_frame("AA:BB:CC:DD:EE:FF", command)
         payload_len = int.from_bytes(frame[14:16], byteorder="little")
         return frame[16 : 16 + payload_len]
+
+    @staticmethod
+    def audio_payload(
+        *,
+        capture_id: int = 0x00AB12CD,
+        block_sequence: int = 0,
+        sample_offset: int = 0,
+        sample_count: int = 512,
+    ) -> bytes:
+        pcm = struct.pack(
+            f"<{sample_count}h",
+            *[((index % 200) - 100) for index in range(sample_count)],
+        )
+        return (
+            struct.pack(
+                "<BBBBIIIHH",
+                1,
+                1 if block_sequence == 0 else 0,
+                1,
+                1,
+                capture_id,
+                block_sequence,
+                sample_offset,
+                sample_count,
+                len(pcm),
+            )
+            + pcm
+        )
 
     def test_assembler_handles_split_frames(self) -> None:
         frame = build_frame("AA:BB:CC:DD:EE:FF", "ALERT", b"hello")
@@ -95,6 +128,28 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(csv_packet.format, "csv")
         self.assertEqual(csv_packet.fields["src"], "EVENT")
 
+    def test_recorded_notifications_restore_audio_report_and_rawdata_in_order(self) -> None:
+        fixture_path = (
+            Path(__file__).parent / "fixtures" / "sound_audio_notifications.json"
+        )
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        assembler = FrameAssembler()
+        frame_bytes = []
+        for encoded in fixture["notification_chunks_base64"]:
+            frame_bytes.extend(assembler.push(base64.b64decode(encoded)))
+
+        frames = [parse_frame(data) for data in frame_bytes]
+
+        self.assertEqual(
+            [frame.packet_type for frame in frames],
+            ["AUDIO", "REPORT", "RAWDATA"],
+        )
+        self.assertIsInstance(frames[0].parsed, AudioPacket)
+        self.assertEqual(frames[0].parsed.capture_id, 0x00AB12CD)
+        self.assertEqual(frames[0].parsed.sample_count, 512)
+        self.assertEqual(frames[1].parsed.fields["event"], "CAPTURE_DONE")
+        self.assertIsInstance(frames[2].parsed, RawDataPacket)
+
     def test_assembler_discards_bad_crlf_and_resynchronizes_to_next_frame(self) -> None:
         valid = build_frame("AA:BB:CC:DD:EE:FF", "ALERT", b"ready")
         malformed = valid[:-2] + b"\x00\x00"
@@ -156,6 +211,33 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(frame.parsed.fields["src"], "SOUND")
         self.assertEqual(frame.parsed.fields["event"], "RECORD_START")
         self.assertEqual(frame.parsed.fields["path"], "SOUND/001.wav")
+
+    def test_audio_v1_frame_decodes_pcm16le_header(self) -> None:
+        frame = parse_frame(
+            build_frame(
+                "AA:BB:CC:DD:EE:FF",
+                "AUDIO",
+                self.audio_payload(),
+            )
+        )
+
+        self.assertIsInstance(frame.parsed, AudioPacket)
+        self.assertTrue(frame.parsed.first_block)
+        self.assertEqual(frame.parsed.block_sequence, 0)
+        self.assertEqual(frame.parsed.sample_offset, 0)
+        self.assertEqual(frame.parsed.data_bytes, 1024)
+        self.assertEqual(len(frame.parsed.pcm), 1024)
+
+    def test_audio_v1_rejects_invalid_header_and_data_length(self) -> None:
+        invalid_version = bytearray(self.audio_payload())
+        invalid_version[0] = 2
+        invalid_data_bytes = bytearray(self.audio_payload())
+        invalid_data_bytes[18:20] = (1000).to_bytes(2, "little")
+
+        for payload in (bytes(invalid_version), bytes(invalid_data_bytes)):
+            with self.subTest(payload=payload[:20].hex()):
+                with self.assertRaises(PacketParseError):
+                    parse_frame(build_frame("AA:BB:CC:DD:EE:FF", "AUDIO", payload))
 
     def test_csv_report_keeps_first_routing_source_and_preserves_duplicate_metric(self) -> None:
         payload = b"src=ADL,event=POP,schema=2,src=3,score=98"
@@ -228,6 +310,49 @@ class ProtocolTests(unittest.TestCase):
 
     def test_record_stop_command_frame_builds_stop_payload(self) -> None:
         self.assertEqual(self.command_payload("record_stop"), b"record_stop")
+
+    def test_sound_start_command_frame_builds_exact_payload(self) -> None:
+        command = build_sound_start_command(
+            "pee",
+            destination="both",
+            threshold_rms=1200,
+            max_seconds=90,
+            silence_seconds=5,
+        )
+
+        self.assertEqual(
+            self.command_payload(command),
+            b"sound_start,label=pee,dest=both,thr=1200,max=90,silence=5",
+        )
+
+    def test_background_command_is_fixed_ungated_background_preset(self) -> None:
+        command = build_sound_background_command(
+            destination="ble",
+            max_seconds=600,
+        )
+
+        self.assertEqual(command, "sound_bg,dest=ble,max=600")
+        self.assertNotIn("label=", command)
+        self.assertNotIn("thr=", command)
+
+    def test_sound_command_rejects_path_traversal_ranges_and_destination(self) -> None:
+        invalid_calls = (
+            lambda: build_sound_start_command("../pee"),
+            lambda: build_sound_start_command("x" * 25),
+            lambda: build_sound_start_command("pee", destination="cloud"),
+            lambda: build_sound_start_command("pee", threshold_rms=32768),
+            lambda: build_sound_start_command("pee", max_seconds=0),
+            lambda: build_sound_start_command("pee", silence_seconds=61),
+        )
+        for call in invalid_calls:
+            with self.subTest(call=call):
+                with self.assertRaises(ValueError):
+                    call()
+
+        self.assertIn(
+            "silence=0",
+            build_sound_start_command("pee", threshold_rms=0, silence_seconds=5),
+        )
 
     def test_record_seconds_rejects_invalid_values(self) -> None:
         for command in ("record:0", "record:301", "record:abc"):

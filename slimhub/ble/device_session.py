@@ -16,6 +16,7 @@ from slimhub.protocol.nus import (
     FrameAssembler,
     PacketParseError,
     ParsedFrame,
+    VALID_COMMANDS,
     build_command_frame,
     normalize_mac,
     parse_frame,
@@ -64,7 +65,11 @@ class DeviceSession:
         self._target_updated_event.set()
         self._command_queue: asyncio.Queue[str] = asyncio.Queue()
         self._pending_commands: dict[str, CommandEvent] = {}
+        self._command_sequence = 0
         self._command_lock = asyncio.Lock()
+        self._frame_handler_lock = asyncio.Lock()
+        self._inflight_frame_tasks: set[asyncio.Task[None]] = set()
+        self._peak_inflight_frames = 0
         self._client: BleakClient | None = None
         self._task: asyncio.Task[None] | None = None
 
@@ -90,8 +95,16 @@ class DeviceSession:
     async def send_command(self, command: CommandEvent) -> None:
         # A disconnected node must converge to its final desired state, not
         # replay every historical enter/exit command after reconnect.
-        key = normalize_mac(command.canonical_node_id or command.address)
+        address_key = normalize_mac(command.canonical_node_id or command.address)
         async with self._command_lock:
+            # enter/exit are desired-state commands and may coalesce. Capture
+            # start/stop/status commands are ordered operations and must each
+            # remain in the single serialized GATT writer queue.
+            if command.command in VALID_COMMANDS:
+                key = address_key
+            else:
+                self._command_sequence += 1
+                key = f"{address_key}:{self._command_sequence}"
             was_pending = key in self._pending_commands
             self._pending_commands[key] = command
             if not was_pending:
@@ -106,6 +119,8 @@ class DeviceSession:
             "last_error": self.last_error,
             "waiting_for_advertisement": self.waiting_for_advertisement,
             "queued_commands": len(self._pending_commands),
+            "inflight_frames": len(self._inflight_frame_tasks),
+            "peak_inflight_frames": self._peak_inflight_frames,
         }
 
     async def _run(self) -> None:
@@ -131,6 +146,7 @@ class DeviceSession:
                     self._client = client
                     self.connected = bool(client.is_connected)
                     self.waiting_for_advertisement = False
+                    await self._request_maximum_mtu(client)
 
                     assembler = FrameAssembler()
                     await asyncio.wait_for(
@@ -195,6 +211,11 @@ class DeviceSession:
                     with suppress(BleakError, RuntimeError, AttributeError):
                         if client.is_connected:
                             await client.disconnect()
+                if self._inflight_frame_tasks:
+                    await asyncio.gather(
+                        *list(self._inflight_frame_tasks),
+                        return_exceptions=True,
+                    )
                 self.connected = False
                 self._client = None
                 if reported_connected and self.on_connection_state is not None:
@@ -219,9 +240,56 @@ class DeviceSession:
                         len(frame_bytes),
                     )
                     continue
-                asyncio.create_task(self.on_frame(self.address, frame))
+                task = asyncio.create_task(self._dispatch_frame(frame))
+                self._inflight_frame_tasks.add(task)
+                self._peak_inflight_frames = max(
+                    self._peak_inflight_frames,
+                    len(self._inflight_frame_tasks),
+                )
+                if len(self._inflight_frame_tasks) == 64:
+                    self.logger.warning(
+                        "%s frame processing pressure inflight=%d",
+                        self.address,
+                        len(self._inflight_frame_tasks),
+                    )
+                task.add_done_callback(self._frame_task_done)
 
         return handle_notify
+
+    async def _dispatch_frame(self, frame: ParsedFrame) -> None:
+        # Preserve wire order across notification callbacks. AUDIO gap
+        # detection depends on REPORT/AUDIO and consecutive blocks reaching
+        # the daemon in the same order in which the assembler emitted them.
+        async with self._frame_handler_lock:
+            await self.on_frame(self.address, frame)
+
+    def _frame_task_done(self, task: asyncio.Task[None]) -> None:
+        self._inflight_frame_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self.logger.error("%s frame handler failed: %s", self.address, error)
+
+    async def _request_maximum_mtu(self, client: BleakClient) -> None:
+        try:
+            request_mtu = getattr(client, "request_mtu", None)
+            if callable(request_mtu):
+                await request_mtu(517)
+            else:
+                backend = getattr(client, "_backend", None)
+                acquire_mtu = getattr(backend, "_acquire_mtu", None)
+                if callable(acquire_mtu):
+                    await acquire_mtu()
+            self.logger.info(
+                "%s BLE MTU=%s",
+                self.address,
+                getattr(client, "mtu_size", "unknown"),
+            )
+        except Exception as exc:
+            # MTU negotiation is an optimization; NUS framing remains valid
+            # with smaller ATT notifications through the per-connection assembler.
+            self.logger.warning("%s BLE MTU negotiation failed: %s", self.address, exc)
 
     async def _command_worker(self, client: BleakClient) -> None:
         while not self._stop_event.is_set():

@@ -69,6 +69,108 @@ class CliAppTests(unittest.TestCase):
                         )
                 self.assertEqual(error.exception.code, 2)
 
+    def test_sound_start_sends_labeled_capture_payload(self) -> None:
+        status, call_args = self.run_command_cli(
+            [
+                "sound",
+                "start",
+                "--address",
+                ADDRESS,
+                "--label",
+                "pee",
+                "--dest",
+                "both",
+                "--threshold-rms",
+                "1200",
+                "--max-seconds",
+                "90",
+                "--silence-seconds",
+                "5",
+            ]
+        )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(call_args.args[1], "command.send")
+        self.assertEqual(
+            call_args.args[2],
+            {
+                "address": ADDRESS,
+                "command": (
+                    "sound_start,label=pee,dest=both,thr=1200,max=90,silence=5"
+                ),
+            },
+        )
+
+    def test_sound_background_uses_fixed_background_command(self) -> None:
+        status, call_args = self.run_command_cli(
+            [
+                "sound",
+                "background",
+                "--address",
+                ADDRESS,
+                "--dest",
+                "ble",
+                "--max-seconds",
+                "600",
+            ]
+        )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            call_args.args[2],
+            {"address": ADDRESS, "command": "sound_bg,dest=ble,max=600"},
+        )
+
+    def test_sound_stop_and_status_use_sound_api(self) -> None:
+        stop_status, stop_call = self.run_command_cli(
+            ["sound", "stop", "--address", ADDRESS]
+        )
+        status_status, status_call = self.run_command_cli(
+            ["sound", "status", "--address", ADDRESS]
+        )
+
+        self.assertEqual(stop_status, 0)
+        self.assertEqual(
+            stop_call.args[2],
+            {"address": ADDRESS, "command": "sound_stop"},
+        )
+        self.assertEqual(status_status, 0)
+        self.assertEqual(status_call.args[1], "sound.status")
+        self.assertEqual(
+            status_call.args[2],
+            {"address": ADDRESS, "command": "sound_status"},
+        )
+
+    def test_sound_cli_rejects_invalid_label_and_ranges(self) -> None:
+        parser = build_parser()
+        invalid_arguments = (
+            ["sound", "start", "--address", ADDRESS, "--label", "../pee"],
+            [
+                "sound",
+                "start",
+                "--address",
+                ADDRESS,
+                "--label",
+                "pee",
+                "--threshold-rms",
+                "32768",
+            ],
+            [
+                "sound",
+                "background",
+                "--address",
+                ADDRESS,
+                "--max-seconds",
+                "1801",
+            ],
+        )
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments):
+                with patch("sys.stderr", new_callable=io.StringIO):
+                    with self.assertRaises(SystemExit) as error:
+                        parser.parse_args(arguments)
+                self.assertEqual(error.exception.code, 2)
+
     def test_command_send_still_accepts_enter_and_exit(self) -> None:
         parser = build_parser()
 

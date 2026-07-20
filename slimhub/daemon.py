@@ -26,6 +26,7 @@ from slimhub.multimodal import DeploymentManifestStore, MultimodalReportStore
 from slimhub.protocol.nus import (
     DEFAULT_DEVICE_NAME,
     AlertPacket,
+    AudioPacket,
     ParsedFrame,
     RawDataPacket,
     ReportPacket,
@@ -34,6 +35,7 @@ from slimhub.protocol.nus import (
     validate_command_payload,
 )
 from slimhub.power_shadow import ShadowPowerState
+from slimhub.sound_capture import SoundCaptureStore
 from slimhub.unitspace.clock import EventReorderBuffer, NodeClockNormalizer
 from slimhub.unitspace.estimator import SimpleUnitspaceEstimator
 
@@ -95,6 +97,7 @@ class SlimHubDaemon:
         self._session_ids: dict[str, str] = {}
         self._session_generation: dict[str, int] = {}
         self._sound_schemas: dict[str, tuple[str | None, int | None]] = {}
+        self.sound_capture = SoundCaptureStore(paths, self.logger)
         self.adapter_lock = asyncio.Lock()
         self.central = BleCentral(
             registry=self.registry,
@@ -136,6 +139,12 @@ class SlimHubDaemon:
             await self.connect_address(address)
         if scan:
             tasks.append(asyncio.create_task(self._scan_loop(), name="ble-scan"))
+        tasks.append(
+            asyncio.create_task(
+                self._sound_capture_timeout_loop(),
+                name="sound-capture-timeouts",
+            )
+        )
 
         try:
             await self.stop_event.wait()
@@ -149,6 +158,7 @@ class SlimHubDaemon:
                 await asyncio.gather(self._report_reorder_task, return_exceptions=True)
                 self._report_reorder_task = None
             await self.registry.stop_all()
+            self.sound_capture.close_all()
             await self.raw_logger.stop()
             await self._stop_server()
 
@@ -166,7 +176,7 @@ class SlimHubDaemon:
             raise ValueError("address is required")
         if not isinstance(command, str):
             raise ValueError(
-                "command must be one of: enter, exit, record, record:<seconds>, record_stop"
+                "command must be a supported NUS COMMAND payload"
             )
 
         normalized_address = normalize_mac(address)
@@ -185,6 +195,11 @@ class SlimHubDaemon:
             raise ValueError(
                 f"no active device session for address: {normalized_address}"
             )
+        self.sound_capture.register_command(
+            normalized_address,
+            validated_command,
+            time.time(),
+        )
         if validated_command in VALID_COMMANDS:
             self.power_shadow.update_command_hint(
                 normalized_address,
@@ -254,7 +269,14 @@ class SlimHubDaemon:
 
     async def handle_frame(self, source_address: str, frame: ParsedFrame) -> None:
         await self.registry.register_alias(frame.mac, source_address)
-        if isinstance(frame.parsed, RawDataPacket):
+        if isinstance(frame.parsed, AudioPacket):
+            self.sound_capture.handle_audio(
+                frame.mac,
+                source_address,
+                frame.parsed,
+                time.time(),
+            )
+        elif isinstance(frame.parsed, RawDataPacket):
             config = self.config_store.load(frame.mac)
             self.config_store.save(config)
             timestamp = time.time()
@@ -382,6 +404,7 @@ class SlimHubDaemon:
             self.power_shadow.mark_connected(address, timestamp)
         else:
             self.power_shadow.mark_disconnected(address, timestamp)
+            self.sound_capture.handle_disconnect(address, timestamp)
         await self.raw_logger.log_connection_state(
             ConnectionStateEvent(
                 timestamp=timestamp,
@@ -504,6 +527,11 @@ class SlimHubDaemon:
                 event.timestamp,
                 bool(event.connected),
             )
+            self.sound_capture.remember_firmware_status(
+                event.mac,
+                event.source_address,
+                event.packet.fields,
+            )
         if src == "INOUT":
             self.multimodal.handle_inout(event)
             self.power_shadow.update_report(event.mac, event.packet, event.timestamp)
@@ -522,6 +550,8 @@ class SlimHubDaemon:
         if src == "SOUND" or (
             src == "EVENT" and event.packet.fields.get("event", "").upper() == "SOUND"
         ):
+            if src == "SOUND":
+                self.sound_capture.handle_report(event)
             self._remember_sound_schema(event.mac, event.packet)
 
     async def _log_multimodal_records(self) -> None:
@@ -612,10 +642,21 @@ class SlimHubDaemon:
         if src != "SOUND":
             return
 
-        if report.fields.get("err") or report.fields.get("dropped"):
+        if any(
+            report.fields.get(key)
+            for key in ("err", "dropped", "queue_drop", "ble_drop")
+        ):
             details = " ".join(
                 f"{key}={value}"
-                for key in ("event", "path", "dropped", "reason", "err")
+                for key in (
+                    "event",
+                    "path",
+                    "dropped",
+                    "queue_drop",
+                    "ble_drop",
+                    "reason",
+                    "err",
+                )
                 if (value := report.fields.get(key))
             )
             self.logger.warning("SOUND report mac=%s %s", frame.mac, details or report.message)
@@ -670,6 +711,20 @@ class SlimHubDaemon:
         if command == "command.send":
             return self._ok(
                 await self.send_command(args.get("address"), args.get("command"))
+            )
+        if command == "sound.status":
+            address = args.get("address")
+            request_result = await self.send_command(address, "sound_status")
+            return self._ok(
+                {
+                    "request": request_result,
+                    "capture": self.sound_capture.snapshot(str(address)),
+                }
+            )
+        if command == "sound.snapshot":
+            address = args.get("address")
+            return self._ok(
+                self.sound_capture.snapshot(str(address) if address else None)
             )
         if command == "config.set":
             config = self.config_store.set_field(
@@ -780,6 +835,13 @@ class SlimHubDaemon:
     async def _wait_or_stop(self, delay_seconds: float) -> None:
         with suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self.stop_event.wait(), timeout=delay_seconds)
+
+    async def _sound_capture_timeout_loop(self) -> None:
+        while not self.stop_event.is_set():
+            recovered = self.sound_capture.recover_timeouts()
+            if recovered:
+                self.logger.warning("Recovered %d timed-out SOUND capture(s)", recovered)
+            await self._wait_or_stop(1.0)
 
     def _ok(self, data: object) -> dict[str, object]:
         return {"ok": True, "data": data, "error": None}

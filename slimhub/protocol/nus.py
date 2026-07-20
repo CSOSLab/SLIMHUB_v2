@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import string
 import struct
 from dataclasses import dataclass
@@ -18,8 +19,18 @@ VALID_COMMANDS = (
 )
 RECORD_COMMAND = "record"
 RECORD_STOP_COMMAND = "record_stop"
+SOUND_STOP_COMMAND = "sound_stop"
+SOUND_STATUS_COMMAND = "sound_status"
 MIN_RECORD_SECONDS = 1
 MAX_RECORD_SECONDS = 300
+MIN_SOUND_LABEL_LEN = 1
+MAX_SOUND_LABEL_LEN = 24
+MAX_SOUND_THRESHOLD_RMS = 32767
+MIN_SOUND_SECONDS = 1
+MAX_SOUND_SECONDS = 1800
+MAX_SOUND_SILENCE_SECONDS = 60
+SOUND_DESTINATIONS = ("sd", "ble", "both")
+SOUND_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
 COMMAND_ALIASES = {
     "strong_enter": "enter",
     "weak_enter": "enter",
@@ -34,7 +45,10 @@ HEADER_LEN = MAC_LEN + PACKET_TYPE_LEN + PACKET_LEN_LEN
 END_FLAG_LEN = len(END_FLAG)
 RAWDATA_PAYLOAD_LEN = 33
 MAX_FRAME_LEN = 4096
-KNOWN_PACKET_TYPES = {"RAWDATA", "ALERT", "REPORT"}
+KNOWN_PACKET_TYPES = {"RAWDATA", "ALERT", "REPORT", "AUDIO"}
+AUDIO_V1_HEADER_LEN = 20
+AUDIO_V1_VERSION = 1
+AUDIO_PCM16LE_ENCODING = 1
 
 
 class PacketParseError(ValueError):
@@ -73,13 +87,31 @@ class ReportPacket:
 
 
 @dataclass(frozen=True)
+class AudioPacket:
+    version: int
+    flags: int
+    encoding: int
+    channels: int
+    capture_id: int
+    block_sequence: int
+    sample_offset: int
+    sample_count: int
+    data_bytes: int
+    pcm: bytes
+
+    @property
+    def first_block(self) -> bool:
+        return bool(self.flags & 0x01)
+
+
+@dataclass(frozen=True)
 class ParsedFrame:
     mac: str
     mac_bytes: bytes
     packet_type: str
     packet_length: int
     payload: bytes
-    parsed: RawDataPacket | AlertPacket | ReportPacket
+    parsed: RawDataPacket | AlertPacket | ReportPacket | AudioPacket
 
 
 class FrameAssembler:
@@ -202,6 +234,107 @@ def build_record_command(seconds: int | None = None) -> str:
     return f"{RECORD_COMMAND}:{validate_record_seconds(seconds)}"
 
 
+def validate_sound_label(label: str) -> str:
+    if not isinstance(label, str) or not SOUND_LABEL_PATTERN.fullmatch(label):
+        raise ValueError(
+            "sound label must be 1-24 characters using only A-Z, a-z, 0-9, _ or -"
+        )
+    return label
+
+
+def validate_sound_destination(destination: str) -> str:
+    if destination not in SOUND_DESTINATIONS:
+        raise ValueError("sound destination must be one of: sd, ble, both")
+    return destination
+
+
+def _validate_sound_integer(
+    value: int,
+    *,
+    name: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer from {minimum} to {maximum}")
+    if value < minimum or value > maximum:
+        raise ValueError(f"{name} must be an integer from {minimum} to {maximum}")
+    return value
+
+
+def build_sound_start_command(
+    label: str,
+    *,
+    destination: str = "both",
+    threshold_rms: int = 800,
+    max_seconds: int = 60,
+    silence_seconds: int = 5,
+) -> str:
+    label = validate_sound_label(label)
+    destination = validate_sound_destination(destination)
+    threshold_rms = _validate_sound_integer(
+        threshold_rms,
+        name="sound threshold RMS",
+        minimum=0,
+        maximum=MAX_SOUND_THRESHOLD_RMS,
+    )
+    max_seconds = _validate_sound_integer(
+        max_seconds,
+        name="sound max seconds",
+        minimum=MIN_SOUND_SECONDS,
+        maximum=MAX_SOUND_SECONDS,
+    )
+    silence_seconds = _validate_sound_integer(
+        silence_seconds,
+        name="sound silence seconds",
+        minimum=0,
+        maximum=MAX_SOUND_SILENCE_SECONDS,
+    )
+    if threshold_rms == 0:
+        silence_seconds = 0
+    return (
+        f"sound_start,label={label},dest={destination},thr={threshold_rms},"
+        f"max={max_seconds},silence={silence_seconds}"
+    )
+
+
+def build_sound_background_command(
+    *,
+    destination: str = "both",
+    max_seconds: int = 300,
+) -> str:
+    destination = validate_sound_destination(destination)
+    max_seconds = _validate_sound_integer(
+        max_seconds,
+        name="sound max seconds",
+        minimum=MIN_SOUND_SECONDS,
+        maximum=MAX_SOUND_SECONDS,
+    )
+    return f"sound_bg,dest={destination},max={max_seconds}"
+
+
+def _command_fields(command: str) -> tuple[str, dict[str, str]]:
+    parts = command.split(",")
+    name = parts[0]
+    fields: dict[str, str] = {}
+    for part in parts[1:]:
+        key, separator, value = part.partition("=")
+        if not separator or not key or key in fields:
+            raise ValueError("sound command fields must be unique key=value pairs")
+        fields[key] = value
+    return name, fields
+
+
+def _sound_int_field(fields: dict[str, str], key: str, default: int) -> int:
+    value = fields.get(key)
+    if value is None:
+        return default
+    try:
+        return int(value, 10)
+    except ValueError as exc:
+        raise ValueError(f"sound {key} must be an integer") from exc
+
+
 def validate_command_payload(command: str) -> str:
     normalized = COMMAND_ALIASES.get(command, command)
     if normalized in VALID_COMMANDS or normalized in (RECORD_COMMAND, RECORD_STOP_COMMAND):
@@ -213,8 +346,38 @@ def validate_command_payload(command: str) -> str:
         except ValueError as exc:
             raise ValueError("record seconds must be an integer from 1 to 300") from exc
         return build_record_command(seconds)
+    if normalized in (SOUND_STOP_COMMAND, SOUND_STATUS_COMMAND):
+        return normalized
+    if normalized.startswith("sound_start"):
+        name, fields = _command_fields(normalized)
+        if name != "sound_start":
+            raise ValueError("invalid sound_start command")
+        unknown = set(fields) - {"label", "dest", "thr", "max", "silence"}
+        if unknown:
+            raise ValueError(f"unknown sound_start field: {sorted(unknown)[0]}")
+        if "label" not in fields:
+            raise ValueError("sound_start requires label")
+        return build_sound_start_command(
+            fields["label"],
+            destination=fields.get("dest", "both"),
+            threshold_rms=_sound_int_field(fields, "thr", 800),
+            max_seconds=_sound_int_field(fields, "max", 60),
+            silence_seconds=_sound_int_field(fields, "silence", 5),
+        )
+    if normalized.startswith("sound_bg"):
+        name, fields = _command_fields(normalized)
+        if name != "sound_bg":
+            raise ValueError("invalid sound_bg command")
+        unknown = set(fields) - {"dest", "max"}
+        if unknown:
+            raise ValueError(f"unknown sound_bg field: {sorted(unknown)[0]}")
+        return build_sound_background_command(
+            destination=fields.get("dest", "both"),
+            max_seconds=_sound_int_field(fields, "max", 300),
+        )
     raise ValueError(
-        "command must be one of: enter, exit, record, record:<seconds>, record_stop"
+        "command must be one of: enter, exit, record, record:<seconds>, record_stop, "
+        "sound_start, sound_bg, sound_stop, sound_status"
     )
 
 
@@ -327,6 +490,56 @@ def parse_report(payload: bytes) -> ReportPacket:
     )
 
 
+def parse_audio(payload: bytes) -> AudioPacket:
+    if len(payload) < AUDIO_V1_HEADER_LEN:
+        raise PacketParseError(
+            f"AUDIO payload too short: expected at least {AUDIO_V1_HEADER_LEN}, got {len(payload)}"
+        )
+    (
+        version,
+        flags,
+        encoding,
+        channels,
+        capture_id,
+        block_sequence,
+        sample_offset,
+        sample_count,
+        data_bytes,
+    ) = struct.unpack("<BBBBIIIHH", payload[:AUDIO_V1_HEADER_LEN])
+    if version != AUDIO_V1_VERSION:
+        raise PacketParseError(f"unsupported AUDIO version: {version}")
+    if encoding != AUDIO_PCM16LE_ENCODING:
+        raise PacketParseError(f"unsupported AUDIO encoding: {encoding}")
+    if channels != 1:
+        raise PacketParseError(f"unsupported AUDIO channels: {channels}")
+    if sample_count <= 0:
+        raise PacketParseError("AUDIO sample_count must be positive")
+    expected_data_bytes = sample_count * channels * 2
+    if data_bytes != expected_data_bytes:
+        raise PacketParseError(
+            "AUDIO data_bytes mismatch: "
+            f"expected {expected_data_bytes}, got {data_bytes}"
+        )
+    expected_payload_len = AUDIO_V1_HEADER_LEN + data_bytes
+    if len(payload) != expected_payload_len:
+        raise PacketParseError(
+            "AUDIO payload length mismatch: "
+            f"expected {expected_payload_len}, got {len(payload)}"
+        )
+    return AudioPacket(
+        version=version,
+        flags=flags,
+        encoding=encoding,
+        channels=channels,
+        capture_id=capture_id,
+        block_sequence=block_sequence,
+        sample_offset=sample_offset,
+        sample_count=sample_count,
+        data_bytes=data_bytes,
+        pcm=payload[AUDIO_V1_HEADER_LEN:],
+    )
+
+
 def _json_field_text(value: object) -> str:
     if value is None:
         return ""
@@ -371,11 +584,13 @@ def parse_frame(data: bytes) -> ParsedFrame:
     mac = ":".join(f"{byte:02X}" for byte in mac_bytes)
 
     if packet_type == "RAWDATA":
-        parsed: RawDataPacket | AlertPacket | ReportPacket = parse_rawdata(payload)
+        parsed: RawDataPacket | AlertPacket | ReportPacket | AudioPacket = parse_rawdata(payload)
     elif packet_type == "ALERT":
         parsed = parse_alert(payload)
     elif packet_type == "REPORT":
         parsed = parse_report(payload)
+    elif packet_type == "AUDIO":
+        parsed = parse_audio(payload)
     else:
         raise PacketParseError(f"unknown packet type: {packet_type!r}")
 
@@ -406,6 +621,13 @@ def describe_frame(frame: ParsedFrame) -> str:
         return (
             f"REPORT mac={frame.mac} length={frame.packet_length} "
             f"message={parsed.message!r}"
+        )
+
+    if isinstance(parsed, AudioPacket):
+        return (
+            f"AUDIO mac={frame.mac} length={frame.packet_length} "
+            f"cid={parsed.capture_id:08x} block={parsed.block_sequence} "
+            f"samples={parsed.sample_count} offset={parsed.sample_offset}"
         )
 
     parts = [

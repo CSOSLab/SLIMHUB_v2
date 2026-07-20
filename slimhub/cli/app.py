@@ -18,8 +18,14 @@ from slimhub.protocol.nus import (
     MAX_RECORD_SECONDS,
     MIN_RECORD_SECONDS,
     RECORD_STOP_COMMAND,
+    SOUND_DESTINATIONS,
+    SOUND_STATUS_COMMAND,
+    SOUND_STOP_COMMAND,
     VALID_COMMANDS,
     build_record_command,
+    build_sound_background_command,
+    build_sound_start_command,
+    validate_sound_label,
 )
 
 
@@ -136,6 +142,55 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stop DEAN Node sound recording.",
     )
     command_record_stop.add_argument("--address", required=True)
+
+    sound_parser = subparsers.add_parser(
+        "sound",
+        help="Capture labeled PCM audio for sound domain adaptation.",
+    )
+    sound_subparsers = sound_parser.add_subparsers(
+        dest="sound_action",
+        required=True,
+    )
+    sound_start = sound_subparsers.add_parser("start", help="Arm a labeled capture.")
+    sound_start.add_argument("--address", required=True)
+    sound_start.add_argument("--label", required=True, type=_sound_label)
+    sound_start.add_argument("--dest", choices=SOUND_DESTINATIONS, default="both")
+    sound_start.add_argument(
+        "--threshold-rms",
+        type=_bounded_integer("threshold RMS", 0, 32767),
+        default=800,
+    )
+    sound_start.add_argument(
+        "--max-seconds",
+        type=_bounded_integer("max seconds", 1, 1800),
+        default=60,
+    )
+    sound_start.add_argument(
+        "--silence-seconds",
+        type=_bounded_integer("silence seconds", 0, 60),
+        default=5,
+    )
+
+    sound_background = sound_subparsers.add_parser(
+        "background",
+        help="Capture the fixed background label without an RMS gate.",
+    )
+    sound_background.add_argument("--address", required=True)
+    sound_background.add_argument(
+        "--dest",
+        choices=SOUND_DESTINATIONS,
+        default="both",
+    )
+    sound_background.add_argument(
+        "--max-seconds",
+        type=_bounded_integer("max seconds", 1, 1800),
+        default=300,
+    )
+
+    sound_stop = sound_subparsers.add_parser("stop", help="Stop or cancel capture.")
+    sound_stop.add_argument("--address", required=True)
+    sound_status = sound_subparsers.add_parser("status", help="Request and show capture state.")
+    sound_status.add_argument("--address", required=True)
 
     config_parser = subparsers.add_parser("config", help="Manage local device config.")
     config_subparsers = config_parser.add_subparsers(dest="config_command", required=True)
@@ -394,6 +449,41 @@ def _send(paths: AppPaths, args: argparse.Namespace) -> object:
             "command.send",
             {"address": args.address, "command": RECORD_STOP_COMMAND},
         )
+    if args.subcommand == "sound" and args.sound_action == "start":
+        command = build_sound_start_command(
+            args.label,
+            destination=args.dest,
+            threshold_rms=args.threshold_rms,
+            max_seconds=args.max_seconds,
+            silence_seconds=args.silence_seconds,
+        )
+        return send_request_sync(
+            paths,
+            "command.send",
+            {"address": args.address, "command": command},
+        )
+    if args.subcommand == "sound" and args.sound_action == "background":
+        command = build_sound_background_command(
+            destination=args.dest,
+            max_seconds=args.max_seconds,
+        )
+        return send_request_sync(
+            paths,
+            "command.send",
+            {"address": args.address, "command": command},
+        )
+    if args.subcommand == "sound" and args.sound_action == "stop":
+        return send_request_sync(
+            paths,
+            "command.send",
+            {"address": args.address, "command": SOUND_STOP_COMMAND},
+        )
+    if args.subcommand == "sound" and args.sound_action == "status":
+        return send_request_sync(
+            paths,
+            "sound.status",
+            {"address": args.address, "command": SOUND_STATUS_COMMAND},
+        )
     if args.subcommand == "config" and args.config_command == "set":
         return send_request_sync(
             paths,
@@ -438,6 +528,12 @@ def _print_result(args: argparse.Namespace, data: object) -> None:
         return
     if args.subcommand == "command":
         _print_command_send(data)
+        return
+    if args.subcommand == "sound":
+        if args.sound_action == "status":
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+        else:
+            _print_command_send(data)
         return
     if args.subcommand == "battery":
         _print_battery_status(data)
@@ -533,6 +629,30 @@ def _record_seconds(value: str) -> int:
             f"seconds must be an integer from {MIN_RECORD_SECONDS} to {MAX_RECORD_SECONDS}"
         )
     return seconds
+
+
+def _sound_label(value: str) -> str:
+    try:
+        return validate_sound_label(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _bounded_integer(name: str, minimum: int, maximum: int):
+    def parse(value: str) -> int:
+        try:
+            parsed = int(value, 10)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"{name} must be an integer from {minimum} to {maximum}"
+            ) from exc
+        if parsed < minimum or parsed > maximum:
+            raise argparse.ArgumentTypeError(
+                f"{name} must be an integer from {minimum} to {maximum}"
+            )
+        return parsed
+
+    return parse
 
 
 def _setup_logging(debug: bool, paths: AppPaths) -> None:

@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from slimhub.events import CommandEvent
+from slimhub.protocol.nus import FrameAssembler, build_frame
 
 
 class FakeBleakClient:
@@ -52,6 +53,16 @@ class ConnectFailureClient:
 
     async def disconnect(self) -> None:
         return None
+
+
+class MtuClient:
+    mtu_size = 517
+
+    def __init__(self) -> None:
+        self.requested: list[int] = []
+
+    async def request_mtu(self, mtu: int) -> None:
+        self.requested.append(mtu)
 
 
 class DeviceSessionQueueTests(unittest.IsolatedAsyncioTestCase):
@@ -118,6 +129,56 @@ class DeviceSessionQueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(results[0][0])
         self.assertTrue(results[-1][0])
+
+    async def test_sound_commands_remain_ordered_in_serial_writer_queue(self) -> None:
+        session = DeviceSession("AA:BB:CC:DD:EE:01", on_frame=ignore_frame)
+
+        await session.send_command(
+            CommandEvent(
+                session.address,
+                "sound_start,label=pee,dest=ble,thr=800,max=60,silence=5",
+                "TOILET",
+            )
+        )
+        await session.send_command(
+            CommandEvent(session.address, "sound_stop", "TOILET")
+        )
+
+        self.assertEqual(session.status()["queued_commands"], 2)
+        first_key = await session._command_queue.get()
+        second_key = await session._command_queue.get()
+        self.assertEqual(session._pending_commands[first_key].command.split(",")[0], "sound_start")
+        self.assertEqual(session._pending_commands[second_key].command, "sound_stop")
+
+    async def test_requests_esp32_preferred_mtu_when_supported(self) -> None:
+        session = DeviceSession("AA:BB:CC:DD:EE:01", on_frame=ignore_frame)
+        client = MtuClient()
+
+        await session._request_maximum_mtu(client)
+
+        self.assertEqual(client.requested, [517])
+
+    async def test_notification_frames_are_dispatched_in_wire_order(self) -> None:
+        handled: list[str] = []
+
+        async def on_frame(_: str, frame: object) -> None:
+            message = frame.parsed.message
+            if message == "first":
+                await asyncio.sleep(0.01)
+            handled.append(message)
+
+        session = DeviceSession("AA:BB:CC:DD:EE:01", on_frame=on_frame)
+        notify = session._build_notify_handler(FrameAssembler())
+        stream = build_frame(session.address, "ALERT", b"first") + build_frame(
+            session.address,
+            "ALERT",
+            b"second",
+        )
+
+        notify(None, bytearray(stream))
+        await asyncio.gather(*list(session._inflight_frame_tasks))
+
+        self.assertEqual(handled, ["first", "second"])
 
 
 if __name__ == "__main__":

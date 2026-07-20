@@ -77,6 +77,24 @@ tail -F data/*/*/*/inference/debugstr/$(date +%F).txt
 The daily, legacy-compatible display archive is
 `data/display/YYYY-MM-DD.txt`.
 
+### Optional: capture labeled sound PCM
+
+Sound capture is opt-in and does not change the normal display, RAWDATA, REPORT,
+or IN/OUT flow. Arm a label, verify `ARMED`/`ACTIVE`, and stop it explicitly:
+
+```bash
+slimhub-v2 sound start --address AA:BB:CC:DD:EE:FF \
+  --label pee --dest both --threshold-rms 1200 --max-seconds 90 \
+  --silence-seconds 5
+slimhub-v2 sound status --address AA:BB:CC:DD:EE:FF
+slimhub-v2 sound stop --address AA:BB:CC:DD:EE:FF
+```
+
+Inspect `data/sound/<NODE_MAC>/<label>/<cid>.json` before using its matching WAV.
+Only manifests with `complete=true`, zero drop counts, and no missing ranges belong
+in the default training dataset. Disconnect/timeout WAV files remain recoverable
+evidence but are deliberately marked incomplete.
+
 ## 4. Configure the database cron job
 
 Copy `docs/db.env.example` to `/home/rtlab/.config/slimhub-v2/db.env`, fill it,

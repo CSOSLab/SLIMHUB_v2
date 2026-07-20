@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import struct
 import tempfile
 import sys
 import types
@@ -160,6 +161,40 @@ def usd_report_frame(address: str) -> ParsedFrame:
     }
     message = ",".join(f"{key}={value}" for key, value in fields.items())
     return report_frame(address, message, fields)
+
+
+def sound_report_frame(address: str, event: str, **extra: str) -> ParsedFrame:
+    fields = {
+        "src": "SOUND",
+        "event": event,
+        "cid": "00ab12cd",
+        **extra,
+    }
+    return report_frame(
+        address,
+        ",".join(f"{key}={value}" for key, value in fields.items()),
+        fields,
+    )
+
+
+def audio_frame(address: str) -> ParsedFrame:
+    pcm = struct.pack("<512h", *range(-256, 256))
+    payload = (
+        struct.pack(
+            "<BBBBIIIHH",
+            1,
+            1,
+            1,
+            1,
+            0x00AB12CD,
+            0,
+            0,
+            512,
+            len(pcm),
+        )
+        + pcm
+    )
+    return parse_frame(build_frame(address, "AUDIO", payload))
 
 
 class DaemonTests(unittest.IsolatedAsyncioTestCase):
@@ -382,6 +417,58 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status["file"], "LOG/001.CSV")
             self.assertEqual(status["uptime"], 12345)
             self.assertEqual(status["ok"], 1)
+
+    async def test_explicit_sound_capture_stores_audio_without_estimator_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            address = "AA:BB:CC:DD:EE:01"
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            session = FakeSession(address)
+            await daemon.registry.add(session)
+
+            await daemon.send_command(
+                address,
+                "sound_start,label=pee,dest=ble,thr=800,max=60,silence=5",
+            )
+            await daemon.handle_frame(
+                address,
+                sound_report_frame(
+                    address,
+                    "CAPTURE_ARMED",
+                    label="pee",
+                    dest="ble",
+                ),
+            )
+            await daemon.handle_frame(
+                address,
+                sound_report_frame(
+                    address,
+                    "CAPTURE_START",
+                    label="pee",
+                    dest="ble",
+                ),
+            )
+            await daemon.handle_frame(address, audio_frame(address))
+            await daemon.handle_frame(
+                address,
+                sound_report_frame(
+                    address,
+                    "CAPTURE_DONE",
+                    samples="512",
+                    blocks="1",
+                    queue_drop="0",
+                    ble_drop="0",
+                    reason="command_stop",
+                ),
+            )
+
+            root = Path(tmpdir) / "data" / "sound" / address / "pee"
+            manifest = json.loads(
+                (root / "00ab12cd.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue((root / "00ab12cd.wav").exists())
+            self.assertTrue(manifest["complete"])
+            self.assertIsNone(daemon.estimator.snapshot()["last_address"])
+            self.assertEqual(session.commands[0].command.split(",")[0], "sound_start")
 
     async def test_two_node_ack_replay_confirms_only_destination_without_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
