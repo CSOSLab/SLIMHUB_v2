@@ -96,6 +96,7 @@ class MultimodalReportStore:
     def __init__(self, manifests: DeploymentManifestStore) -> None:
         self.manifests = manifests
         self._seen_analysis: set[tuple[str, str, int]] = set()
+        self._seen_sound_runs: set[tuple[str, str, int, int, int]] = set()
         self._baselines: dict[tuple[str, str, str], dict[str, object]] = {}
         self._sessions: dict[tuple[str, str, int], dict[str, object]] = {}
         self._open_session: dict[tuple[str, str], tuple[str, str, int] | None] = {}
@@ -432,9 +433,29 @@ class MultimodalReportStore:
             return
         fields = event.packet.fields
         analysis_seq = _integer(fields.get("analysis_seq") or fields.get("aid"))
-        if not self._claim_analysis(event, mac, boot_id, analysis_seq):
-            return
         session_seq = _integer(fields.get("session_seq") or fields.get("sid"))
+        if name == "SOUND" and analysis_seq is None:
+            sound_class = _integer(fields.get("class_index") or fields.get("class"))
+            if session_seq is None or sound_class is None or event_ts is None:
+                self._record(
+                    event,
+                    "multimodal_error",
+                    error="missing_or_malformed_sound_identity",
+                )
+                return
+            sound_key = (mac, boot_id, session_seq, event_ts, sound_class)
+            if sound_key in self._seen_sound_runs:
+                self._record(
+                    event,
+                    "multimodal_replay",
+                    session_seq=session_seq,
+                    event_ts_ms=event_ts,
+                    class_index=sound_class,
+                )
+                return
+            self._seen_sound_runs.add(sound_key)
+        elif not self._claim_analysis(event, mac, boot_id, analysis_seq):
+            return
         schema = _integer(fields.get("schema"))
         errors = _schema_errors(schema, event_ts)
         if schema == 2:
@@ -453,6 +474,7 @@ class MultimodalReportStore:
             "duration_ms": _integer(fields.get("duration_ms")),
             "confidence": _integer(fields.get("confidence")),
             "event_order": _event_order(event, event_ts, analysis_seq),
+            "raw_fields": dict(fields),
             "errors": errors,
         }
         if name == "ENV":
@@ -465,22 +487,69 @@ class MultimodalReportStore:
             if event_id not in ENV_IDS:
                 errors.append("unknown_env_id")
         else:
+            from slimhub.logging.sound_schema import resolve_node_sound_schema
+
             class_count = _integer(fields.get("class_count"))
-            sound_class = _integer(fields.get("class"))
+            sound_class = _integer(fields.get("class_index") or fields.get("class"))
+            semantic_value = fields.get("semantic")
+            profile = fields.get("profile")
+            location = fields.get("location") or event.location
+            model = fields.get("model")
+            sound_schema = resolve_node_sound_schema(
+                profile=profile,
+                location=location,
+                class_count=class_count,
+                semantic=semantic_value,
+            )
+            explicit_semantic = str(semantic_value or "").strip()
+            if explicit_semantic.lower() in {
+                "",
+                "0",
+                "1",
+                "false",
+                "true",
+                "ready",
+                "disabled",
+            }:
+                explicit_semantic = ""
+            label = (
+                explicit_semantic
+                or (
+                    sound_schema.labels[sound_class]
+                    if sound_schema is not None
+                    and sound_class is not None
+                    and 0 <= sound_class < sound_schema.class_count
+                    else None
+                )
+                or (
+                    SOUND_CLASSES.get(sound_class)
+                    if schema == 1 and sound_class is not None
+                    else None
+                )
+            )
             data.update(
                 class_count=class_count,
+                class_index=sound_class,
                 **{"class": sound_class},
-                label=SOUND_CLASSES.get(sound_class) if sound_class is not None else None,
+                label=label,
+                semantic=semantic_value,
+                profile=profile,
+                location=location,
+                model=model,
                 count=_integer(fields.get("count")),
                 max=_number(fields.get("max")),
                 mean=_number(fields.get("mean")),
             )
-            if class_count != 10:
+            if class_count is None or not 1 <= class_count <= 16:
+                errors.append("sound_class_count_out_of_range")
+            if schema == 1 and class_count != 10:
                 errors.append("sound_class_count_must_be_10")
-            if sound_class not in SOUND_CLASSES:
+            if sound_class is None or class_count is None or not 0 <= sound_class < class_count:
                 errors.append("unknown_sound_class")
-            elif event_id != f"S{sound_class}":
+            elif event_id and event_id != f"S{sound_class}":
                 errors.append("sound_id_class_mismatch")
+            if label is None and schema == 2:
+                errors.append("semantic_unavailable")
             if sound_class == 0:
                 errors.append("background_is_not_positive_adl_event")
         self._attach_to_session(mac, boot_id, session_seq, data)

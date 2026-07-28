@@ -11,9 +11,9 @@ from slimhub.protocol.nus import SOUND_STOP_COMMAND, normalize_mac, validate_sou
 
 
 CAPTURE_ID_PATTERN = re.compile(r"^[0-9A-Fa-f]{1,8}$")
-SUCCESS_EVENT = "CAPTURE_DONE"
+SUCCESS_EVENTS = {"CAPTURE_DONE", "CAPTURE_COMPLETE"}
 FAILURE_EVENTS = {"CAPTURE_CANCELLED", "CAPTURE_ERROR"}
-TERMINAL_EVENTS = {SUCCESS_EVENT, *FAILURE_EVENTS}
+TERMINAL_EVENTS = {*SUCCESS_EVENTS, *FAILURE_EVENTS}
 ACCEPT_EVENTS = {"CAPTURE_ARMED"}
 LIFECYCLE_EVENTS = {
     "CAPTURE_ARMED",
@@ -34,6 +34,9 @@ class SoundCommandIntent:
     threshold_rms: int
     max_seconds: int
     silence_seconds: int
+    mode: str
+    open_db: int | None
+    close_db: int | None
     created_at: float
     session_key: tuple[str, int] | None = None
     command_errors: list[str] = field(default_factory=list)
@@ -49,6 +52,12 @@ class SoundCaptureSession:
     label: str
     location: str
     request_id: int | None
+    mode: str | None = None
+    threshold_rms: int | None = None
+    open_db: int | None = None
+    close_db: int | None = None
+    max_ms: int | None = None
+    silence_ms: int | None = None
     state: str = "ARMED"
     accepted: bool = False
     terminal_event: str | None = None
@@ -80,7 +89,7 @@ class SoundCaptureSession:
 
     @property
     def success(self) -> bool:
-        return self.terminal_event == SUCCESS_EVENT and self.complete is True
+        return self.terminal_event in SUCCESS_EVENTS and self.complete is True
 
 
 class SoundCaptureStore:
@@ -110,12 +119,27 @@ class SoundCaptureStore:
             threshold_rms = int(fields["thr"])
             max_seconds = int(fields["max"])
             silence_seconds = int(fields["silence"])
+            mode = "labeled"
+            open_db = None
+            close_db = None
         elif command.startswith("sound_bg,"):
             fields = _command_fields(command)
             label = "background"
             threshold_rms = 0
             max_seconds = int(fields["max"])
             silence_seconds = 0
+            mode = "background"
+            open_db = None
+            close_db = None
+        elif command.startswith("sound_auto,"):
+            fields = _command_fields(command)
+            label = "automatic"
+            threshold_rms = 0
+            max_seconds = int(fields["max"])
+            silence_seconds = int(fields["silence"])
+            mode = "automatic"
+            open_db = _optional_int(fields.get("open_db"), None)
+            close_db = _optional_int(fields.get("close_db"), None)
         elif command == SOUND_STOP_COMMAND:
             for session in self._sessions_for_address(normalized):
                 if not session.terminal:
@@ -135,6 +159,9 @@ class SoundCaptureStore:
             threshold_rms=threshold_rms,
             max_seconds=max_seconds,
             silence_seconds=silence_seconds,
+            mode=mode,
+            open_db=open_db,
+            close_db=close_db,
             created_at=timestamp,
         )
         self._intents[intent.request_id] = intent
@@ -151,7 +178,13 @@ class SoundCaptureStore:
         self._remember_latest_status(node_mac, ble_address, event_name, event)
 
         if event_name in {"COMMAND_ERROR", "CAPTURE_BUSY"}:
-            intent = self._pending_intent(node_mac, ble_address)
+            if event_name == "COMMAND_ERROR" and not fields.get("command"):
+                return
+            intent = self._pending_intent(
+                node_mac,
+                ble_address,
+                command=fields.get("command"),
+            )
             if intent is not None:
                 intent.command_errors.append(fields.get("reason") or event_name.lower())
                 intent.change_event.set()
@@ -187,6 +220,12 @@ class SoundCaptureStore:
             if intent is not None:
                 session.request_id = intent.request_id
                 session.label = intent.label
+                session.mode = intent.mode
+                session.threshold_rms = intent.threshold_rms
+                session.open_db = intent.open_db
+                session.close_db = intent.close_db
+                session.max_ms = intent.max_seconds * 1000
+                session.silence_ms = intent.silence_seconds * 1000
                 intent.session_key = key
                 self._remove_pending(intent)
 
@@ -216,6 +255,19 @@ class SoundCaptureStore:
 
         if event_name == "CAPTURE_ARMED":
             session.accepted = True
+            session.label = _report_label(fields.get("label") or session.label)
+            session.mode = fields.get("mode") or session.mode
+            session.threshold_rms = _optional_int(
+                fields.get("threshold_rms") or fields.get("thr"),
+                session.threshold_rms,
+            )
+            session.open_db = _optional_int(fields.get("open_db"), session.open_db)
+            session.close_db = _optional_int(fields.get("close_db"), session.close_db)
+            session.max_ms = _optional_int(fields.get("max_ms"), session.max_ms)
+            session.silence_ms = _optional_int(
+                fields.get("silence_ms"),
+                session.silence_ms,
+            )
             if session.started_at is None:
                 session.state = "ARMED"
         elif event_name == "CAPTURE_START":
@@ -241,7 +293,10 @@ class SoundCaptureStore:
             )
         elif event_name in TERMINAL_EVENTS:
             session.terminal_event = event_name
-            session.complete = _complete_flag(fields.get("complete"))
+            session.complete = _complete_flag(
+                fields.get("complete"),
+                default=event_name in SUCCESS_EVENTS,
+            )
             session.reason = fields.get("reason") or event_name.lower()
             session.samples = _optional_int(fields.get("samples"), session.samples)
             session.blocks = _optional_int(fields.get("blocks"), session.blocks)
@@ -256,7 +311,7 @@ class SoundCaptureStore:
             session.queue_drop = _optional_int(fields.get("queue_drop"), 0) or 0
             session.ble_drop = _optional_int(fields.get("ble_drop"), 0) or 0
             session.ended_at = event.timestamp
-            session.state = "DONE" if event_name == SUCCESS_EVENT else event_name.removeprefix(
+            session.state = "DONE" if event_name in SUCCESS_EVENTS else event_name.removeprefix(
                 "CAPTURE_"
             )
 
@@ -486,12 +541,14 @@ class SoundCaptureStore:
         self,
         node_mac: str,
         ble_address: str,
+        *,
+        command: object = None,
     ) -> SoundCommandIntent | None:
         candidates: list[SoundCommandIntent] = []
         for address in {node_mac, ble_address}:
             for request_id in self._pending_by_address.get(address, []):
                 intent = self._intents[request_id]
-                if intent.session_key is None:
+                if intent.session_key is None and _command_matches(command, intent.payload):
                     candidates.append(intent)
         return max(candidates, key=lambda item: item.request_id) if candidates else None
 
@@ -573,6 +630,12 @@ class SoundCaptureStore:
             "location": session.location,
             "state": session.state,
             "accepted": session.accepted,
+            "mode": session.mode,
+            "threshold_rms": session.threshold_rms,
+            "open_db": session.open_db,
+            "close_db": session.close_db,
+            "max_ms": session.max_ms,
+            "silence_ms": session.silence_ms,
             "terminal_event": session.terminal_event,
             "complete": session.complete,
             "reason": session.reason,
@@ -612,8 +675,18 @@ def _optional_int(value: object, default: int | None) -> int | None:
         return default
 
 
-def _complete_flag(value: object) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes"}
+def _complete_flag(value: object, *, default: bool = False) -> bool:
+    if value is None or str(value).strip() == "":
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def _command_matches(report_command: object, intent_payload: str) -> bool:
+    report = str(report_command or "").strip()
+    if not report:
+        return True
+    intent_name = intent_payload.split(",", 1)[0]
+    return report == intent_payload or report == intent_name
 
 
 def _report_label(value: object) -> str:

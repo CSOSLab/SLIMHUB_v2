@@ -43,8 +43,12 @@ PACKET_LEN_LEN = 2
 HEADER_LEN = MAC_LEN + PACKET_TYPE_LEN + PACKET_LEN_LEN
 END_FLAG_LEN = len(END_FLAG)
 RAWDATA_PAYLOAD_LEN = 33
+MIN_COMMAND_PAYLOAD_LEN = 1
+MAX_COMMAND_PAYLOAD_LEN = 128
+MAX_REPORT_PAYLOAD_LEN = 256
 MAX_FRAME_LEN = 4096
 KNOWN_PACKET_TYPES = {"RAWDATA", "ALERT", "REPORT", "AUDIO", "WAVFILE"}
+NODE_SIMPLE_COMMANDS = {"node_status", "config_get", "config_reload"}
 
 
 class PacketParseError(ValueError):
@@ -137,6 +141,18 @@ class FrameAssembler:
                 byteorder="little",
                 signed=False,
             )
+            if (
+                (packet_type == "RAWDATA" and packet_length != RAWDATA_PAYLOAD_LEN)
+                or (packet_type == "REPORT" and packet_length > MAX_REPORT_PAYLOAD_LEN)
+            ):
+                bad_byte = self._buffer.pop(0)
+                logging.warning(
+                    "Dropping byte 0x%02x while resynchronizing: invalid %s payload length %d",
+                    bad_byte,
+                    packet_type,
+                    packet_length,
+                )
+                continue
             frame_len = HEADER_LEN + packet_length + END_FLAG_LEN
 
             if frame_len > self._max_frame_len:
@@ -289,6 +305,47 @@ def build_sound_background_command(
     return f"sound_bg,max={max_seconds}"
 
 
+def build_sound_auto_command(
+    *,
+    max_seconds: int = 300,
+    silence_seconds: int = 20,
+    open_db: int | None = None,
+    close_db: int | None = None,
+) -> str:
+    max_seconds = _validate_sound_integer(
+        max_seconds,
+        name="sound max seconds",
+        minimum=MIN_SOUND_SECONDS,
+        maximum=MAX_SOUND_SECONDS,
+    )
+    silence_seconds = _validate_sound_integer(
+        silence_seconds,
+        name="sound silence seconds",
+        minimum=0,
+        maximum=MAX_SOUND_SILENCE_SECONDS,
+    )
+    if (open_db is None) != (close_db is None):
+        raise ValueError("sound automatic requires both open dB and close dB overrides")
+    command = f"sound_auto,max={max_seconds},silence={silence_seconds}"
+    if open_db is not None and close_db is not None:
+        open_db = _validate_sound_integer(
+            open_db,
+            name="sound open dB",
+            minimum=0,
+            maximum=120,
+        )
+        close_db = _validate_sound_integer(
+            close_db,
+            name="sound close dB",
+            minimum=0,
+            maximum=120,
+        )
+        if open_db <= close_db:
+            raise ValueError("sound open dB must be greater than close dB")
+        command += f",open_db={open_db},close_db={close_db}"
+    return command
+
+
 def _command_fields(command: str) -> tuple[str, dict[str, str]]:
     parts = command.split(",")
     name = parts[0]
@@ -312,18 +369,70 @@ def _sound_int_field(fields: dict[str, str], key: str, default: int) -> int:
 
 
 def validate_command_payload(command: str) -> str:
+    if not isinstance(command, str) or "\x00" in command:
+        raise ValueError("command must be NUL-free UTF-8 text")
+    _validate_command_size(command)
     normalized = COMMAND_ALIASES.get(command, command)
+    validated: str
     if normalized in VALID_COMMANDS or normalized in (RECORD_COMMAND, RECORD_STOP_COMMAND):
-        return normalized
+        validated = normalized
+        return _validate_command_size(validated)
     if normalized.startswith(f"{RECORD_COMMAND}:"):
         seconds_text = normalized[len(RECORD_COMMAND) + 1 :]
         try:
             seconds = int(seconds_text, 10)
         except ValueError as exc:
             raise ValueError("record seconds must be an integer from 1 to 300") from exc
-        return build_record_command(seconds)
+        return _validate_command_size(build_record_command(seconds))
     if normalized in (SOUND_STOP_COMMAND, SOUND_STATUS_COMMAND):
-        return normalized
+        return _validate_command_size(normalized)
+    if normalized in NODE_SIMPLE_COMMANDS:
+        return _validate_command_size(normalized)
+    if normalized.startswith("time_sync"):
+        name, fields = _command_fields(normalized)
+        if name != "time_sync" or set(fields) != {"epoch_ms", "tz_min"}:
+            raise ValueError("time_sync requires epoch_ms and tz_min")
+        epoch_ms = _integer_field(fields, "epoch_ms")
+        timezone_minutes = _integer_field(fields, "tz_min")
+        if epoch_ms <= 0 or not -24 * 60 <= timezone_minutes <= 24 * 60:
+            raise ValueError("invalid time_sync values")
+        return _validate_command_size(
+            f"time_sync,epoch_ms={epoch_ms},tz_min={timezone_minutes}"
+        )
+    if normalized.startswith("config_set"):
+        name, fields = _command_fields(normalized)
+        if name != "config_set" or set(fields) != {"location", "sound_profile"}:
+            raise ValueError("config_set requires location and sound_profile")
+        allowed = {
+            ("TOILET", "toilet_v1"),
+            ("KITCHEN", "kitchen_v1"),
+            ("LIVING", "living_v1"),
+            ("BEDROOM", "living_v1"),
+        }
+        location = fields["location"].strip().upper()
+        profile = fields["sound_profile"].strip().lower()
+        if (location, profile) not in allowed:
+            raise ValueError("unsupported config_set location/profile combination")
+        return _validate_command_size(
+            f"config_set,location={location},sound_profile={profile}"
+        )
+    if normalized.startswith("inout_confirm"):
+        name, fields = _command_fields(normalized)
+        if name != "inout_confirm" or set(fields) != {"bid", "cid", "state", "rid"}:
+            raise ValueError("inout_confirm requires bid, cid, state and rid")
+        bid = fields["bid"].strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{1,32}", bid):
+            raise ValueError("inout_confirm bid must be hexadecimal")
+        cid = _integer_field(fields, "cid")
+        state = fields["state"].strip().lower()
+        rid_text = fields["rid"].strip().lower().removeprefix("0x")
+        if cid < 0 or state not in {"in", "out"}:
+            raise ValueError("invalid inout_confirm cid or state")
+        if not re.fullmatch(r"[0-9a-f]{1,8}", rid_text) or int(rid_text, 16) == 0:
+            raise ValueError("inout_confirm rid must be a nonzero 32-bit hexadecimal value")
+        return _validate_command_size(
+            f"inout_confirm,bid={bid},cid={cid},state={state},rid={rid_text}"
+        )
     if normalized.startswith("sound_start"):
         name, fields = _command_fields(normalized)
         if name != "sound_start":
@@ -333,11 +442,13 @@ def validate_command_payload(command: str) -> str:
             raise ValueError(f"unknown sound_start field: {sorted(unknown)[0]}")
         if "label" not in fields:
             raise ValueError("sound_start requires label")
-        return build_sound_start_command(
-            fields["label"],
-            threshold_rms=_sound_int_field(fields, "thr", 800),
-            max_seconds=_sound_int_field(fields, "max", 60),
-            silence_seconds=_sound_int_field(fields, "silence", 5),
+        return _validate_command_size(
+            build_sound_start_command(
+                fields["label"],
+                threshold_rms=_sound_int_field(fields, "thr", 800),
+                max_seconds=_sound_int_field(fields, "max", 60),
+                silence_seconds=_sound_int_field(fields, "silence", 5),
+            )
         )
     if normalized.startswith("sound_bg"):
         name, fields = _command_fields(normalized)
@@ -346,17 +457,59 @@ def validate_command_payload(command: str) -> str:
         unknown = set(fields) - {"max"}
         if unknown:
             raise ValueError(f"unknown sound_bg field: {sorted(unknown)[0]}")
-        return build_sound_background_command(
-            max_seconds=_sound_int_field(fields, "max", 300),
+        return _validate_command_size(
+            build_sound_background_command(
+                max_seconds=_sound_int_field(fields, "max", 300),
+            )
+        )
+    if normalized.startswith("sound_auto"):
+        name, fields = _command_fields(normalized)
+        if name != "sound_auto":
+            raise ValueError("invalid sound_auto command")
+        unknown = set(fields) - {"max", "silence", "open_db", "close_db"}
+        if unknown:
+            raise ValueError(f"unknown sound_auto field: {sorted(unknown)[0]}")
+        return _validate_command_size(
+            build_sound_auto_command(
+                max_seconds=_sound_int_field(fields, "max", 300),
+                silence_seconds=_sound_int_field(fields, "silence", 20),
+                open_db=(
+                    _sound_int_field(fields, "open_db", 0)
+                    if "open_db" in fields
+                    else None
+                ),
+                close_db=(
+                    _sound_int_field(fields, "close_db", 0)
+                    if "close_db" in fields
+                    else None
+                ),
+            )
         )
     raise ValueError(
         "command must be one of: enter, exit, record, record:<seconds>, record_stop, "
-        "sound_start, sound_bg, sound_stop, sound_status"
+        "sound_start, sound_bg, sound_auto, sound_stop, sound_status, node_status, "
+        "config_get, config_set, config_reload, time_sync, inout_confirm"
     )
 
 
 def build_command_frame(mac: str, command: str) -> bytes:
     return build_frame(mac, "COMMAND", validate_command_payload(command).encode("utf-8"))
+
+
+def _integer_field(fields: dict[str, str], key: str) -> int:
+    try:
+        return int(fields[key], 10)
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"{key} must be an integer") from exc
+
+
+def _validate_command_size(command: str) -> str:
+    size = len(command.encode("utf-8"))
+    if not MIN_COMMAND_PAYLOAD_LEN <= size <= MAX_COMMAND_PAYLOAD_LEN:
+        raise ValueError(
+            f"command payload must be {MIN_COMMAND_PAYLOAD_LEN}-{MAX_COMMAND_PAYLOAD_LEN} bytes"
+        )
+    return command
 
 
 def parse_rawdata(payload: bytes) -> RawDataPacket:
@@ -417,7 +570,16 @@ def parse_alert(payload: bytes) -> AlertPacket:
 
 
 def parse_report(payload: bytes) -> ReportPacket:
-    message = payload.decode("utf-8", errors="replace")
+    if len(payload) > MAX_REPORT_PAYLOAD_LEN:
+        raise PacketParseError(
+            f"REPORT payload exceeds {MAX_REPORT_PAYLOAD_LEN} bytes"
+        )
+    if b"\x00" in payload:
+        raise PacketParseError("REPORT payload contains embedded NUL")
+    try:
+        message = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PacketParseError("REPORT payload is not valid UTF-8") from exc
     if payload.lstrip().startswith(b"{"):
         try:
             document = json.loads(message)
@@ -435,14 +597,15 @@ def parse_report(payload: bytes) -> ReportPacket:
                 format="json",
                 parse_error="json_report_must_be_an_object",
             )
-        fields = {
+        json_fields = {
             str(key): _json_field_text(value)
             for key, value in document.items()
             if isinstance(value, (str, int, float, bool)) or value is None
         }
+        _normalize_report_aliases(json_fields)
         return ReportPacket(
             message=message,
-            fields=fields,
+            fields=json_fields,
             format="json",
             document=document,
         )
@@ -457,11 +620,27 @@ def parse_report(payload: bytes) -> ReportPacket:
                 duplicate_fields.setdefault(normalized_key, []).append(normalized_value)
             else:
                 fields[normalized_key] = normalized_value
+    _normalize_report_aliases(fields)
     return ReportPacket(
         message=message,
         fields=fields,
         duplicate_fields=duplicate_fields or None,
     )
+
+
+def _normalize_report_aliases(fields: dict[str, str]) -> None:
+    aliases = {
+        "bid": ("boot_id",),
+        "cid": ("event_seq",),
+        "timestamp": ("event_ts_ms", "ts"),
+    }
+    for canonical, alternatives in aliases.items():
+        if canonical in fields:
+            continue
+        for alternative in alternatives:
+            if alternative in fields:
+                fields[canonical] = fields[alternative]
+                break
 
 
 def _json_field_text(value: object) -> str:

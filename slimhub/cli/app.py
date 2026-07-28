@@ -26,6 +26,7 @@ from slimhub.protocol.nus import (
     VALID_COMMANDS,
     build_record_command,
     build_sound_background_command,
+    build_sound_auto_command,
     build_sound_start_command,
     validate_sound_label,
 )
@@ -419,6 +420,78 @@ def build_parser() -> argparse.ArgumentParser:
     _add_wait_option(sound_stop, no_wait_result="the stop command is queued")
     sound_status = sound_subparsers.add_parser("status", help="Request and show capture state.")
     _add_target_options(sound_status, required=True)
+
+    sound_automatic = sound_subparsers.add_parser(
+        "automatic",
+        help="Run automatic threshold capture using the Node's stored defaults.",
+        description=(
+            "Send sound_auto. By default no dB thresholds are transmitted, so the "
+            "Node's stored 57/52 dB settings remain authoritative."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    _add_target_options(sound_automatic, required=True)
+    sound_automatic.add_argument(
+        "--max-seconds",
+        type=_bounded_integer("max seconds", 1, 1800),
+        default=300,
+        metavar="1..1800",
+    )
+    sound_automatic.add_argument(
+        "--silence-seconds",
+        type=_bounded_integer("silence seconds", 0, 60),
+        default=20,
+        metavar="0..60",
+    )
+    sound_automatic.add_argument(
+        "--open-db",
+        type=_bounded_integer("open dB", 0, 120),
+        metavar="0..120",
+        help="Optional opening threshold; requires --close-db.",
+    )
+    sound_automatic.add_argument(
+        "--close-db",
+        type=_bounded_integer("close dB", 0, 120),
+        metavar="0..120",
+        help="Optional closing threshold; requires --open-db.",
+    )
+    _add_wait_option(sound_automatic)
+
+    node_parser = subparsers.add_parser(
+        "node",
+        help="Query and configure DEAN Node v2 runtime state.",
+        formatter_class=_HelpFormatter,
+    )
+    node_subparsers = node_parser.add_subparsers(dest="node_action", required=True)
+    node_status = node_subparsers.add_parser("status", help="Request NODE/STATUS.")
+    _add_target_options(node_status, required=True)
+    node_config = node_subparsers.add_parser("config", help="Manage Node configuration.")
+    node_config_subparsers = node_config.add_subparsers(
+        dest="node_config_action",
+        required=True,
+    )
+    node_config_get = node_config_subparsers.add_parser("get", help="Request CONFIG/STATUS.")
+    _add_target_options(node_config_get, required=True)
+    node_config_set = node_config_subparsers.add_parser(
+        "set",
+        help="Apply a supported location/profile pair while the Node is OUT+IDLE.",
+    )
+    _add_target_options(node_config_set, required=True)
+    node_config_set.add_argument(
+        "--node-location",
+        required=True,
+        choices=("TOILET", "KITCHEN", "LIVING", "BEDROOM"),
+    )
+    node_config_set.add_argument(
+        "--profile",
+        required=True,
+        choices=("toilet_v1", "kitchen_v1", "living_v1"),
+    )
+    node_config_reload = node_config_subparsers.add_parser(
+        "reload",
+        help="Reload Node configuration while the Node is OUT+IDLE.",
+    )
+    _add_target_options(node_config_reload, required=True)
 
     config_parser = subparsers.add_parser(
         "config",
@@ -875,6 +948,59 @@ def _send(paths: AppPaths, args: argparse.Namespace) -> object:
             "sound.status",
             {**_target_payload(args), "command": SOUND_STATUS_COMMAND},
         )
+    if args.subcommand == "sound" and args.sound_action == "automatic":
+        command = build_sound_auto_command(
+            max_seconds=args.max_seconds,
+            silence_seconds=args.silence_seconds,
+            open_db=args.open_db,
+            close_db=args.close_db,
+        )
+        return send_request_sync(
+            paths,
+            "sound.capture",
+            {
+                **_target_payload(args),
+                "command": command,
+                "wait": args.wait,
+                "timeout": (
+                    _sound_capture_wait_timeout("automatic", args.max_seconds)
+                    if args.wait
+                    else SOUND_NO_WAIT_ACCEPT_SECONDS
+                ),
+            },
+        )
+    if args.subcommand == "node" and args.node_action == "status":
+        return send_request_sync(
+            paths,
+            "node.status",
+            {**_target_payload(args), "refresh": True},
+        )
+    if (
+        args.subcommand == "node"
+        and args.node_action == "config"
+        and args.node_config_action == "get"
+    ):
+        return send_request_sync(paths, "node.config.get", _target_payload(args))
+    if (
+        args.subcommand == "node"
+        and args.node_action == "config"
+        and args.node_config_action == "set"
+    ):
+        return send_request_sync(
+            paths,
+            "node.config.set",
+            {
+                **_target_payload(args),
+                "node_location": args.node_location,
+                "profile": args.profile,
+            },
+        )
+    if (
+        args.subcommand == "node"
+        and args.node_action == "config"
+        and args.node_config_action == "reload"
+    ):
+        return send_request_sync(paths, "node.config.reload", _target_payload(args))
     if args.subcommand == "config" and args.config_command == "set":
         return send_request_sync(
             paths,
@@ -904,7 +1030,7 @@ def _should_show_default_wait_eta(
 ) -> bool:
     return bool(
         args.subcommand == "sound"
-        and args.sound_action in {"start", "background", "stop"}
+        and args.sound_action in {"start", "background", "automatic", "stop"}
         and getattr(args, "wait", False)
         and "--wait" not in cli_args
         and "--no-wait" not in cli_args
@@ -958,7 +1084,7 @@ def _sound_eta_budget(args: argparse.Namespace) -> tuple[float, float, str]:
         estimate = float(SOUND_ARM_WAIT_SECONDS + args.max_seconds)
         deadline = float(_sound_capture_wait_timeout("start", args.max_seconds))
         return estimate, deadline, "upper bound"
-    if args.sound_action == "background":
+    if args.sound_action in {"background", "automatic"}:
         estimate = float(args.max_seconds)
         deadline = float(_sound_capture_wait_timeout("background", args.max_seconds))
         return estimate, deadline, "estimate"
@@ -1014,7 +1140,7 @@ def _target_payload(
     args: argparse.Namespace,
     *,
     required: bool = True,
-) -> dict[str, str]:
+) -> dict[str, object]:
     address = getattr(args, "address", None)
     location = getattr(args, "location", None)
     if address:
@@ -1026,7 +1152,7 @@ def _target_payload(
     return {}
 
 
-def _config_target_payload(args: argparse.Namespace) -> dict[str, str]:
+def _config_target_payload(args: argparse.Namespace) -> dict[str, object]:
     option_address = getattr(args, "target_address", None)
     location = getattr(args, "target_location", None)
     legacy_address = getattr(args, "legacy_address", None)
@@ -1184,7 +1310,7 @@ def _result_exit_code(args: argparse.Namespace, data: object) -> int:
 def _handle_sound_interrupt(paths: AppPaths, args: argparse.Namespace) -> int:
     if (
         args.subcommand != "sound"
-        or args.sound_action not in {"start", "background"}
+        or args.sound_action not in {"start", "background", "automatic"}
         or not getattr(args, "wait", False)
     ):
         return 130

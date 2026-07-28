@@ -55,15 +55,20 @@ MINIMAL_AUDIT_KINDS = {
     "legacy_inference_invalid",
     "legacy_json_invalid",
     "multimodal_error",
+    "raw_sound_metadata",
 }
+CONTRACT_RECORD_PREFIXES = ("node_", "config_", "inout_")
 
 
 class RawDataLogger:
     def __init__(self, paths: AppPaths, *, audit_mode: str | None = None) -> None:
         self.paths = paths
-        self.audit_mode = (
-            audit_mode or os.environ.get("SLIMHUB_AUDIT_JSONL", "minimal")
-        ).strip().lower()
+        selected_audit_mode = (
+            audit_mode
+            if audit_mode is not None
+            else os.environ.get("SLIMHUB_AUDIT_JSONL", "minimal")
+        )
+        self.audit_mode = selected_audit_mode.strip().lower()
         if self.audit_mode not in AUDIT_MODES:
             raise ValueError(
                 "SLIMHUB_AUDIT_JSONL must be one of: off, minimal, full"
@@ -164,8 +169,11 @@ class RawDataLogger:
                             "flag_env": event.packet.flag_env,
                             "flag_sound": event.packet.flag_sound,
                         },
-                        "sound_schema_version": event.sound_schema_version,
-                        "sound_class_count": event.sound_class_count,
+                            "sound_schema_version": event.sound_schema_version,
+                            "sound_class_count": event.sound_class_count,
+                            "sound_semantic_ready": event.sound_semantic_ready,
+                            "sound_profile": event.sound_profile,
+                            "sound_model": event.sound_model,
                     },
                 )
             )
@@ -180,7 +188,9 @@ class RawDataLogger:
         if self.audit_mode == "off":
             return
         if self.audit_mode == "minimal" and not (
-            event.packet.parse_error or event.identity_warning
+            event.packet.parse_error
+            or event.identity_warning
+            or _retain_contract_report(event)
         ):
             return
         path = self._structured_path_for(event.timestamp)
@@ -213,7 +223,11 @@ class RawDataLogger:
     async def write_structured(self, event: StructuredEvent) -> None:
         if self.audit_mode == "off":
             return
-        if self.audit_mode == "minimal" and event.kind not in MINIMAL_AUDIT_KINDS:
+        if (
+            self.audit_mode == "minimal"
+            and event.kind not in MINIMAL_AUDIT_KINDS
+            and not event.kind.startswith(CONTRACT_RECORD_PREFIXES)
+        ):
             return
         path = self._structured_path_for(event.timestamp)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -265,14 +279,29 @@ class RawDataLogger:
     def _row_for(self, event: RawDataEvent) -> dict[str, object]:
         timestamp = datetime.fromtimestamp(event.timestamp)
         packet = event.packet
-        try:
-            schema = resolve_sound_schema(event.sound_schema_version, event.sound_class_count)
-        except ValueError:
-            # Preserve the raw packet and avoid inventing labels if a firmware
-            # report advertises an incompatible schema.
+        sound: list[int | None]
+        if event.sound_semantic_ready is False:
             schema = B_TFLM_V1_SCHEMA
-        sound = list(packet.sound[: schema.class_count])
-        sound.extend([None] * (schema.class_count - len(sound)))
+            sound = [None] * schema.class_count
+        else:
+            try:
+                schema = resolve_sound_schema(
+                    event.sound_profile or event.sound_schema_version,
+                    event.sound_class_count,
+                )
+                sound = list(packet.sound[: schema.class_count])
+                sound.extend([None] * (schema.class_count - len(sound)))
+                if schema.labels != B_TFLM_V1_SCHEMA.labels:
+                    # The legacy CSV has fixed toilet-v1 columns. Dynamic room
+                    # semantics are retained in raw_sound_metadata JSONL instead
+                    # of writing scores under incorrect legacy headings.
+                    schema = B_TFLM_V1_SCHEMA
+                    sound = [None] * schema.class_count
+            except ValueError:
+                # Preserve the raw packet and avoid inventing labels if a firmware
+                # report advertises an incompatible schema.
+                schema = B_TFLM_V1_SCHEMA
+                sound = [None] * schema.class_count
 
         row: dict[str, object] = {
             "time": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
@@ -289,9 +318,11 @@ class RawDataLogger:
         for label, value in zip(schema.labels, sound):
             # A zero byte is the firmware's padding for an untransmitted score;
             # it must not become a plausible-looking 0.5 probability.
-            row[label] = "" if not packet.flag_sound or value in (None, 0) else (value + 128) / 256
+            if not packet.flag_sound or value is None or value == 0:
+                row[label] = ""
+            else:
+                row[label] = (value + 128) / 256
         return row
-
     def _alert_line_for(self, event: AlertEvent) -> str:
         timestamp = datetime.fromtimestamp(event.timestamp)
         timestamp_text = timestamp.strftime("%Y-%m-%d %H:%M:%S")
@@ -367,3 +398,17 @@ class RawDataLogger:
             "connected": event.connected,
             "session_id": event.session_id,
         }
+
+
+def _retain_contract_report(event: ReportEvent) -> bool:
+    fields = event.packet.fields
+    src = fields.get("src", "").strip().upper()
+    if src in {"NODE", "CONFIG", "SOUND"}:
+        return True
+    if src == "INOUT":
+        return (
+            fields.get("schema") == "2"
+            or bool(fields.get("bid") or fields.get("boot_id"))
+            or fields.get("event", "").upper() in {"CONFIRM_ACK", "CONFIRM_ERROR"}
+        )
+    return src in {"EVENT", "ADL"} and fields.get("schema") == "2"

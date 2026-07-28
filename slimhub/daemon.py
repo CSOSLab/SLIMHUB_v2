@@ -20,6 +20,13 @@ from slimhub.config import (
     is_assigned_location,
     location_key,
 )
+from slimhub.dean_contract import (
+    LOCAL_STANDALONE,
+    SLIMHUB_CONFIRMED,
+    DeanContractStore,
+    build_config_set_command,
+    build_time_sync_command,
+)
 from slimhub.events import (
     AlertEvent,
     CommandEvent,
@@ -109,6 +116,7 @@ class SlimHubDaemon:
         self.report_reorder_buffer: EventReorderBuffer[ReportEvent] = EventReorderBuffer()
         self._report_reorder_task: asyncio.Task[None] | None = None
         self.power_shadow = ShadowPowerState(paths)
+        self.dean_contract = DeanContractStore(paths.node_state_path)
         self.registry = DeviceRegistry()
         self.battery_status: dict[str, dict[str, object]] = {}
         self._session_ids: dict[str, str] = {}
@@ -263,6 +271,79 @@ class SlimHubDaemon:
                 session.name = config.name or session.name
         return "Config data applied"
 
+    async def node_status(
+        self,
+        address: object,
+        *,
+        location: object | None = None,
+        refresh: bool = True,
+    ) -> dict[str, object]:
+        normalized = self.resolve_device_target(address, location)
+        request = (
+            await self.send_command(normalized, "node_status")
+            if refresh
+            else None
+        )
+        return {
+            "request": request,
+            "cached": self.dean_contract.snapshot(normalized),
+        }
+
+    async def node_config_get(
+        self,
+        address: object,
+        *,
+        location: object | None = None,
+    ) -> dict[str, object]:
+        normalized = self.resolve_device_target(address, location)
+        request = await self.send_command(normalized, "config_get")
+        return {
+            "request": request,
+            "cached": self.dean_contract.snapshot(normalized),
+        }
+
+    async def node_config_set(
+        self,
+        address: object,
+        node_location: object,
+        profile: object,
+        *,
+        target_location: object | None = None,
+    ) -> dict[str, object]:
+        normalized = self.resolve_device_target(address, target_location)
+        location_text = str(node_location)
+        profile_text = str(profile)
+        self.dean_contract.validate_config_change(
+            normalized,
+            location_text,
+            profile_text,
+        )
+        payload = build_config_set_command(location_text, profile_text)
+        request = await self.send_command(normalized, payload)
+        return {
+            "request": request,
+            "cached": self.dean_contract.snapshot(normalized),
+            "pending": {
+                "location": location_text.strip().upper(),
+                "profile": profile_text.strip().lower(),
+                "applies_on": "CONFIG/APPLIED",
+            },
+        }
+
+    async def node_config_reload(
+        self,
+        address: object,
+        *,
+        location: object | None = None,
+    ) -> dict[str, object]:
+        normalized = self.resolve_device_target(address, location)
+        self.dean_contract.validate_config_reload(normalized)
+        request = await self.send_command(normalized, "config_reload")
+        return {
+            "request": request,
+            "cached": self.dean_contract.snapshot(normalized),
+        }
+
     async def service_command(
         self,
         address: object,
@@ -326,7 +407,12 @@ class SlimHubDaemon:
             sound_schema_version, sound_class_count = self._sound_schemas.get(
                 normalize_mac(frame.mac), (None, None)
             )
-            event = RawDataEvent(
+            node_state = self.dean_contract.node_state(frame.mac)
+            semantic_ready = (
+                str(node_state.semantic or "").lower() in {"1", "true", "ready"}
+                and str(node_state.config or "").upper() == "READY"
+            )
+            raw_event = RawDataEvent(
                 timestamp=timestamp,
                 mac=frame.mac,
                 location=config.location,
@@ -338,19 +424,58 @@ class SlimHubDaemon:
                 receipt_timestamp=timestamp,
                 sound_schema_version=sound_schema_version,
                 sound_class_count=sound_class_count,
+                sound_semantic_ready=(
+                    semantic_ready
+                    if node_state.semantic is not None or node_state.config is not None
+                    else None
+                ),
+                sound_profile=node_state.profile,
+                sound_model=node_state.model,
             )
             self.power_shadow.update_rawdata(frame.mac, frame.parsed, timestamp)
-            await self.raw_logger.log(event)
-            sent_commands = await self._send_unitspace_commands(
-                self.estimator.handle(event)
+            self.dean_contract.handle_raw(raw_event)
+            await self.raw_logger.log(raw_event)
+            authority = self.dean_contract.node_state(frame.mac).authority
+            estimator_commands = self.estimator.handle(raw_event)
+            sent_commands = (
+                []
+                if authority in {SLIMHUB_CONFIRMED, LOCAL_STANDALONE}
+                else await self._send_unitspace_commands(estimator_commands)
             )
+            if frame.parsed.flag_sound == 1:
+                node = self.dean_contract.node_state(frame.mac)
+                class_count = node.class_count
+                scores = (
+                    list(frame.parsed.sound[:class_count])
+                    if class_count is not None and 1 <= class_count <= 16
+                    else []
+                )
+                await self.raw_logger.log_structured(
+                    StructuredEvent(
+                        timestamp=timestamp,
+                        kind="raw_sound_metadata",
+                        mac=frame.mac,
+                        data={
+                            "raw_scores": scores,
+                            "class_count": class_count,
+                            "semantic": node.semantic,
+                            "profile": node.profile,
+                            "location": node.location or config.location,
+                            "model": node.model,
+                            "semantic_ready": (
+                                str(node.semantic or "").lower() in {"1", "true", "ready"}
+                                and str(node.config or "").upper() == "READY"
+                            ),
+                        },
+                    )
+                )
             await self._log_estimator_records()
             self._log_commands(sent_commands)
         elif isinstance(frame.parsed, AlertPacket):
             config = self.config_store.load(frame.mac)
             self.config_store.save(config)
             timestamp = time.time()
-            event = AlertEvent(
+            alert_event = AlertEvent(
                 timestamp=timestamp,
                 mac=frame.mac,
                 location=config.location,
@@ -359,7 +484,7 @@ class SlimHubDaemon:
                 device_type=config.type,
             )
             self.power_shadow.update_alert(frame.mac, frame.parsed.message, timestamp)
-            await self.raw_logger.log_alert(event)
+            await self.raw_logger.log_alert(alert_event)
         elif isinstance(frame.parsed, ReportPacket):
             config = self.config_store.load(frame.mac)
             self.config_store.save(config)
@@ -448,6 +573,7 @@ class SlimHubDaemon:
         else:
             self.power_shadow.mark_disconnected(address, timestamp)
             self.sound_capture.handle_disconnect(address, timestamp)
+        self.dean_contract.handle_connection(address, connected, timestamp)
         await self.raw_logger.log_connection_state(
             ConnectionStateEvent(
                 timestamp=timestamp,
@@ -458,6 +584,8 @@ class SlimHubDaemon:
         )
         state = "connected" if connected else "disconnected"
         self.logger.info("%s %s", address, state)
+        if connected:
+            await self._initialize_node_session(address, timestamp)
 
     async def handle_command_result(
         self,
@@ -522,11 +650,12 @@ class SlimHubDaemon:
                 )
                 continue
             sent_commands.append(command)
-            self.power_shadow.update_command_hint(
-                command.address,
-                command.command,
-                time.time(),
-            )
+            if command.command in VALID_COMMANDS:
+                self.power_shadow.update_command_hint(
+                    command.address,
+                    command.command,
+                    time.time(),
+                )
             await self.raw_logger.log_structured(
                 StructuredEvent(
                     timestamp=time.time(),
@@ -545,6 +674,27 @@ class SlimHubDaemon:
                 )
             )
         return sent_commands
+
+    async def _initialize_node_session(self, address: str, timestamp: float) -> None:
+        """Queue the once-per-link DEAN initialization sequence after notify setup."""
+        config = self.config_store.load(address)
+        for payload in (build_time_sync_command(timestamp), "node_status", "config_get"):
+            sent = await self.registry.send_command(
+                CommandEvent(
+                    address=normalize_mac(address),
+                    command=payload,
+                    location=config.location,
+                    canonical_node_id=normalize_mac(address),
+                    created_at=timestamp,
+                )
+            )
+            if not sent:
+                self.logger.warning(
+                    "Unable to queue Node initialization address=%s command=%s",
+                    address,
+                    payload.split(",", 1)[0],
+                )
+                return
 
     async def _log_estimator_records(self) -> None:
         for record in self.estimator.drain_records():
@@ -566,6 +716,25 @@ class SlimHubDaemon:
             await self._log_multimodal_records()
             return
         src = event.packet.fields.get("src", "").upper()
+        contract_commands = self.dean_contract.handle_report(event)
+        if src in {"NODE", "CONFIG"}:
+            self._remember_sound_schema(event.mac, event.packet)
+        if (
+            src == "CONFIG"
+            and event.packet.fields.get("event", "").upper() == "APPLIED"
+            and event.packet.fields.get("location")
+        ):
+            self.config_store.set_field(
+                event.mac,
+                "location",
+                event.packet.fields["location"],
+            )
+        if contract_commands:
+            sent_contract_commands = await self._send_unitspace_commands(
+                contract_commands
+            )
+            self._log_commands(sent_contract_commands)
+        await self._log_contract_records()
         if src == "USD":
             self._remember_usd_status(
                 event.mac,
@@ -584,8 +753,25 @@ class SlimHubDaemon:
         if src == "INOUT":
             self.multimodal.handle_inout(event)
             self.power_shadow.update_report(event.mac, event.packet, event.timestamp)
-            sent_commands = await self._send_unitspace_commands(
-                self.estimator.handle_report(event)
+            fields = event.packet.fields
+            node_authority = self.dean_contract.node_state(event.mac).authority
+            schema2_candidate = (
+                fields.get("event", "").upper() in {"ENTER", "EXIT"}
+                and bool(fields.get("bid") or fields.get("boot_id"))
+                and bool(fields.get("cid") or fields.get("event_seq"))
+            )
+            use_contract_authority = (
+                node_authority in {SLIMHUB_CONFIRMED, LOCAL_STANDALONE}
+                or schema2_candidate
+                or fields.get("event", "").upper()
+                in {"CONFIRM_ACK", "CONFIRM_ERROR"}
+            )
+            sent_commands = (
+                []
+                if use_contract_authority
+                else await self._send_unitspace_commands(
+                    self.estimator.handle_report(event)
+                )
             )
             await self._log_estimator_records()
             self._log_commands(sent_commands)
@@ -602,6 +788,17 @@ class SlimHubDaemon:
             if src == "SOUND":
                 self.sound_capture.handle_report(event)
             self._remember_sound_schema(event.mac, event.packet)
+
+    async def _log_contract_records(self) -> None:
+        for record in self.dean_contract.drain_records():
+            await self.raw_logger.log_structured(
+                StructuredEvent(
+                    timestamp=record.timestamp,
+                    kind=record.kind,
+                    mac=record.mac,
+                    data=dict(record.data),
+                )
+            )
 
     async def _log_multimodal_records(self) -> None:
         for record in self.multimodal.drain_records():
@@ -775,7 +972,7 @@ class SlimHubDaemon:
                 args.get("location"),
             )
             request_result = await self.send_command(address, args.get("command"))
-            request_id = int(request_result["sound_request_id"])
+            request_id = int(str(request_result["sound_request_id"]))
             wait_for_terminal = bool(args.get("wait", True))
             timeout = float(
                 args.get(
@@ -842,12 +1039,45 @@ class SlimHubDaemon:
                 }
             )
         if command == "sound.snapshot":
-            address = self.resolve_device_target(
+            optional_address = self.resolve_device_target(
                 args.get("address"),
                 args.get("location"),
             ) if args.get("address") or args.get("location") else None
             return self._ok(
-                self.sound_capture.snapshot(str(address) if address else None)
+                self.sound_capture.snapshot(
+                    str(optional_address) if optional_address else None
+                )
+            )
+        if command == "node.status":
+            return self._ok(
+                await self.node_status(
+                    args.get("address"),
+                    location=args.get("location"),
+                    refresh=bool(args.get("refresh", True)),
+                )
+            )
+        if command == "node.config.get":
+            return self._ok(
+                await self.node_config_get(
+                    args.get("address"),
+                    location=args.get("location"),
+                )
+            )
+        if command == "node.config.set":
+            return self._ok(
+                await self.node_config_set(
+                    args.get("address"),
+                    args.get("node_location"),
+                    args.get("profile"),
+                    target_location=args.get("location"),
+                )
+            )
+        if command == "node.config.reload":
+            return self._ok(
+                await self.node_config_reload(
+                    args.get("address"),
+                    location=args.get("location"),
+                )
             )
         if command == "config.set":
             return self._ok(
@@ -908,26 +1138,35 @@ class SlimHubDaemon:
         if command == "multimodal.status":
             return self._ok(self.multimodal.snapshot())
         if command == "power.status":
-            address = self.resolve_device_target(
+            optional_address = self.resolve_device_target(
                 args.get("address"),
                 args.get("location"),
             ) if args.get("address") or args.get("location") else None
             return self._ok(
-                self.power_shadow.snapshot(str(address)) if address else self.power_shadow.snapshot()
+                self.power_shadow.snapshot(str(optional_address))
+                if optional_address
+                else self.power_shadow.snapshot()
             )
         if command == "battery.status":
-            address = self.resolve_device_target(
+            optional_address = self.resolve_device_target(
                 args.get("address"),
                 args.get("location"),
             ) if args.get("address") or args.get("location") else None
-            return self._ok(await self._battery_status_payload(address))
+            return self._ok(await self._battery_status_payload(optional_address))
         if command == "raw.tail":
-            address = self.resolve_device_target(
+            optional_address = self.resolve_device_target(
                 args.get("address"),
                 args.get("location"),
             ) if args.get("address") or args.get("location") else None
-            lines = int(args.get("lines", 20))
-            return self._ok({"lines": self._tail_raw(str(address) if address else None, lines)})
+            lines = int(str(args.get("lines", 20)))
+            return self._ok(
+                {
+                    "lines": self._tail_raw(
+                        str(optional_address) if optional_address else None,
+                        lines,
+                    )
+                }
+            )
 
         raise ValueError(f"unknown command: {command!r}")
 
@@ -1027,7 +1266,12 @@ class SlimHubDaemon:
 
     def _remember_sound_schema(self, mac: str, report: ReportPacket) -> None:
         fields = report.fields
-        version = fields.get("schema_version") or fields.get("sound_schema")
+        version = (
+            fields.get("profile")
+            or fields.get("sound_profile")
+            or fields.get("schema_version")
+            or fields.get("sound_schema")
+        )
         if version is None and fields.get("schema") == "1":
             version = "b-tflm-v1"
         class_count = _int_or_none(fields.get("class_count"))

@@ -68,6 +68,11 @@ class AppPaths:
         return self.programdata_dir / "deployment_manifest.json"
 
     @property
+    def node_state_path(self) -> Path:
+        """Latest MAC-scoped DEAN Node v2 status/configuration metadata."""
+        return self.programdata_dir / "dean_node_state.json"
+
+    @property
     def display_path(self) -> Path:
         """Current operator-facing display feed (append-only text)."""
         return self.programdata_dir / "display.txt"

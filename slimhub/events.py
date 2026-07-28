@@ -19,6 +19,9 @@ class RawDataEvent:
     receipt_timestamp: float | None = None
     sound_schema_version: str | None = None
     sound_class_count: int | None = None
+    sound_semantic_ready: bool | None = None
+    sound_profile: str | None = None
+    sound_model: str | None = None
 
 
 @dataclass(frozen=True)
