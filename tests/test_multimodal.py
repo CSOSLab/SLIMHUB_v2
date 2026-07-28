@@ -76,6 +76,81 @@ def json_report(
 
 
 class MultimodalStoreTests(unittest.TestCase):
+    def test_schema2_sound_semantics_are_location_profile_scoped(self) -> None:
+        store = self.make_store()
+        store.handle(
+            report(
+                MAC_A,
+                "EVENT",
+                "SOUND",
+                schema=2,
+                session_seq=7,
+                event_ts_ms=1200,
+                class_index=4,
+                class_count=9,
+                semantic=1,
+                profile="kitchen_v1",
+                location="KITCHEN",
+                model="cafebabe",
+            )
+        )
+        store.handle(
+            report(
+                MAC_B,
+                "EVENT",
+                "SOUND",
+                schema=2,
+                session_seq=7,
+                event_ts_ms=1200,
+                class_index=4,
+                class_count=10,
+                semantic=1,
+                profile="toilet_v1",
+                location="TOILET",
+                model="deadbeef",
+            )
+        )
+
+        features = [
+            record.data
+            for record in store.drain_records()
+            if record.kind == "feature"
+        ]
+
+        self.assertEqual(features[0]["label"], "cooking")
+        self.assertEqual(features[1]["label"], "brushing")
+        self.assertEqual(features[0]["class_index"], 4)
+        self.assertEqual(features[0]["model"], "cafebabe")
+
+    def test_schema2_sound_semantic_zero_is_fail_safe_and_deduplicated(self) -> None:
+        store = self.make_store()
+        event = report(
+            MAC_A,
+            "EVENT",
+            "SOUND",
+            schema=2,
+            session_seq=9,
+            event_ts_ms=1500,
+            class_index=4,
+            class_count=9,
+            semantic=0,
+            profile="kitchen_v1",
+            location="KITCHEN",
+        )
+
+        store.handle(event)
+        store.handle(event)
+        records = store.drain_records()
+        feature = next(record for record in records if record.kind == "feature")
+
+        self.assertIsNone(feature.data["label"])
+        self.assertIn("semantic_unavailable", feature.data["errors"])
+        self.assertEqual(
+            sum(record.kind == "feature" for record in records),
+            1,
+        )
+        self.assertTrue(any(record.kind == "multimodal_replay" for record in records))
+
     def make_store(self, manifest: dict[str, object] | None = None) -> MultimodalReportStore:
         self.tmpdir = tempfile.TemporaryDirectory()
         path = Path(self.tmpdir.name) / "deployment_manifest.json"

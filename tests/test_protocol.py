@@ -17,6 +17,7 @@ from slimhub.protocol.nus import (
     build_frame,
     build_record_command,
     build_sound_background_command,
+    build_sound_auto_command,
     build_sound_start_command,
     parse_frame,
 )
@@ -352,6 +353,62 @@ class ProtocolTests(unittest.TestCase):
     def test_command_frame_rejects_unknown_command(self) -> None:
         with self.assertRaisesRegex(ValueError, "command must be one of"):
             build_command_frame("AA:BB:CC:DD:EE:FF", "stay")
+
+    def test_report_payload_boundaries_and_embedded_nul(self) -> None:
+        prefix = b"src=EVENT,event=ENV,schema=2,"
+        payload_256 = prefix + b"x" * (256 - len(prefix))
+        payload_257 = payload_256 + b"x"
+
+        parsed = parse_frame(
+            build_frame("AA:BB:CC:DD:EE:FF", "REPORT", payload_256)
+        )
+
+        self.assertEqual(parsed.packet_length, 256)
+        with self.assertRaisesRegex(PacketParseError, "exceeds 256"):
+            parse_frame(build_frame("AA:BB:CC:DD:EE:FF", "REPORT", payload_257))
+        with self.assertRaisesRegex(PacketParseError, "embedded NUL"):
+            parse_frame(
+                build_frame(
+                    "AA:BB:CC:DD:EE:FF",
+                    "REPORT",
+                    b"src=NODE,event=STATUS\x00",
+                )
+            )
+
+    def test_report_aliases_are_normalized_without_dropping_original_fields(self) -> None:
+        parsed = parse_frame(
+            build_frame(
+                "AA:BB:CC:DD:EE:FF",
+                "REPORT",
+                (
+                    b"src=INOUT,event=ENTER,boot_id=a1b2c3d4,"
+                    b"event_seq=7,event_ts_ms=123,future=kept"
+                ),
+            )
+        ).parsed
+
+        self.assertEqual(parsed.fields["bid"], "a1b2c3d4")
+        self.assertEqual(parsed.fields["cid"], "7")
+        self.assertEqual(parsed.fields["timestamp"], "123")
+        self.assertEqual(parsed.fields["future"], "kept")
+        self.assertEqual(parsed.fields["boot_id"], "a1b2c3d4")
+
+    def test_command_payload_over_128_bytes_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "1-128 bytes"):
+            build_command_frame("AA:BB:CC:DD:EE:FF", "x" * 129)
+
+    def test_sound_auto_uses_node_thresholds_unless_both_overrides_are_given(self) -> None:
+        default = build_sound_auto_command()
+        override = build_sound_auto_command(open_db=60, close_db=55)
+
+        self.assertEqual(default, "sound_auto,max=300,silence=20")
+        self.assertNotIn("open_db", default)
+        self.assertEqual(
+            override,
+            "sound_auto,max=300,silence=20,open_db=60,close_db=55",
+        )
+        with self.assertRaisesRegex(ValueError, "requires both"):
+            build_sound_auto_command(open_db=60)
 
 
 if __name__ == "__main__":

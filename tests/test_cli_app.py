@@ -316,6 +316,99 @@ class CliAppTests(unittest.TestCase):
         self.assertEqual(call.args[1], "sound.status")
         self.assertIn('"storage": "node_sd"', output)
 
+    def test_sound_automatic_omits_default_thresholds_and_accepts_pair_override(self) -> None:
+        status, call, _ = self.run_command_cli(
+            ["sound", "automatic", "--address", ADDRESS, "--no-wait"],
+            sound_response(status="armed", reason="accepted"),
+        )
+        override_status, override_call, _ = self.run_command_cli(
+            [
+                "sound",
+                "automatic",
+                "--address",
+                ADDRESS,
+                "--open-db",
+                "60",
+                "--close-db",
+                "55",
+                "--no-wait",
+            ],
+            sound_response(status="armed", reason="accepted"),
+        )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            call.args[2]["command"],
+            "sound_auto,max=300,silence=20",
+        )
+        self.assertEqual(override_status, 0)
+        self.assertEqual(
+            override_call.args[2]["command"],
+            "sound_auto,max=300,silence=20,open_db=60,close_db=55",
+        )
+
+    def test_sound_automatic_rejects_only_one_threshold_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("slimhub.cli.app.send_request_sync") as send:
+                with patch("sys.stderr", new_callable=io.StringIO):
+                    status = run_cli(
+                        [
+                            "--base-dir",
+                            tmpdir,
+                            "sound",
+                            "automatic",
+                            "--address",
+                            ADDRESS,
+                            "--open-db",
+                            "60",
+                        ]
+                    )
+
+        self.assertEqual(status, 1)
+        send.assert_not_called()
+
+    def test_node_status_and_config_commands_use_node_api(self) -> None:
+        status, status_call, _ = self.run_command_cli(
+            ["node", "status", "--address", ADDRESS],
+            {"cached": {}},
+        )
+        get_status, get_call, _ = self.run_command_cli(
+            ["node", "config", "get", "--address", ADDRESS],
+            {"cached": {}},
+        )
+        set_status, set_call, _ = self.run_command_cli(
+            [
+                "node",
+                "config",
+                "set",
+                "--address",
+                ADDRESS,
+                "--node-location",
+                "KITCHEN",
+                "--profile",
+                "kitchen_v1",
+            ],
+            {"cached": {}},
+        )
+        reload_status, reload_call, _ = self.run_command_cli(
+            ["node", "config", "reload", "--address", ADDRESS],
+            {"cached": {}},
+        )
+
+        self.assertEqual((status, get_status, set_status, reload_status), (0, 0, 0, 0))
+        self.assertEqual(status_call.args[1], "node.status")
+        self.assertEqual(get_call.args[1], "node.config.get")
+        self.assertEqual(set_call.args[1], "node.config.set")
+        self.assertEqual(
+            set_call.args[2],
+            {
+                "address": ADDRESS,
+                "node_location": "KITCHEN",
+                "profile": "kitchen_v1",
+            },
+        )
+        self.assertEqual(reload_call.args[1], "node.config.reload")
+
     def test_sound_cli_rejects_invalid_label_and_ranges(self) -> None:
         parser = build_parser()
         invalid_arguments = (

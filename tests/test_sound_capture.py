@@ -9,6 +9,7 @@ from slimhub.config import AppPaths
 from slimhub.events import ReportEvent
 from slimhub.protocol.nus import (
     ReportPacket,
+    build_sound_auto_command,
     build_sound_background_command,
     build_sound_start_command,
 )
@@ -372,6 +373,81 @@ class SoundCaptureStoreTests(unittest.IsolatedAsyncioTestCase):
         result = await waiter
         self.assertTrue(result["success"])
         self.assertEqual(result["reason"], "command_stop")
+
+    async def test_automatic_capture_uses_armed_values_and_capture_complete(self) -> None:
+        store = SoundCaptureStore()
+        request_id = store.register_command(
+            MAC,
+            build_sound_auto_command(),
+            100.0,
+        )
+        store.handle_report(
+            report_event(
+                101.0,
+                "CAPTURE_ARMED",
+                label="automatic",
+                mode="automatic",
+                threshold_rms=912,
+                open_db=57,
+                close_db=52,
+                max_ms=300000,
+                silence_ms=20000,
+            )
+        )
+        store.handle_report(
+            report_event(
+                102.0,
+                "CAPTURE_COMPLETE",
+                label="automatic",
+                reason="silence",
+            )
+        )
+
+        result = await store.wait_for_request(
+            request_id,
+            terminal=True,
+            timeout=0.1,
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["session"]["mode"], "automatic")
+        self.assertEqual(result["session"]["threshold_rms"], 912)
+        self.assertEqual(result["session"]["open_db"], 57)
+        self.assertEqual(result["session"]["close_db"], 52)
+        self.assertEqual(result["session"]["max_ms"], 300000)
+        self.assertEqual(result["session"]["silence_ms"], 20000)
+
+    async def test_command_error_must_match_pending_sound_command(self) -> None:
+        store = SoundCaptureStore()
+        request_id = store.register_command(
+            MAC,
+            build_sound_auto_command(),
+            100.0,
+        )
+
+        store.handle_report(
+            report_event(
+                101.0,
+                "COMMAND_ERROR",
+                command="sound_start",
+                reason="old_error",
+            )
+        )
+        store.handle_report(
+            report_event(
+                102.0,
+                "CAPTURE_ARMED",
+                label="automatic",
+                mode="automatic",
+            )
+        )
+
+        result = await store.wait_for_request(
+            request_id,
+            terminal=False,
+            timeout=0.1,
+        )
+        self.assertTrue(result["success"])
 
 
 if __name__ == "__main__":

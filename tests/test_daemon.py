@@ -199,6 +199,140 @@ def audio_frame(address: str) -> ParsedFrame:
 
 
 class DaemonTests(unittest.IsolatedAsyncioTestCase):
+    async def test_connection_initializes_time_status_and_config_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            address = "AA:BB:CC:DD:EE:01"
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            session = FakeSession(address)
+            await daemon.registry.add(session)
+
+            await daemon.handle_connection_state(address, True, 100.0)
+
+            self.assertEqual(
+                [command.command.split(",", 1)[0] for command in session.commands],
+                ["time_sync", "node_status", "config_get"],
+            )
+            self.assertIn("epoch_ms=100000", session.commands[0].command)
+
+    async def test_schema2_candidate_uses_exact_confirmation_and_applied_ack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            address = "AA:BB:CC:DD:EE:01"
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            session = FakeSession(address)
+            await daemon.registry.add(session)
+            await daemon.handle_frame(
+                address,
+                report_frame(
+                    address,
+                    "src=NODE,event=STATUS,bid=a1b2c3d4,authority=slimhub_confirmed,"
+                    "occupancy=OUT,capture=IDLE,config=READY,semantic=1",
+                    {
+                        "src": "NODE",
+                        "event": "STATUS",
+                        "bid": "a1b2c3d4",
+                        "authority": "slimhub_confirmed",
+                        "occupancy": "OUT",
+                        "capture": "IDLE",
+                        "config": "READY",
+                        "semantic": "1",
+                    },
+                ),
+            )
+            await daemon.handle_frame(
+                address,
+                report_frame(
+                    address,
+                    "src=INOUT,event=ENTER,schema=2,bid=a1b2c3d4,cid=7,timestamp=100",
+                    {
+                        "src": "INOUT",
+                        "event": "ENTER",
+                        "schema": "2",
+                        "bid": "a1b2c3d4",
+                        "cid": "7",
+                        "timestamp": "100",
+                    },
+                ),
+            )
+            await daemon.flush_report_reorder_buffer()
+
+            self.assertEqual(len(session.commands), 1)
+            command = session.commands[0].command
+            self.assertTrue(
+                command.startswith(
+                    "inout_confirm,bid=a1b2c3d4,cid=7,state=in,rid="
+                )
+            )
+            rid = command.rsplit("=", 1)[1]
+            await daemon.handle_frame(
+                address,
+                report_frame(
+                    address,
+                    "src=INOUT,event=CONFIRM_ACK,schema=2,bid=a1b2c3d4,cid=7,"
+                    f"rid={rid},state=in,source=slimhub,applied=1,timestamp=101",
+                    {
+                        "src": "INOUT",
+                        "event": "CONFIRM_ACK",
+                        "schema": "2",
+                        "bid": "a1b2c3d4",
+                        "cid": "7",
+                        "rid": rid,
+                        "state": "in",
+                        "source": "slimhub",
+                        "applied": "1",
+                        "timestamp": "101",
+                    },
+                ),
+            )
+            await daemon.flush_report_reorder_buffer()
+
+            self.assertEqual(
+                daemon.dean_contract.snapshot(address)["occupancy"],
+                "IN",
+            )
+            self.assertIsNone(daemon.estimator.snapshot()["last_address"])
+
+    async def test_node_config_dispatch_waits_for_applied_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            address = "AA:BB:CC:DD:EE:01"
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            session = FakeSession(address)
+            await daemon.registry.add(session)
+            await daemon.handle_frame(
+                address,
+                report_frame(
+                    address,
+                    "src=NODE,event=STATUS,bid=a1b2c3d4,authority=slimhub_confirmed,"
+                    "occupancy=OUT,capture=IDLE,profile=toilet_v1,class_count=10",
+                    {
+                        "src": "NODE",
+                        "event": "STATUS",
+                        "bid": "a1b2c3d4",
+                        "authority": "slimhub_confirmed",
+                        "occupancy": "OUT",
+                        "capture": "IDLE",
+                        "profile": "toilet_v1",
+                        "class_count": "10",
+                    },
+                ),
+            )
+
+            response = await daemon.dispatch(
+                {
+                    "command": "node.config.set",
+                    "args": {
+                        "address": address,
+                        "node_location": "KITCHEN",
+                        "profile": "kitchen_v1",
+                    },
+                }
+            )
+
+            self.assertEqual(
+                session.commands[-1].command,
+                "config_set,location=KITCHEN,sound_profile=kitchen_v1",
+            )
+            self.assertEqual(response["data"]["cached"]["profile"], "toilet_v1")
+
     def test_json_device_requires_canonical_uppercase_colon_mac(self) -> None:
         address = "AA:BB:CC:DD:EE:01"
         frame = json_report_frame(
