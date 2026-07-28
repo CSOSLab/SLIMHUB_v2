@@ -122,6 +122,7 @@ slimhub-v2 sound start --location TOILET \
 
 slimhub-v2 sound background --location TOILET --max-seconds 10
 slimhub-v2 sound background --location TOILET --max-seconds 300 --no-wait
+slimhub-v2 sound automatic --location TOILET
 
 slimhub-v2 sound status --location TOILET
 slimhub-v2 sound stop --location TOILET
@@ -132,15 +133,15 @@ slimhub-v2 sound stop --location TOILET
 명령은 임의 label을 받지 않고 항상 `background`, threshold 0, silence 0을
 사용합니다. WAV는 Node의 `/sdcard/SOUND/<label>/<cid>.wav`에만 존재합니다.
 
-기본 `--wait`는 `CAPTURE_DONE`/`CAPTURE_CANCELLED`/`CAPTURE_ERROR`까지 CLI를
-유지합니다. 성공한 `CAPTURE_DONE,complete=1`만 exit code 0이고, 그 밖의 terminal이나
+기본 `--wait`는 `CAPTURE_DONE`/`CAPTURE_COMPLETE`/`CAPTURE_CANCELLED`/
+`CAPTURE_ERROR`까지 CLI를 유지합니다. 성공한 DONE/COMPLETE만 exit code 0이고, 그 밖의 terminal이나
 timeout은 non-zero입니다. `--no-wait`는 `CAPTURE_ARMED`와 cid를 확인한 뒤 반환합니다.
 `sound stop`도 기본적으로 terminal REPORT를 기다립니다. reconnect 중에도 정해진
 deadline 안에서는 같은 waiter가 유지되며 자동으로 새 capture를 시작하지 않습니다.
-completion timeout은 고정 15초가 아니라 Node의 WAV flush/fsync/CRC 시간을 고려해
+completion timeout은 고정 15초가 아니라 Node의 WAV flush/fsync 시간을 고려해
 `max-seconds + max(180초, max-seconds/2)`로 계산합니다. RMS-gated start에는 여기에
 ARM 대기 120초가 추가됩니다. 예를 들어 background 600초는 900초, gated start
-600초는 1020초까지 기다립니다. `sound stop`은 최대 길이 파일의 CRC 완료와 BLE
+600초는 1020초까지 기다립니다. `sound stop`은 최대 길이 파일 완료와 BLE
 재연결을 위해 1020초, `--no-wait`의 ARMED 확인은 180초까지 기다립니다.
 대화형 터미널에서 `--wait`/`--no-wait`를 모두 생략하면 최종 한 줄을 출력하기 전까지
 같은 줄에서 진행 막대와 ETA를 갱신합니다. background ETA는 `max-seconds` 기준 예상값,
@@ -256,52 +257,45 @@ MTU 또는 connection-interval bulk-transfer tuning은 사용하지 않습니다
 
 ### DEAN_Node_v2 PIR+RADAR IN/OUT
 
-현재 A(NCS) firmware에서 RAWDATA `flag_human_presence=1, detected=10`은
-PIR+RADAR가 확인한 **preliminary ENTER candidate**입니다. Central은 해당
-후보에 대해 원하는 node state를 명령하지만, BLE write만으로 점유를 확정하지
-않습니다. 같은 node의 `ENTER,code=10` REPORT는 RAW10 metadata sidecar이므로
-두 packet은 한 후보로 coalesce됩니다.
-
-`detected=1`은 legacy PIR-only low-confidence evidence입니다. flood가 나도
-strong occupancy transition이나 `enter` command를 만들지 않습니다. 점유
-전이는 `EVENT id=C0/C1` command application ACK 및 실제 전이가 발생한
-`SEQUENCE ... event_id=D0/D1`으로 확인·기록합니다. `SEQUENCE` REPORT는
-feedback loop를 막기 위해 estimator 후보로 다시 입력하지 않습니다.
-
-Firmware는 다음과 같은 IN/OUT report packet도 보냅니다.
+production Node는 `authority=slimhub_confirmed`를 사용합니다.
+RAWDATA `detected=10/20`은 PIR+RADAR ENTER/EXIT candidate이지만 bid/cid가
+없으므로 이것만으로 confirmation을 보내지 않습니다. 같은 MAC의 typed REPORT가
+boot/candidate identity를 제공한 뒤에만 다음 명령을 보냅니다.
 
 ```text
-src=INOUT,event=ENTER,signal=enter,code=10,boot_id=12ab34cd,event_seq=41,event_ts_ms=123456
-src=INOUT,event=EVENT,id=C0,boot_id=12ab34cd,primary_seq=41,occupied=1,target_match=1
-src=INOUT,event=SEQUENCE,result=ENTER_CONFIRMED,event_id=D0,boot_id=12ab34cd,event_seq=41,event_ts_ms=124000
-src=INOUT,event=STATE,occupied=1,boot_id=12ab34cd,event_ts_ms=124100
-src=USD,event=STATUS,uptime=12345,file=LOG/001.CSV,ok=1,batt_valid=1,batt_v=3.980,batt_mv=3980,batt_pct=75,batt_rem_mah=1125,batt_cap_mah=1500,usb=0,chg=1,sd=0
+src=INOUT,event=ENTER,schema=2,boot_id=12ab34cd,event_seq=41,event_ts_ms=123456
+inout_confirm,bid=12ab34cd,cid=41,state=in,rid=<nonzero-hex>
+src=INOUT,event=CONFIRM_ACK,schema=2,bid=12ab34cd,cid=41,rid=...,state=in,source=slimhub,applied=1
 ```
 
-frame MAC, BLE alias, boot/sequence ID와 node uptime은 메모리 상태에서 처리하고,
-확정 IN/OUT과 inference만 `data/`에 저장합니다. full audit를 명시적으로 켠 경우에만
-RAW/REPORT/command record를 `programdata/reports/*.jsonl`에 저장합니다. 서로 다른 node의
-`event_ts_ms`는 직접 비교하지 않고 `(MAC, boot_id)`별 clock offset으로
-정규화합니다.
+상태는 Node `(MAC)`, candidate `(MAC,bid,cid)`, command
+`(MAC,bid,cid,rid)`로 분리됩니다. 정확히 일치하는
+`CONFIRM_ACK,source=slimhub,applied=1`만 authoritative입니다. reconnect 후
+NODE/STATUS의 bid가 바뀌면 이전 pending transaction은 stale로 종료됩니다.
+`no_pending_candidate`는 45초 window 안에서 새 rid로 한 번만 retry합니다.
+`authority=local_standalone`은 시험 전용이며 Central confirmation을 억제하고
+`source=local,applied=1` 결과만 관찰합니다.
 
-새 PIR+RADAR flow를 하드웨어에서 확인할 때는 다음 명령을 사용합니다.
+notification subscription 직후 연결 session마다 `time_sync`, `node_status`,
+`config_get`을 순서대로 전송합니다. 상태/config cache는 MAC별로
+`programdata/dean_node_state.json`에 저장됩니다.
 
 ```bash
 slimhub-v2 --debug --run --scan-timeout 8 --scan-interval 5
+slimhub-v2 node status --address AA:BB:CC:DD:EE:FF
+slimhub-v2 node config get --address AA:BB:CC:DD:EE:FF
+slimhub-v2 node config set --address AA:BB:CC:DD:EE:FF \
+  --node-location KITCHEN --profile kitchen_v1
+slimhub-v2 node config reload --address AA:BB:CC:DD:EE:FF
 slimhub-v2 raw tail --address AA:BB:CC:DD:EE:FF --lines 20
 slimhub-v2 unitspace status
-slimhub-v2 power status --address AA:BB:CC:DD:EE:FF
-slimhub-v2 battery status --address AA:BB:CC:DD:EE:FF
-tail -n 50 programdata/logging.log
 ```
 
-Outbound unitspace command는 NUS RX로 `COMMAND` frame을 보내는 방식입니다.
-현재 배포 firmware와의 호환을 위해 frame MAC은 target node MAC이고 payload는
-여전히 UTF-8 `enter`/`exit`입니다. Central은 노드별 최종 desired state만
-보관해 reconnect FIFO 재생을 방지하며, C0/C1 ACK 또는 reconnect `STATE`로
-수렴합니다. 다음 revision의 `cmd_id`, desired epoch, canonical node ID/alias
-계약은 [docs/command-protocol-v2.md](docs/command-protocol-v2.md)에 정리돼
-있습니다.
+`config_set/config_reload`는 cached occupancy OUT, capture IDLE일 때만
+허용하며 CONFIG/APPLIED가 오기 전에는 cached configuration을 바꾸지 않습니다.
+전체 wire/correlation 계약은
+[docs/command-protocol-v2.md](docs/command-protocol-v2.md), 운영 절차는
+[docs/dean-node-v2-integration.md](docs/dean-node-v2-integration.md)에 있습니다.
 
 ## Multimodal EVENT / ADL reports
 
@@ -355,13 +349,26 @@ JSON key, future schema, 31자를 넘은 sequence와 malformed JSON도 parser를
 
 ## Sound schema
 
-현재 B TFLM schema는 `b-tflm-v1`, `class_count=10`입니다. score 8/9는
-`watering_low`/`watering_high`이고 `microwave`/`cooking`이 아닙니다. SOUND
-REPORT는 `src=EVENT,event=SOUND,schema=1,class_count=10`을 포함해야 하며,
-index 7은 `flushing_end`입니다. RAWDATA의 zero padding score는 0.5로
-dequantize하지 않고 빈 값으로 기록합니다. RAW score window와 firmware가 여러
-window를 합쳐 확정한 `EVENT/SOUND` run은 별도 telemetry이며, Central은 이를
-ADL evidence로 중복 합산하지 않습니다.
+sound class index는 전역 semantic이 아닙니다. TOILET/toilet_v1은 10개,
+KITCHEN/kitchen_v1은 9개, LIVING/BEDROOM/living_v1은 5개 class입니다.
+예를 들어 index 4는 KITCHEN에서 `cooking`, TOILET에서 `brushing`,
+LIVING/BEDROOM에서 `snoring`입니다. Node REPORT의 semantic/profile/location/
+class_count/model을 함께 저장하고 `semantic=0` 또는 config not READY면 label을
+추측하지 않습니다. RAWDATA의 16개 int8 slot 중 class_count 이후 padding은
+score가 아니며 zero padding을 0.5로 변환하지 않습니다.
+
+automatic capture 기본값은 Node에 저장된 57/52 dB를 사용하므로 threshold를
+전송하지 않습니다.
+
+```bash
+slimhub-v2 sound automatic --location KITCHEN
+slimhub-v2 sound automatic --location KITCHEN \
+  --open-db 60 --close-db 55 --max-seconds 300 --silence-seconds 20
+```
+
+`--open-db`와 `--close-db`는 반드시 함께 지정합니다. CAPTURE_ARMED가 보고한
+실제 cid/mode/threshold/max/silence 값을 authoritative metadata로 저장하며,
+CAPTURE_SEGMENT와 CAPTURE_COMPLETE를 포함한 장시간 capture를 기다릴 수 있습니다.
 
 ## Shadow Power State
 

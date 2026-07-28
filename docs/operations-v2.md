@@ -35,7 +35,12 @@ Check startup and connected devices:
 ```bash
 tail -n 50 logs/slimhub-v2.out
 slimhub-v2 --list
+slimhub-v2 node status --address AA:BB:CC:DD:EE:FF
 ```
+
+Every connection queues `time_sync`, `node_status`, then `config_get` after
+notification subscription. Production status must report
+`authority=slimhub_confirmed`. `local_standalone` is test-only.
 
 Stop it after a deployment check with `slimhub-v2 --quit`.
 
@@ -50,9 +55,10 @@ matching legacy-compatible JSON is written under each node's
 node's `inference/rawdata/YYYY-MM-DD.txt`. On startup, existing feature-only
 lines are removed from the current display and today's text archive.
 
-`SLIMHUB_AUDIT_JSONL=minimal` is the default and writes only malformed/security
-or processing errors under `programdata/reports/`. Use `full` only for a short
-diagnostic session; normal RAW/REPORT duplication is intentionally disabled.
+`SLIMHUB_AUDIT_JSONL=minimal` is the default. It writes malformed/security
+errors plus lossless schema-2 NODE/CONFIG/INOUT/EVENT/ADL/SOUND contract
+records under `programdata/reports/`. Use `full` only for short raw transport
+diagnostics.
 
 During the schema 2 migration, JSON `EVENT` and `INFERENCE` records share the
 same framed NUS `REPORT` transport as typed CSV records. The display uses the
@@ -89,19 +95,20 @@ slimhub-v2 sound start --location KITCHEN \
   --silence-seconds 5
 slimhub-v2 sound background --location KITCHEN --max-seconds 10
 slimhub-v2 sound background --location KITCHEN --max-seconds 300 --no-wait
+slimhub-v2 sound automatic --location KITCHEN
 slimhub-v2 sound status --location KITCHEN
 slimhub-v2 sound stop --location KITCHEN
 ```
 
 The default wait exits only after a terminal REPORT. A successful
-`CAPTURE_DONE,complete=1` returns zero; incomplete/cancelled/error/timeout returns
+`CAPTURE_DONE` or `CAPTURE_COMPLETE` returns zero; incomplete/cancelled/error/timeout returns
 non-zero. `--no-wait` returns after `CAPTURE_ARMED` confirms the cid. Node WAVs are
 stored under `/sdcard/SOUND/<label>/<cid>.wav`; there is no Central sound directory
 or BLE completeness manifest. On an interactive terminal, omitting both wait
 options displays an in-place progress bar and ETA. Background uses `max-seconds`
 as its estimate; gated start shows an upper bound that includes the ARM timeout.
 Explicit `--wait` and non-interactive pipe/cron runs stay quiet until the final line.
-The terminal wait deadline scales for uSD WAV flush/fsync/CRC:
+The terminal wait deadline scales for uSD WAV flush/fsync:
 `max_seconds + max(180 seconds, max_seconds / 2)`, plus the 120-second ARM window
 for gated start. Stop waits up to 1020 seconds and no-wait ARMED confirmation up
 to 180 seconds, allowing BLE reconnect and cached terminal REPORT delivery.
