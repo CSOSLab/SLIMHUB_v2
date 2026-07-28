@@ -12,7 +12,14 @@ from pathlib import Path
 from slimhub.ble.central import BleCentral
 from slimhub.ble.registry import DeviceRegistry
 from slimhub.ble.scanner import discover_named_devices
-from slimhub.config import DEFAULT_DEVICE_TYPE, AppPaths, DeviceConfigStore, HubConfigStore
+from slimhub.config import (
+    DEFAULT_DEVICE_TYPE,
+    AppPaths,
+    DeviceConfigStore,
+    HubConfigStore,
+    is_assigned_location,
+    location_key,
+)
 from slimhub.events import (
     AlertEvent,
     CommandEvent,
@@ -26,7 +33,7 @@ from slimhub.multimodal import DeploymentManifestStore, MultimodalReportStore
 from slimhub.protocol.nus import (
     DEFAULT_DEVICE_NAME,
     AlertPacket,
-    AudioPacket,
+    IgnoredPacket,
     ParsedFrame,
     RawDataPacket,
     ReportPacket,
@@ -56,6 +63,16 @@ USD_STATUS_FIELDS = (
 )
 DEFAULT_CONNECT_TIMEOUT = 10.0
 DEFAULT_NOTIFY_TIMEOUT = 5.0
+SOUND_STATUS_WAIT_SECONDS = 2.0
+DEFAULT_SOUND_ACCEPT_WAIT_SECONDS = 180.0
+DEFAULT_SOUND_CAPTURE_WAIT_SECONDS = 3600.0
+DEFAULT_SOUND_STOP_WAIT_SECONDS = 1020.0
+
+
+def _fill_sound_outcome_location(outcome: dict[str, object], location: str) -> None:
+    session = outcome.get("session")
+    if isinstance(session, dict) and session.get("location") in {None, "", "undefined"}:
+        session["location"] = location
 
 
 class SlimHubDaemon:
@@ -139,13 +156,6 @@ class SlimHubDaemon:
             await self.connect_address(address)
         if scan:
             tasks.append(asyncio.create_task(self._scan_loop(), name="ble-scan"))
-        tasks.append(
-            asyncio.create_task(
-                self._sound_capture_timeout_loop(),
-                name="sound-capture-timeouts",
-            )
-        )
-
         try:
             await self.stop_event.wait()
         finally:
@@ -158,7 +168,6 @@ class SlimHubDaemon:
                 await asyncio.gather(self._report_reorder_task, return_exceptions=True)
                 self._report_reorder_task = None
             await self.registry.stop_all()
-            self.sound_capture.close_all()
             await self.raw_logger.stop()
             await self._stop_server()
 
@@ -171,15 +180,26 @@ class SlimHubDaemon:
         self.config_store.ensure(normalized, device_type=session.name or DEFAULT_DEVICE_TYPE)
         return session.status()
 
-    async def send_command(self, address: object, command: object) -> dict[str, object]:
-        if not isinstance(address, str) or not address:
-            raise ValueError("address is required")
+    def resolve_device_target(
+        self,
+        address: object | None,
+        location: object | None,
+    ) -> str:
+        return self.config_store.resolve_target(address=address, location=location)
+
+    async def send_command(
+        self,
+        address: object,
+        command: object,
+        *,
+        location: object | None = None,
+    ) -> dict[str, object]:
         if not isinstance(command, str):
             raise ValueError(
                 "command must be a supported NUS COMMAND payload"
             )
 
-        normalized_address = normalize_mac(address)
+        normalized_address = self.resolve_device_target(address, location)
         validated_command = validate_command_payload(command)
         session = await self.registry.get(normalized_address)
         if session is None:
@@ -195,7 +215,7 @@ class SlimHubDaemon:
             raise ValueError(
                 f"no active device session for address: {normalized_address}"
             )
-        self.sound_capture.register_command(
+        sound_request_id = self.sound_capture.register_command(
             normalized_address,
             validated_command,
             time.time(),
@@ -207,11 +227,34 @@ class SlimHubDaemon:
                 time.time(),
             )
 
-        return {
+        result = {
             "address": normalized_address,
+            "location": config.location,
             "command": validated_command,
             "session": session.status(),
         }
+        if sound_request_id is not None:
+            result["sound_request_id"] = sound_request_id
+        return result
+
+    def set_device_config(
+        self,
+        address: object,
+        location: object,
+        field: object,
+        value: object,
+    ) -> dict[str, object]:
+        normalized_address = self.resolve_device_target(address, location)
+        config, warning = self.config_store.set_field_unique(
+            normalized_address,
+            str(field),
+            str(value),
+        )
+        result = dict(config.__dict__)
+        result["warnings"] = [warning] if warning else []
+        if warning:
+            self.logger.warning("Device configuration warning: %s", warning)
+        return result
 
     async def apply_config(self) -> str:
         for config in self.config_store.list_all():
@@ -269,12 +312,12 @@ class SlimHubDaemon:
 
     async def handle_frame(self, source_address: str, frame: ParsedFrame) -> None:
         await self.registry.register_alias(frame.mac, source_address)
-        if isinstance(frame.parsed, AudioPacket):
-            self.sound_capture.handle_audio(
+        if isinstance(frame.parsed, IgnoredPacket):
+            self.logger.debug(
+                "Ignoring migration packet type=%s mac=%s bytes=%d",
+                frame.parsed.packet_type,
                 frame.mac,
-                source_address,
-                frame.parsed,
-                time.time(),
+                frame.parsed.payload_bytes,
             )
         elif isinstance(frame.parsed, RawDataPacket):
             config = self.config_store.load(frame.mac)
@@ -441,6 +484,12 @@ class SlimHubDaemon:
                     "ack_pending": True,
                 },
             )
+        )
+        self.sound_capture.handle_command_result(
+            command.address,
+            command.command,
+            succeeded,
+            error,
         )
 
     async def _scan_loop(self) -> None:
@@ -707,32 +756,108 @@ class SlimHubDaemon:
         if command == "devices":
             return self._ok(await self._devices_payload())
         if command == "connect":
-            return self._ok(await self.connect_address(str(args["address"])))
+            target = self.resolve_device_target(
+                args.get("address"),
+                args.get("location"),
+            )
+            return self._ok(await self.connect_address(target))
         if command == "command.send":
             return self._ok(
-                await self.send_command(args.get("address"), args.get("command"))
+                await self.send_command(
+                    args.get("address"),
+                    args.get("command"),
+                    location=args.get("location"),
+                )
             )
+        if command == "sound.capture":
+            address = self.resolve_device_target(
+                args.get("address"),
+                args.get("location"),
+            )
+            request_result = await self.send_command(address, args.get("command"))
+            request_id = int(request_result["sound_request_id"])
+            wait_for_terminal = bool(args.get("wait", True))
+            timeout = float(
+                args.get(
+                    "timeout",
+                    (
+                        DEFAULT_SOUND_CAPTURE_WAIT_SECONDS
+                        if wait_for_terminal
+                        else DEFAULT_SOUND_ACCEPT_WAIT_SECONDS
+                    ),
+                )
+            )
+            outcome = await self.sound_capture.wait_for_request(
+                request_id,
+                terminal=wait_for_terminal,
+                timeout=timeout,
+            )
+            _fill_sound_outcome_location(outcome, str(request_result["location"]))
+            return self._ok({"request": request_result, "outcome": outcome})
+        if command == "sound.stop":
+            address = self.resolve_device_target(
+                args.get("address"),
+                args.get("location"),
+            )
+            previous_revision = self.sound_capture.status_revision(address)
+            request_result = await self.send_command(address, "sound_stop")
+            if not bool(args.get("wait", True)):
+                return self._ok(
+                    {
+                        "request": request_result,
+                        "outcome": {
+                            "status": "queued",
+                            "success": True,
+                            "exit_code": 0,
+                            "reason": "stop_queued",
+                            "complete": None,
+                            "session": self.sound_capture.latest_session(address),
+                        },
+                    }
+                )
+            outcome = await self.sound_capture.wait_for_terminal_after(
+                address,
+                after=previous_revision,
+                timeout=float(args.get("timeout", DEFAULT_SOUND_STOP_WAIT_SECONDS)),
+            )
+            _fill_sound_outcome_location(outcome, str(request_result["location"]))
+            return self._ok({"request": request_result, "outcome": outcome})
         if command == "sound.status":
-            address = args.get("address")
+            address = self.resolve_device_target(
+                args.get("address"),
+                args.get("location"),
+            )
+            previous_revision = self.sound_capture.status_revision(address)
             request_result = await self.send_command(address, "sound_status")
+            fresh_report = await self.sound_capture.wait_for_status_revision(
+                address,
+                after=previous_revision,
+                timeout=SOUND_STATUS_WAIT_SECONDS,
+            )
             return self._ok(
                 {
                     "request": request_result,
+                    "fresh_report": fresh_report,
                     "capture": self.sound_capture.snapshot(str(address)),
                 }
             )
         if command == "sound.snapshot":
-            address = args.get("address")
+            address = self.resolve_device_target(
+                args.get("address"),
+                args.get("location"),
+            ) if args.get("address") or args.get("location") else None
             return self._ok(
                 self.sound_capture.snapshot(str(address) if address else None)
             )
         if command == "config.set":
-            config = self.config_store.set_field(
-                str(args["address"]),
-                str(args["field"]),
-                str(args["value"]),
+            return self._ok(
+                self.set_device_config(
+                    args.get("address"),
+                    args.get("location"),
+                    args.get("field"),
+                    args.get("value"),
+                )
             )
-            return self._ok(config.__dict__)
         if command == "config.apply":
             return self._ok(await self.apply_config())
         if command == "hub.config.set":
@@ -783,14 +908,24 @@ class SlimHubDaemon:
         if command == "multimodal.status":
             return self._ok(self.multimodal.snapshot())
         if command == "power.status":
-            address = args.get("address")
+            address = self.resolve_device_target(
+                args.get("address"),
+                args.get("location"),
+            ) if args.get("address") or args.get("location") else None
             return self._ok(
                 self.power_shadow.snapshot(str(address)) if address else self.power_shadow.snapshot()
             )
         if command == "battery.status":
-            return self._ok(await self._battery_status_payload(args.get("address")))
+            address = self.resolve_device_target(
+                args.get("address"),
+                args.get("location"),
+            ) if args.get("address") or args.get("location") else None
+            return self._ok(await self._battery_status_payload(address))
         if command == "raw.tail":
-            address = args.get("address")
+            address = self.resolve_device_target(
+                args.get("address"),
+                args.get("location"),
+            ) if args.get("address") or args.get("location") else None
             lines = int(args.get("lines", 20))
             return self._ok({"lines": self._tail_raw(str(address) if address else None, lines)})
 
@@ -798,7 +933,12 @@ class SlimHubDaemon:
 
     async def _devices_payload(self) -> list[dict[str, object]]:
         statuses = {item["address"]: item for item in await self.registry.list_status()}
-        for config in self.config_store.list_all():
+        configs = self.config_store.list_all()
+        locations: dict[str, list[str]] = {}
+        for config in configs:
+            if is_assigned_location(config.location):
+                locations.setdefault(location_key(config.location), []).append(config.address)
+        for config in configs:
             canonical = await self.registry.resolve_address(config.address)
             status = statuses.setdefault(
                 canonical,
@@ -816,6 +956,9 @@ class SlimHubDaemon:
             status["configured_name"] = config.name
             status["type"] = config.type
             status["location"] = config.location
+            conflicting_addresses = locations.get(location_key(config.location), [])
+            status["location_conflict"] = len(conflicting_addresses) > 1
+            status["location_conflict_devices"] = conflicting_addresses
         return list(statuses.values())
 
     def _tail_raw(self, address: str | None, lines: int) -> list[str]:
@@ -835,13 +978,6 @@ class SlimHubDaemon:
     async def _wait_or_stop(self, delay_seconds: float) -> None:
         with suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self.stop_event.wait(), timeout=delay_seconds)
-
-    async def _sound_capture_timeout_loop(self) -> None:
-        while not self.stop_event.is_set():
-            recovered = self.sound_capture.recover_timeouts()
-            if recovered:
-                self.logger.warning("Recovered %d timed-out SOUND capture(s)", recovered)
-            await self._wait_or_stop(1.0)
 
     def _ok(self, data: object) -> dict[str, object]:
         return {"ok": True, "data": data, "error": None}

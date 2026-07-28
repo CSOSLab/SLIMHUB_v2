@@ -55,16 +55,6 @@ class ConnectFailureClient:
         return None
 
 
-class MtuClient:
-    mtu_size = 517
-
-    def __init__(self) -> None:
-        self.requested: list[int] = []
-
-    async def request_mtu(self, mtu: int) -> None:
-        self.requested.append(mtu)
-
-
 class DeviceSessionQueueTests(unittest.IsolatedAsyncioTestCase):
     async def test_transient_ble_failure_is_concise_and_not_a_false_disconnect(self) -> None:
         states: list[bool] = []
@@ -130,13 +120,37 @@ class DeviceSessionQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(results[0][0])
         self.assertTrue(results[-1][0])
 
+    async def test_gatt_write_failure_requests_reconnect_and_preserves_command(self) -> None:
+        session = DeviceSession(
+            "AA:BB:CC:DD:EE:01",
+            on_frame=ignore_frame,
+            reconnect_delay=0.0,
+        )
+        await session.send_command(CommandEvent(session.address, "sound_stop", "TOILET"))
+        reconnect_requested = asyncio.Event()
+
+        await session._command_worker(FlakyClient(), reconnect_requested)
+
+        self.assertTrue(reconnect_requested.is_set())
+        self.assertEqual(session.status()["queued_commands"], 1)
+
+    async def test_reconnect_wait_has_timer_fallback_without_scanner_update(self) -> None:
+        session = DeviceSession(
+            "AA:BB:CC:DD:EE:01",
+            on_frame=ignore_frame,
+            reconnect_delay=0.001,
+        )
+        session._target_updated_event.clear()
+
+        await asyncio.wait_for(session._wait_for_reconnect(), timeout=0.1)
+
     async def test_sound_commands_remain_ordered_in_serial_writer_queue(self) -> None:
         session = DeviceSession("AA:BB:CC:DD:EE:01", on_frame=ignore_frame)
 
         await session.send_command(
             CommandEvent(
                 session.address,
-                "sound_start,label=pee,dest=ble,thr=800,max=60,silence=5",
+                "sound_start,label=pee,thr=800,max=60,silence=5",
                 "TOILET",
             )
         )
@@ -149,14 +163,6 @@ class DeviceSessionQueueTests(unittest.IsolatedAsyncioTestCase):
         second_key = await session._command_queue.get()
         self.assertEqual(session._pending_commands[first_key].command.split(",")[0], "sound_start")
         self.assertEqual(session._pending_commands[second_key].command, "sound_stop")
-
-    async def test_requests_esp32_preferred_mtu_when_supported(self) -> None:
-        session = DeviceSession("AA:BB:CC:DD:EE:01", on_frame=ignore_frame)
-        client = MtuClient()
-
-        await session._request_maximum_mtu(client)
-
-        self.assertEqual(client.requested, [517])
 
     async def test_notification_frames_are_dispatched_in_wire_order(self) -> None:
         handled: list[str] = []

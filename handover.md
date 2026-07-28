@@ -15,7 +15,6 @@ Recent integration commits:
 ## Implemented Central behavior
 
 ### IN/OUT event sequence
-
 - `RAWDATA detected=10` is a preliminary enter candidate, not confirmed occupancy.
 - Adjacent RAW10 and `src=INOUT,event=ENTER,code=10` sidecar reports are coalesced.
 - `detected=1` is low-confidence legacy PIR evidence and cannot create an occupancy transition.

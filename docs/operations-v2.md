@@ -16,7 +16,7 @@ Confirm the node is powered and advertising with the configured NUS device
 name. Before starting the daemon, set the location for a known MAC if needed:
 
 ```bash
-slimhub-v2 --config AA:BB:CC:DD:EE:FF location KITCHEN
+slimhub-v2 config set --address AA:BB:CC:DD:EE:FF location KITCHEN
 ```
 
 ## 2. Start SLIMHUB in the background
@@ -80,20 +80,31 @@ The daily, legacy-compatible display archive is
 ### Optional: capture labeled sound PCM
 
 Sound capture is opt-in and does not change the normal display, RAWDATA, REPORT,
-or IN/OUT flow. Arm a label, verify `ARMED`/`ACTIVE`, and stop it explicitly:
+or IN/OUT flow. WAV files exist only on the DEAN Node uSD card. BLE carries the
+command and lifecycle/completion REPORTs, never PCM or WAV binary:
 
 ```bash
-slimhub-v2 sound start --address AA:BB:CC:DD:EE:FF \
-  --label pee --dest both --threshold-rms 1200 --max-seconds 90 \
+slimhub-v2 sound start --location KITCHEN \
+  --label pee --threshold-rms 1200 --max-seconds 90 \
   --silence-seconds 5
-slimhub-v2 sound status --address AA:BB:CC:DD:EE:FF
-slimhub-v2 sound stop --address AA:BB:CC:DD:EE:FF
+slimhub-v2 sound background --location KITCHEN --max-seconds 10
+slimhub-v2 sound background --location KITCHEN --max-seconds 300 --no-wait
+slimhub-v2 sound status --location KITCHEN
+slimhub-v2 sound stop --location KITCHEN
 ```
 
-Inspect `data/sound/<NODE_MAC>/<label>/<cid>.json` before using its matching WAV.
-Only manifests with `complete=true`, zero drop counts, and no missing ranges belong
-in the default training dataset. Disconnect/timeout WAV files remain recoverable
-evidence but are deliberately marked incomplete.
+The default wait exits only after a terminal REPORT. A successful
+`CAPTURE_DONE,complete=1` returns zero; incomplete/cancelled/error/timeout returns
+non-zero. `--no-wait` returns after `CAPTURE_ARMED` confirms the cid. Node WAVs are
+stored under `/sdcard/SOUND/<label>/<cid>.wav`; there is no Central sound directory
+or BLE completeness manifest. On an interactive terminal, omitting both wait
+options displays an in-place progress bar and ETA. Background uses `max-seconds`
+as its estimate; gated start shows an upper bound that includes the ARM timeout.
+Explicit `--wait` and non-interactive pipe/cron runs stay quiet until the final line.
+The terminal wait deadline scales for uSD WAV flush/fsync/CRC:
+`max_seconds + max(180 seconds, max_seconds / 2)`, plus the 120-second ARM window
+for gated start. Stop waits up to 1020 seconds and no-wait ARMED confirmation up
+to 180 seconds, allowing BLE reconnect and cached terminal REPORT delivery.
 
 ## 4. Configure the database cron job
 

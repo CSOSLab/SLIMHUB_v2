@@ -1,7 +1,7 @@
 from slimhub.protocol.nus import (
     AlertPacket,
-    AudioPacket,
     FrameAssembler,
+    IgnoredPacket,
     MAX_RECORD_SECONDS,
     MIN_RECORD_SECONDS,
     PacketParseError,
@@ -21,20 +21,18 @@ from slimhub.protocol.nus import (
     mac_to_bytes,
     normalize_mac,
     parse_frame,
-    parse_audio,
     parse_report,
     parse_rawdata,
     validate_command,
     validate_command_payload,
     validate_record_seconds,
-    validate_sound_destination,
     validate_sound_label,
 )
 
 __all__ = [
     "AlertPacket",
-    "AudioPacket",
     "FrameAssembler",
+    "IgnoredPacket",
     "MAX_RECORD_SECONDS",
     "MIN_RECORD_SECONDS",
     "PacketParseError",
@@ -54,12 +52,10 @@ __all__ = [
     "mac_to_bytes",
     "normalize_mac",
     "parse_frame",
-    "parse_audio",
     "parse_report",
     "parse_rawdata",
     "validate_command",
     "validate_command_payload",
     "validate_record_seconds",
-    "validate_sound_destination",
     "validate_sound_label",
 ]

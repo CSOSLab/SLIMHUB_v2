@@ -7,9 +7,9 @@ import unittest
 from pathlib import Path
 
 from slimhub.protocol.nus import (
-    AudioPacket,
     END_FLAG,
     FrameAssembler,
+    IgnoredPacket,
     PacketParseError,
     RawDataPacket,
     ReportPacket,
@@ -144,9 +144,8 @@ class ProtocolTests(unittest.TestCase):
             [frame.packet_type for frame in frames],
             ["AUDIO", "REPORT", "RAWDATA"],
         )
-        self.assertIsInstance(frames[0].parsed, AudioPacket)
-        self.assertEqual(frames[0].parsed.capture_id, 0x00AB12CD)
-        self.assertEqual(frames[0].parsed.sample_count, 512)
+        self.assertIsInstance(frames[0].parsed, IgnoredPacket)
+        self.assertEqual(frames[0].parsed.packet_type, "AUDIO")
         self.assertEqual(frames[1].parsed.fields["event"], "CAPTURE_DONE")
         self.assertIsInstance(frames[2].parsed, RawDataPacket)
 
@@ -212,7 +211,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(frame.parsed.fields["event"], "RECORD_START")
         self.assertEqual(frame.parsed.fields["path"], "SOUND/001.wav")
 
-    def test_audio_v1_frame_decodes_pcm16le_header(self) -> None:
+    def test_legacy_audio_and_wavfile_frames_are_ignored(self) -> None:
         frame = parse_frame(
             build_frame(
                 "AA:BB:CC:DD:EE:FF",
@@ -221,23 +220,15 @@ class ProtocolTests(unittest.TestCase):
             )
         )
 
-        self.assertIsInstance(frame.parsed, AudioPacket)
-        self.assertTrue(frame.parsed.first_block)
-        self.assertEqual(frame.parsed.block_sequence, 0)
-        self.assertEqual(frame.parsed.sample_offset, 0)
-        self.assertEqual(frame.parsed.data_bytes, 1024)
-        self.assertEqual(len(frame.parsed.pcm), 1024)
+        wavfile = parse_frame(
+            build_frame("AA:BB:CC:DD:EE:FF", "WAVFILE", b"legacy")
+        )
 
-    def test_audio_v1_rejects_invalid_header_and_data_length(self) -> None:
-        invalid_version = bytearray(self.audio_payload())
-        invalid_version[0] = 2
-        invalid_data_bytes = bytearray(self.audio_payload())
-        invalid_data_bytes[18:20] = (1000).to_bytes(2, "little")
-
-        for payload in (bytes(invalid_version), bytes(invalid_data_bytes)):
-            with self.subTest(payload=payload[:20].hex()):
-                with self.assertRaises(PacketParseError):
-                    parse_frame(build_frame("AA:BB:CC:DD:EE:FF", "AUDIO", payload))
+        self.assertIsInstance(frame.parsed, IgnoredPacket)
+        self.assertEqual(frame.parsed.packet_type, "AUDIO")
+        self.assertEqual(frame.parsed.payload_bytes, len(self.audio_payload()))
+        self.assertIsInstance(wavfile.parsed, IgnoredPacket)
+        self.assertEqual(wavfile.parsed.packet_type, "WAVFILE")
 
     def test_csv_report_keeps_first_routing_source_and_preserves_duplicate_metric(self) -> None:
         payload = b"src=ADL,event=POP,schema=2,src=3,score=98"
@@ -314,7 +305,6 @@ class ProtocolTests(unittest.TestCase):
     def test_sound_start_command_frame_builds_exact_payload(self) -> None:
         command = build_sound_start_command(
             "pee",
-            destination="both",
             threshold_rms=1200,
             max_seconds=90,
             silence_seconds=5,
@@ -322,24 +312,20 @@ class ProtocolTests(unittest.TestCase):
 
         self.assertEqual(
             self.command_payload(command),
-            b"sound_start,label=pee,dest=both,thr=1200,max=90,silence=5",
+            b"sound_start,label=pee,thr=1200,max=90,silence=5",
         )
 
     def test_background_command_is_fixed_ungated_background_preset(self) -> None:
-        command = build_sound_background_command(
-            destination="ble",
-            max_seconds=600,
-        )
+        command = build_sound_background_command(max_seconds=600)
 
-        self.assertEqual(command, "sound_bg,dest=ble,max=600")
+        self.assertEqual(command, "sound_bg,max=600")
         self.assertNotIn("label=", command)
         self.assertNotIn("thr=", command)
 
-    def test_sound_command_rejects_path_traversal_ranges_and_destination(self) -> None:
+    def test_sound_command_rejects_path_traversal_and_ranges(self) -> None:
         invalid_calls = (
             lambda: build_sound_start_command("../pee"),
             lambda: build_sound_start_command("x" * 25),
-            lambda: build_sound_start_command("pee", destination="cloud"),
             lambda: build_sound_start_command("pee", threshold_rms=32768),
             lambda: build_sound_start_command("pee", max_seconds=0),
             lambda: build_sound_start_command("pee", silence_seconds=61),

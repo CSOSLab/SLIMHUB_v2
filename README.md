@@ -55,12 +55,13 @@ slimhub-v2 --list
 slimhub-v2 --config AA:BB:CC:DD:EE:FF location ENTRY
 slimhub-v2 --apply
 slimhub-v2 --service AA:BB:CC:DD:EE:FF enable inference rawdata
-slimhub-v2 command send --address AA:BB:CC:DD:EE:FF --command enter
-slimhub-v2 raw tail --address AA:BB:CC:DD:EE:FF --lines 20
+slimhub-v2 config set --address AA:BB:CC:DD:EE:FF location ENTRY
+slimhub-v2 command send --location ENTRY --command enter
+slimhub-v2 raw tail --location ENTRY --lines 20
 slimhub-v2 unitspace status
-slimhub-v2 power status --address AA:BB:CC:DD:EE:FF
-slimhub-v2 battery status --address AA:BB:CC:DD:EE:FF
-slimhub-v2 sound status --address AA:BB:CC:DD:EE:FF
+slimhub-v2 power status --location ENTRY
+slimhub-v2 battery status --location ENTRY
+slimhub-v2 sound status --location ENTRY
 slimhub-v2 --quit
 ```
 
@@ -79,6 +80,15 @@ daemon은 `programdata/slimhub.sock`에서 요청을 받습니다. Hub 설정은
 `programdata/config.json`에 저장됩니다. 장치 설정은
 `programdata/config/<MAC>.json` 아래에 저장되며, SLIMHUB 스타일의
 `address`, `type`, `name`, `location` 필드를 사용합니다.
+
+device target을 받는 v2 명령은 `--address MAC` 또는 `--location NAME` 중 하나를
+사용할 수 있습니다. `undefined`, `unnamed`, `unknown` 같은 초기 location은 target으로
+사용할 수 없습니다. location lookup은 대소문자를 구분하지 않으며 정확히 하나의
+device와 일치해야 합니다. 새 location이 이미 다른 MAC에 할당돼 있으면 Central은
+`<location>_2`, `<location>_3`처럼 사용 가능한 번호를 붙여 저장하고 CLI에 warning을
+표시합니다. 기존 configuration 파일에 중복 location이 남아 있으면 `--location`
+명령은 충돌한 MAC 목록과 수정 명령을 출력하며 실행되지 않습니다. `slimhub-v2 devices`
+출력에서도 해당 행은 `Conflict=YES`로 표시됩니다.
 
 Rawdata 로그는
 `data/<location>/<type>/<MAC>/inference/rawdata/YYYY-MM-DD.txt`에 누적됩니다.
@@ -100,38 +110,47 @@ record에는 해당 event만 저장하며 누적 session 전체를 반복 복사
 
 ## Sound domain-adaptation capture
 
-명시적인 운영자 명령이 있을 때만 Node의 PCM AUDIO를 저장합니다. label은 1–24자의
-영문/숫자/`_`/`-`만 허용하며 path traversal 문자열은 거부합니다.
+명시적인 운영자 명령이 있을 때만 DEAN Node가 uSD에 PCM WAV를 저장합니다. BLE는
+command와 상태/완료 REPORT에만 사용하고, SLIMHUB_v2로 PCM/WAV binary를 전송하거나
+Central `data/`에 WAV를 만들지 않습니다. label은 1–24자의 영문/숫자/`_`/`-`만
+허용하며 path traversal 문자열은 거부합니다.
 
 ```bash
-slimhub-v2 sound start --address AA:BB:CC:DD:EE:FF \
-  --label pee --dest both --threshold-rms 1200 --max-seconds 90 \
+slimhub-v2 sound start --location TOILET \
+  --label pee --threshold-rms 1200 --max-seconds 90 \
   --silence-seconds 5
 
-slimhub-v2 sound background --address AA:BB:CC:DD:EE:FF \
-  --dest ble --max-seconds 600
+slimhub-v2 sound background --location TOILET --max-seconds 10
+slimhub-v2 sound background --location TOILET --max-seconds 300 --no-wait
 
-slimhub-v2 sound status --address AA:BB:CC:DD:EE:FF
-slimhub-v2 sound stop --address AA:BB:CC:DD:EE:FF
+slimhub-v2 sound status --location TOILET
+slimhub-v2 sound stop --location TOILET
 ```
 
 `sound start`는 threshold를 넘기 전 `ARMED`, 실제 PCM이 시작되면 `ACTIVE`입니다.
 `--threshold-rms 0`은 gate를 해제하며 silence도 자동으로 0이 됩니다. background
 명령은 임의 label을 받지 않고 항상 `background`, threshold 0, silence 0을
-사용합니다. legacy `command record`와 `record-stop`도 계속 지원합니다.
+사용합니다. WAV는 Node의 `/sdcard/SOUND/<label>/<cid>.wav`에만 존재합니다.
 
-BLE PCM은 16 kHz, mono, PCM16 WAV와 JSON sidecar로 저장됩니다.
+기본 `--wait`는 `CAPTURE_DONE`/`CAPTURE_CANCELLED`/`CAPTURE_ERROR`까지 CLI를
+유지합니다. 성공한 `CAPTURE_DONE,complete=1`만 exit code 0이고, 그 밖의 terminal이나
+timeout은 non-zero입니다. `--no-wait`는 `CAPTURE_ARMED`와 cid를 확인한 뒤 반환합니다.
+`sound stop`도 기본적으로 terminal REPORT를 기다립니다. reconnect 중에도 정해진
+deadline 안에서는 같은 waiter가 유지되며 자동으로 새 capture를 시작하지 않습니다.
+completion timeout은 고정 15초가 아니라 Node의 WAV flush/fsync/CRC 시간을 고려해
+`max-seconds + max(180초, max-seconds/2)`로 계산합니다. RMS-gated start에는 여기에
+ARM 대기 120초가 추가됩니다. 예를 들어 background 600초는 900초, gated start
+600초는 1020초까지 기다립니다. `sound stop`은 최대 길이 파일의 CRC 완료와 BLE
+재연결을 위해 1020초, `--no-wait`의 ARMED 확인은 180초까지 기다립니다.
+대화형 터미널에서 `--wait`/`--no-wait`를 모두 생략하면 최종 한 줄을 출력하기 전까지
+같은 줄에서 진행 막대와 ETA를 갱신합니다. background ETA는 `max-seconds` 기준 예상값,
+RMS-gated start ETA는 firmware ARM timeout을 포함한 상한값입니다. 명시적 `--wait`,
+`--no-wait`, pipe/cron 같은 비대화형 실행에는 진행 표시를 출력하지 않습니다.
 
-```text
-data/sound/<NODE_MAC>/<label>/<cid>.wav
-data/sound/<NODE_MAC>/<label>/<cid>.json
-```
-
-sidecar에는 명령 파라미터, ARMED/START/DONE 원문 REPORT, 수신 sample/block 수,
-missing range, firmware 정보, queue/ble drop, 종료 원인과 `complete`가 들어갑니다.
-sequence 또는 sample-offset gap, drop, disconnect, timeout이 있으면 WAV는 복구
-가능하게 닫되 `complete=false`로 표시합니다. 원본 WAV는 dataset export 시에도
-수정하지 않습니다.
+`sound status`는 command를 queue한 직후의 stale snapshot을 반환하지 않도록 최대
+2초 동안 새 SOUND REPORT를 기다립니다. `fresh_report=false`이면 Node가 그 시간 안에
+회신하지 않아 마지막 관측값을 표시한 것입니다. legacy `command record`와
+`record-stop`은 별도 호환 명령으로 계속 지원합니다.
 
 운영자용 display는 daemon이 확정한 IN/OUT(D0/D1)과 inference 상태 전이만
 `programdata/display.txt`에 append합니다. 개별 ENV/SOUND, candidate, command
@@ -226,15 +245,14 @@ Inbound packet type은 다음과 같습니다.
 - `RAWDATA`: 33-byte little-endian payload
 - `ALERT`: UTF-8 text payload
 - `REPORT`: UTF-8 comma-separated key/value 또는 NCS-compatible JSON payload
-- `AUDIO`: v1 binary header와 512-sample signed PCM16LE block
+- `AUDIO`/`WAVFILE`: migration compatibility를 위해 crash 없이 폐기하며 저장하지 않음
 
 BLE notification 경계는 NUS frame 경계가 아닙니다. Central은 connection별
 byte accumulator에서 16-byte header의 little-endian payload length와 뒤따르는
 CRLF를 모두 확인한 뒤에만 frame을 파싱합니다. 잘못된 length, packet type,
-CRLF는 bounded resynchronization으로 폐기하므로 MTU 23/247/517의 header/payload/
-CRLF 분할과 연결된 frame stream도 처리합니다. 연결 직후 가능한 최대 MTU를
-요청하지만 작은 ATT notification에서도 같은 accumulator가 AUDIO frame 전체를
-복원합니다.
+CRLF는 bounded resynchronization으로 폐기하므로 작은 ATT notification에 걸친
+header/payload/CRLF 분할과 연결된 frame stream도 처리합니다. sound capture를 위한
+MTU 또는 connection-interval bulk-transfer tuning은 사용하지 않습니다.
 
 ### DEAN_Node_v2 PIR+RADAR IN/OUT
 

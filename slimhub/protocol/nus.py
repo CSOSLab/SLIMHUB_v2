@@ -29,7 +29,6 @@ MAX_SOUND_THRESHOLD_RMS = 32767
 MIN_SOUND_SECONDS = 1
 MAX_SOUND_SECONDS = 1800
 MAX_SOUND_SILENCE_SECONDS = 60
-SOUND_DESTINATIONS = ("sd", "ble", "both")
 SOUND_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
 COMMAND_ALIASES = {
     "strong_enter": "enter",
@@ -45,10 +44,7 @@ HEADER_LEN = MAC_LEN + PACKET_TYPE_LEN + PACKET_LEN_LEN
 END_FLAG_LEN = len(END_FLAG)
 RAWDATA_PAYLOAD_LEN = 33
 MAX_FRAME_LEN = 4096
-KNOWN_PACKET_TYPES = {"RAWDATA", "ALERT", "REPORT", "AUDIO"}
-AUDIO_V1_HEADER_LEN = 20
-AUDIO_V1_VERSION = 1
-AUDIO_PCM16LE_ENCODING = 1
+KNOWN_PACKET_TYPES = {"RAWDATA", "ALERT", "REPORT", "AUDIO", "WAVFILE"}
 
 
 class PacketParseError(ValueError):
@@ -87,21 +83,11 @@ class ReportPacket:
 
 
 @dataclass(frozen=True)
-class AudioPacket:
-    version: int
-    flags: int
-    encoding: int
-    channels: int
-    capture_id: int
-    block_sequence: int
-    sample_offset: int
-    sample_count: int
-    data_bytes: int
-    pcm: bytes
+class IgnoredPacket:
+    """Migration-only packet that must never start Central file storage."""
 
-    @property
-    def first_block(self) -> bool:
-        return bool(self.flags & 0x01)
+    packet_type: str
+    payload_bytes: int
 
 
 @dataclass(frozen=True)
@@ -111,7 +97,7 @@ class ParsedFrame:
     packet_type: str
     packet_length: int
     payload: bytes
-    parsed: RawDataPacket | AlertPacket | ReportPacket | AudioPacket
+    parsed: RawDataPacket | AlertPacket | ReportPacket | IgnoredPacket
 
 
 class FrameAssembler:
@@ -242,12 +228,6 @@ def validate_sound_label(label: str) -> str:
     return label
 
 
-def validate_sound_destination(destination: str) -> str:
-    if destination not in SOUND_DESTINATIONS:
-        raise ValueError("sound destination must be one of: sd, ble, both")
-    return destination
-
-
 def _validate_sound_integer(
     value: int,
     *,
@@ -265,13 +245,11 @@ def _validate_sound_integer(
 def build_sound_start_command(
     label: str,
     *,
-    destination: str = "both",
     threshold_rms: int = 800,
     max_seconds: int = 60,
     silence_seconds: int = 5,
 ) -> str:
     label = validate_sound_label(label)
-    destination = validate_sound_destination(destination)
     threshold_rms = _validate_sound_integer(
         threshold_rms,
         name="sound threshold RMS",
@@ -293,24 +271,22 @@ def build_sound_start_command(
     if threshold_rms == 0:
         silence_seconds = 0
     return (
-        f"sound_start,label={label},dest={destination},thr={threshold_rms},"
+        f"sound_start,label={label},thr={threshold_rms},"
         f"max={max_seconds},silence={silence_seconds}"
     )
 
 
 def build_sound_background_command(
     *,
-    destination: str = "both",
     max_seconds: int = 300,
 ) -> str:
-    destination = validate_sound_destination(destination)
     max_seconds = _validate_sound_integer(
         max_seconds,
         name="sound max seconds",
         minimum=MIN_SOUND_SECONDS,
         maximum=MAX_SOUND_SECONDS,
     )
-    return f"sound_bg,dest={destination},max={max_seconds}"
+    return f"sound_bg,max={max_seconds}"
 
 
 def _command_fields(command: str) -> tuple[str, dict[str, str]]:
@@ -352,14 +328,13 @@ def validate_command_payload(command: str) -> str:
         name, fields = _command_fields(normalized)
         if name != "sound_start":
             raise ValueError("invalid sound_start command")
-        unknown = set(fields) - {"label", "dest", "thr", "max", "silence"}
+        unknown = set(fields) - {"label", "thr", "max", "silence"}
         if unknown:
             raise ValueError(f"unknown sound_start field: {sorted(unknown)[0]}")
         if "label" not in fields:
             raise ValueError("sound_start requires label")
         return build_sound_start_command(
             fields["label"],
-            destination=fields.get("dest", "both"),
             threshold_rms=_sound_int_field(fields, "thr", 800),
             max_seconds=_sound_int_field(fields, "max", 60),
             silence_seconds=_sound_int_field(fields, "silence", 5),
@@ -368,11 +343,10 @@ def validate_command_payload(command: str) -> str:
         name, fields = _command_fields(normalized)
         if name != "sound_bg":
             raise ValueError("invalid sound_bg command")
-        unknown = set(fields) - {"dest", "max"}
+        unknown = set(fields) - {"max"}
         if unknown:
             raise ValueError(f"unknown sound_bg field: {sorted(unknown)[0]}")
         return build_sound_background_command(
-            destination=fields.get("dest", "both"),
             max_seconds=_sound_int_field(fields, "max", 300),
         )
     raise ValueError(
@@ -490,56 +464,6 @@ def parse_report(payload: bytes) -> ReportPacket:
     )
 
 
-def parse_audio(payload: bytes) -> AudioPacket:
-    if len(payload) < AUDIO_V1_HEADER_LEN:
-        raise PacketParseError(
-            f"AUDIO payload too short: expected at least {AUDIO_V1_HEADER_LEN}, got {len(payload)}"
-        )
-    (
-        version,
-        flags,
-        encoding,
-        channels,
-        capture_id,
-        block_sequence,
-        sample_offset,
-        sample_count,
-        data_bytes,
-    ) = struct.unpack("<BBBBIIIHH", payload[:AUDIO_V1_HEADER_LEN])
-    if version != AUDIO_V1_VERSION:
-        raise PacketParseError(f"unsupported AUDIO version: {version}")
-    if encoding != AUDIO_PCM16LE_ENCODING:
-        raise PacketParseError(f"unsupported AUDIO encoding: {encoding}")
-    if channels != 1:
-        raise PacketParseError(f"unsupported AUDIO channels: {channels}")
-    if sample_count <= 0:
-        raise PacketParseError("AUDIO sample_count must be positive")
-    expected_data_bytes = sample_count * channels * 2
-    if data_bytes != expected_data_bytes:
-        raise PacketParseError(
-            "AUDIO data_bytes mismatch: "
-            f"expected {expected_data_bytes}, got {data_bytes}"
-        )
-    expected_payload_len = AUDIO_V1_HEADER_LEN + data_bytes
-    if len(payload) != expected_payload_len:
-        raise PacketParseError(
-            "AUDIO payload length mismatch: "
-            f"expected {expected_payload_len}, got {len(payload)}"
-        )
-    return AudioPacket(
-        version=version,
-        flags=flags,
-        encoding=encoding,
-        channels=channels,
-        capture_id=capture_id,
-        block_sequence=block_sequence,
-        sample_offset=sample_offset,
-        sample_count=sample_count,
-        data_bytes=data_bytes,
-        pcm=payload[AUDIO_V1_HEADER_LEN:],
-    )
-
-
 def _json_field_text(value: object) -> str:
     if value is None:
         return ""
@@ -584,13 +508,13 @@ def parse_frame(data: bytes) -> ParsedFrame:
     mac = ":".join(f"{byte:02X}" for byte in mac_bytes)
 
     if packet_type == "RAWDATA":
-        parsed: RawDataPacket | AlertPacket | ReportPacket | AudioPacket = parse_rawdata(payload)
+        parsed: RawDataPacket | AlertPacket | ReportPacket | IgnoredPacket = parse_rawdata(payload)
     elif packet_type == "ALERT":
         parsed = parse_alert(payload)
     elif packet_type == "REPORT":
         parsed = parse_report(payload)
-    elif packet_type == "AUDIO":
-        parsed = parse_audio(payload)
+    elif packet_type in {"AUDIO", "WAVFILE"}:
+        parsed = IgnoredPacket(packet_type=packet_type, payload_bytes=len(payload))
     else:
         raise PacketParseError(f"unknown packet type: {packet_type!r}")
 
@@ -623,11 +547,10 @@ def describe_frame(frame: ParsedFrame) -> str:
             f"message={parsed.message!r}"
         )
 
-    if isinstance(parsed, AudioPacket):
+    if isinstance(parsed, IgnoredPacket):
         return (
-            f"AUDIO mac={frame.mac} length={frame.packet_length} "
-            f"cid={parsed.capture_id:08x} block={parsed.block_sequence} "
-            f"samples={parsed.sample_count} offset={parsed.sample_offset}"
+            f"IGNORED packet_type={parsed.packet_type} mac={frame.mac} "
+            f"length={parsed.payload_bytes}"
         )
 
     parts = [

@@ -4,29 +4,37 @@ import argparse
 import asyncio
 import json
 import logging
+import queue
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import Sequence
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from slimhub.cli.client import send_request_sync
-from slimhub.config import AppPaths, HubConfigStore
+from slimhub.config import AppPaths, DeviceConfigStore, HubConfigStore
 from slimhub.integrations.database import DataDirectoryDatabaseUpdater
 from slimhub.protocol.nus import (
     DEFAULT_DEVICE_NAME,
     MAX_RECORD_SECONDS,
+    MAX_SOUND_SECONDS,
     MIN_RECORD_SECONDS,
     RECORD_STOP_COMMAND,
-    SOUND_DESTINATIONS,
     SOUND_STATUS_COMMAND,
-    SOUND_STOP_COMMAND,
     VALID_COMMANDS,
     build_record_command,
     build_sound_background_command,
     build_sound_start_command,
     validate_sound_label,
 )
+
+SOUND_ARM_WAIT_SECONDS = 120
+SOUND_FINALIZE_MIN_SECONDS = 180
+SOUND_NO_WAIT_ACCEPT_SECONDS = 180
+SOUND_STOP_WAIT_SECONDS = SOUND_ARM_WAIT_SECONDS + (MAX_SOUND_SECONDS // 2)
+SOUND_INTERRUPT_STOP_WAIT_SECONDS = SOUND_FINALIZE_MIN_SECONDS
 
 
 class _HelpFormatter(
@@ -46,6 +54,34 @@ class _HelpFormatter(
         return help_text
 
 
+def _add_target_options(
+    parser: argparse.ArgumentParser,
+    *,
+    required: bool,
+    address_help: str = "Target one Node by MAC address.",
+    location_help: str = "Target one Node by its unique configured location.",
+) -> None:
+    group = parser.add_mutually_exclusive_group(required=required)
+    group.add_argument("--address", metavar="MAC", help=address_help)
+    group.add_argument("--location", metavar="NAME", help=location_help)
+
+
+def _add_wait_option(
+    parser: argparse.ArgumentParser,
+    *,
+    no_wait_result: str = "CAPTURE_ARMED confirms the cid",
+) -> None:
+    parser.add_argument(
+        "--wait",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Wait for the Node terminal REPORT; "
+            f"--no-wait returns after {no_wait_result}."
+        ),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="slimhub-v2",
@@ -59,8 +95,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Typical deployment workflow:\n"
             "  slimhub-v2 run --background\n"
             "  slimhub-v2 devices\n"
-            "  slimhub-v2 config set AA:BB:CC:DD:EE:FF location TOILET\n"
-            "  slimhub-v2 sound status --address AA:BB:CC:DD:EE:FF\n"
+            "  slimhub-v2 config set --address AA:BB:CC:DD:EE:FF location TOILET\n"
+            "  slimhub-v2 sound status --location TOILET\n"
             "  slimhub-v2 db ingest\n"
             "  slimhub-v2 db status\n\n"
             "Help navigation:\n"
@@ -157,10 +193,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Detach the daemon and write launcher output to logs/slimhub-v2.out.",
     )
-    run_parser.add_argument(
-        "--address",
-        metavar="MAC",
-        help="Connect this BLE address immediately in addition to normal scanning.",
+    _add_target_options(
+        run_parser,
+        required=False,
+        address_help="Connect this BLE address immediately in addition to normal scanning.",
+        location_help="Resolve this configured location and connect its device immediately.",
     )
     run_parser.add_argument(
         "--name",
@@ -171,7 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--no-scan",
         action="store_true",
-        help="Disable periodic scanning; normally combine with --address.",
+        help="Disable periodic scanning; normally combine with --address or --location.",
     )
     run_parser.add_argument(
         "--scan-timeout",
@@ -226,14 +263,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     connect_parser = subparsers.add_parser(
         "connect",
-        help="Add a BLE address to the running daemon.",
+        help="Add a device target to the running daemon.",
         description=(
-            "Create or resume a daemon-managed BLE session for one address.\n"
+            "Create or resume a daemon-managed BLE session by MAC or unique location.\n"
             "This does not start the daemon; use 'run' first."
         ),
         formatter_class=_HelpFormatter,
     )
-    connect_parser.add_argument("--address", required=True, metavar="MAC", help="Node BLE MAC address.")
+    _add_target_options(connect_parser, required=True)
 
     command_parser = subparsers.add_parser(
         "command",
@@ -246,7 +283,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  slimhub-v2 command send --address AA:BB:CC:DD:EE:FF --command enter\n"
-            "  slimhub-v2 command record --address AA:BB:CC:DD:EE:FF --seconds 30"
+            "  slimhub-v2 command send --location TOILET --command enter\n"
+            "  slimhub-v2 command record --location TOILET --seconds 30"
         ),
         formatter_class=_HelpFormatter,
     )
@@ -260,7 +298,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Queue a manual IN/OUT feedback COMMAND for one connected Node.",
         formatter_class=_HelpFormatter,
     )
-    command_send.add_argument("--address", required=True, metavar="MAC", help="Target Node MAC address.")
+    _add_target_options(command_send, required=True)
     command_send.add_argument(
         "--command",
         dest="nus_command",
@@ -273,11 +311,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Start legacy unlabeled Node recording (compatibility).",
         description=(
             "Send legacy record or record:<seconds>. This does not use the labeled\n"
-            "AUDIO/WAV capture workflow; prefer 'slimhub-v2 sound start'."
+            "Node-uSD capture workflow; prefer 'slimhub-v2 sound start'."
         ),
         formatter_class=_HelpFormatter,
     )
-    command_record.add_argument("--address", required=True, metavar="MAC", help="Target Node MAC address.")
+    _add_target_options(command_record, required=True)
     command_record.add_argument(
         "--seconds",
         type=_record_seconds,
@@ -289,24 +327,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stop legacy unlabeled Node recording (compatibility).",
         description="Send the legacy record_stop payload.",
     )
-    command_record_stop.add_argument("--address", required=True, metavar="MAC", help="Target Node MAC address.")
+    _add_target_options(command_record_stop, required=True)
 
     sound_parser = subparsers.add_parser(
         "sound",
-        help="Capture labeled PCM audio for sound domain adaptation.",
+        help="Capture labeled PCM audio on the DEAN Node uSD card.",
         description=(
-            "Control explicit, labeled 16 kHz mono PCM capture. BLE audio is stored as\n"
-            "data/sound/<NODE_MAC>/<label>/<cid>.wav with a JSON completeness manifest.\n"
-            "Only captures started through this group are written to the local audio store."
+            "Control explicit, labeled 16 kHz mono PCM capture stored on the DEAN Node\n"
+            "uSD card. BLE carries commands and completion reports only; audio data is\n"
+            "never transferred to SLIMHUB_v2."
         ),
         epilog=(
-            "Capture states: ARMED waits for the RMS trigger; ACTIVE receives PCM;\n"
-            "DONE/INCOMPLETE is finalized in the JSON manifest.\n\n"
+            "Capture states: ARMED waits for the RMS trigger; ACTIVE records to Node uSD;\n"
+            "DONE/CANCELLED returns a final completion report.\n"
+            "On an interactive terminal, omitting both wait options shows an in-place ETA;\n"
+            "explicit --wait stays quiet until the final result.\n\n"
             "Examples:\n"
-            "  slimhub-v2 sound start --address AA:BB:CC:DD:EE:FF --label pee\n"
-            "  slimhub-v2 sound background --address AA:BB:CC:DD:EE:FF --dest ble\n"
-            "  slimhub-v2 sound status --address AA:BB:CC:DD:EE:FF\n"
-            "  slimhub-v2 sound stop --address AA:BB:CC:DD:EE:FF"
+            "  slimhub-v2 sound start --location TOILET --label pee\n"
+            "  slimhub-v2 sound background --location TOILET --max-seconds 10\n"
+            "  slimhub-v2 sound background --location TOILET --no-wait\n"
+            "  slimhub-v2 sound status --location TOILET\n"
+            "  slimhub-v2 sound stop --location TOILET"
         ),
         formatter_class=_HelpFormatter,
     )
@@ -323,19 +364,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=_HelpFormatter,
     )
-    sound_start.add_argument("--address", required=True, metavar="MAC", help="Target Node MAC address.")
+    _add_target_options(sound_start, required=True)
     sound_start.add_argument(
         "--label",
         required=True,
         type=_sound_label,
         metavar="LABEL",
         help="Dataset label: 1-24 letters, digits, '_' or '-'.",
-    )
-    sound_start.add_argument(
-        "--dest",
-        choices=SOUND_DESTINATIONS,
-        default="both",
-        help="Storage destination: Node SD, Central BLE/WAV, or both.",
     )
     sound_start.add_argument(
         "--threshold-rms",
@@ -358,6 +393,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="0..60",
         help="Continuous below-threshold time that ends an ACTIVE capture; 0 disables it.",
     )
+    _add_wait_option(sound_start)
 
     sound_background = sound_subparsers.add_parser(
         "background",
@@ -368,13 +404,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=_HelpFormatter,
     )
-    sound_background.add_argument("--address", required=True, metavar="MAC", help="Target Node MAC address.")
-    sound_background.add_argument(
-        "--dest",
-        choices=SOUND_DESTINATIONS,
-        default="both",
-        help="Storage destination: Node SD, Central BLE/WAV, or both.",
-    )
+    _add_target_options(sound_background, required=True)
     sound_background.add_argument(
         "--max-seconds",
         type=_bounded_integer("max seconds", 1, 1800),
@@ -382,11 +412,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="1..1800",
         help="Maximum background capture duration.",
     )
+    _add_wait_option(sound_background)
 
     sound_stop = sound_subparsers.add_parser("stop", help="Stop or cancel capture.")
-    sound_stop.add_argument("--address", required=True, metavar="MAC", help="Target Node MAC address.")
+    _add_target_options(sound_stop, required=True)
+    _add_wait_option(sound_stop, no_wait_result="the stop command is queued")
     sound_status = sound_subparsers.add_parser("status", help="Request and show capture state.")
-    sound_status.add_argument("--address", required=True, metavar="MAC", help="Target Node MAC address.")
+    _add_target_options(sound_status, required=True)
 
     config_parser = subparsers.add_parser(
         "config",
@@ -397,7 +429,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Examples:\n"
-            "  slimhub-v2 config set AA:BB:CC:DD:EE:FF location TOILET\n"
+            "  slimhub-v2 config set --address AA:BB:CC:DD:EE:FF location TOILET\n"
+            "  slimhub-v2 config set --location TOILET name toilet-node\n"
             "  slimhub-v2 config apply"
         ),
         formatter_class=_HelpFormatter,
@@ -408,7 +441,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Set one device configuration field.",
         formatter_class=_HelpFormatter,
     )
-    config_set.add_argument("address", metavar="MAC", help="Configured Node MAC address.")
+    config_target = config_set.add_mutually_exclusive_group()
+    config_target.add_argument(
+        "--address",
+        dest="target_address",
+        metavar="MAC",
+        help="Target a device by MAC address.",
+    )
+    config_target.add_argument(
+        "--location",
+        dest="target_location",
+        metavar="NAME",
+        help="Target a device by its current unique location.",
+    )
+    config_set.add_argument(
+        "legacy_address",
+        nargs="?",
+        metavar="ADDRESS",
+        help="Compatibility positional MAC; prefer --address.",
+    )
     config_set.add_argument(
         "field",
         choices=("type", "name", "location"),
@@ -436,10 +487,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show the latest rawdata lines.",
         formatter_class=_HelpFormatter,
     )
-    raw_tail.add_argument(
-        "--address",
-        metavar="MAC",
-        help="Restrict output to one Node; omit to use all configured devices.",
+    _add_target_options(
+        raw_tail,
+        required=False,
+        address_help="Restrict output to one Node; omit both target options for all devices.",
+        location_help="Restrict output to one uniquely configured location.",
     )
     raw_tail.add_argument(
         "--lines",
@@ -474,7 +526,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     power_status = power_subparsers.add_parser("status", help="Show shadow power-state status.")
-    power_status.add_argument("--address", metavar="MAC", help="Restrict output to one Node.")
+    _add_target_options(power_status, required=False)
 
     battery_parser = subparsers.add_parser(
         "battery",
@@ -490,7 +542,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     battery_status = battery_subparsers.add_parser("status", help="Show latest USD STATUS report.")
-    battery_status.add_argument("--address", metavar="MAC", help="Restrict output to one Node.")
+    _add_target_options(battery_status, required=False)
 
     db_parser = subparsers.add_parser(
         "db",
@@ -557,7 +609,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run_cli(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    cli_args = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(cli_args)
     if args.legacy_help:
         print(_legacy_help())
         return 0
@@ -570,6 +623,7 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
 
     try:
         if _is_run_command(args):
+            target_address = _resolve_local_target(paths, args)
             if args.background:
                 return _run_background(argv, paths)
 
@@ -586,22 +640,24 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
             )
             print("==== SLIMHUB START ====")
             logging.info("SLIMHUB start")
-            asyncio.run(daemon.run(address=args.address, scan=not args.no_scan))
+            asyncio.run(daemon.run(address=target_address, scan=not args.no_scan))
             return 0
 
         if args.hubconfig:
             data = HubConfigStore(paths).set_field(args.hubconfig[0], args.hubconfig[1]).__dict__
         elif args.subcommand == "db":
             data = _run_database(paths, args)
+        elif _should_show_default_wait_eta(args, cli_args):
+            data = _send_with_default_wait_eta(paths, args)
         else:
             data = _send(paths, args)
         _print_result(args, data)
-        return 0
+        return _result_exit_code(args, data)
     except FileNotFoundError:
         print("Slimhub server is not running")
-        return 0
+        return 1 if args.subcommand == "sound" else 0
     except KeyboardInterrupt:
-        return 130
+        return _handle_sound_interrupt(paths, args)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -653,7 +709,7 @@ Modern equivalents include:
   slimhub-v2 run --background
   slimhub-v2 stop
   slimhub-v2 devices
-  slimhub-v2 config set ADDRESS {type,name,location} VALUE
+  slimhub-v2 config set --address ADDRESS {type,name,location} VALUE
   slimhub-v2 config apply
   slimhub-v2 command send --address ADDRESS --command {enter,exit}
   slimhub-v2 sound start --address ADDRESS --label LABEL
@@ -745,65 +801,85 @@ def _send(paths: AppPaths, args: argparse.Namespace) -> object:
             {"address": address, "file_path": file_path, "save_path": save_path},
         )
     if args.subcommand == "connect":
-        return send_request_sync(paths, "connect", {"address": args.address})
+        return send_request_sync(paths, "connect", _target_payload(args))
     if args.subcommand == "command" and args.command_action == "send":
         return send_request_sync(
             paths,
             "command.send",
-            {"address": args.address, "command": args.nus_command},
+            {**_target_payload(args), "command": args.nus_command},
         )
     if args.subcommand == "command" and args.command_action == "record":
         return send_request_sync(
             paths,
             "command.send",
-            {"address": args.address, "command": build_record_command(args.seconds)},
+            {**_target_payload(args), "command": build_record_command(args.seconds)},
         )
     if args.subcommand == "command" and args.command_action == "record-stop":
         return send_request_sync(
             paths,
             "command.send",
-            {"address": args.address, "command": RECORD_STOP_COMMAND},
+            {**_target_payload(args), "command": RECORD_STOP_COMMAND},
         )
     if args.subcommand == "sound" and args.sound_action == "start":
         command = build_sound_start_command(
             args.label,
-            destination=args.dest,
             threshold_rms=args.threshold_rms,
             max_seconds=args.max_seconds,
             silence_seconds=args.silence_seconds,
         )
         return send_request_sync(
             paths,
-            "command.send",
-            {"address": args.address, "command": command},
+            "sound.capture",
+            {
+                **_target_payload(args),
+                "command": command,
+                "wait": args.wait,
+                "timeout": (
+                    _sound_capture_wait_timeout("start", args.max_seconds)
+                    if args.wait
+                    else SOUND_NO_WAIT_ACCEPT_SECONDS
+                ),
+            },
         )
     if args.subcommand == "sound" and args.sound_action == "background":
         command = build_sound_background_command(
-            destination=args.dest,
             max_seconds=args.max_seconds,
         )
         return send_request_sync(
             paths,
-            "command.send",
-            {"address": args.address, "command": command},
+            "sound.capture",
+            {
+                **_target_payload(args),
+                "command": command,
+                "wait": args.wait,
+                "timeout": (
+                    _sound_capture_wait_timeout("background", args.max_seconds)
+                    if args.wait
+                    else SOUND_NO_WAIT_ACCEPT_SECONDS
+                ),
+            },
         )
     if args.subcommand == "sound" and args.sound_action == "stop":
         return send_request_sync(
             paths,
-            "command.send",
-            {"address": args.address, "command": SOUND_STOP_COMMAND},
+            "sound.stop",
+            {
+                **_target_payload(args),
+                "wait": args.wait,
+                "timeout": SOUND_STOP_WAIT_SECONDS,
+            },
         )
     if args.subcommand == "sound" and args.sound_action == "status":
         return send_request_sync(
             paths,
             "sound.status",
-            {"address": args.address, "command": SOUND_STATUS_COMMAND},
+            {**_target_payload(args), "command": SOUND_STATUS_COMMAND},
         )
     if args.subcommand == "config" and args.config_command == "set":
         return send_request_sync(
             paths,
             "config.set",
-            {"address": args.address, "field": args.field, "value": args.value},
+            {**_config_target_payload(args), "field": args.field, "value": args.value},
         )
     if args.subcommand == "config" and args.config_command == "apply":
         return send_request_sync(paths, "config.apply")
@@ -811,15 +887,168 @@ def _send(paths: AppPaths, args: argparse.Namespace) -> object:
         return send_request_sync(
             paths,
             "raw.tail",
-            {"address": args.address, "lines": args.lines},
+            {**_target_payload(args, required=False), "lines": args.lines},
         )
     if args.subcommand == "unitspace" and args.unitspace_command == "status":
         return send_request_sync(paths, "unitspace.status")
     if args.subcommand == "power" and args.power_command == "status":
-        return send_request_sync(paths, "power.status", {"address": args.address})
+        return send_request_sync(paths, "power.status", _target_payload(args, required=False))
     if args.subcommand == "battery" and args.battery_command == "status":
-        return send_request_sync(paths, "battery.status", {"address": args.address})
+        return send_request_sync(paths, "battery.status", _target_payload(args, required=False))
     raise RuntimeError("unhandled CLI command")
+
+
+def _should_show_default_wait_eta(
+    args: argparse.Namespace,
+    cli_args: Sequence[str],
+) -> bool:
+    return bool(
+        args.subcommand == "sound"
+        and args.sound_action in {"start", "background", "stop"}
+        and getattr(args, "wait", False)
+        and "--wait" not in cli_args
+        and "--no-wait" not in cli_args
+        and getattr(sys.stderr, "isatty", lambda: False)()
+    )
+
+
+def _send_with_default_wait_eta(
+    paths: AppPaths,
+    args: argparse.Namespace,
+) -> object:
+    results: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+    def send_in_background() -> None:
+        try:
+            results.put((True, _send(paths, args)))
+        except BaseException as exc:
+            results.put((False, exc))
+
+    worker = threading.Thread(
+        target=send_in_background,
+        name="sound-cli-wait",
+        daemon=True,
+    )
+    worker.start()
+
+    estimate_seconds, deadline_seconds, estimate_kind = _sound_eta_budget(args)
+    started_at = time.monotonic()
+    try:
+        while worker.is_alive():
+            elapsed = time.monotonic() - started_at
+            _render_sound_eta(
+                elapsed=elapsed,
+                estimate_seconds=estimate_seconds,
+                deadline_seconds=deadline_seconds,
+                estimate_kind=estimate_kind,
+            )
+            worker.join(timeout=0.2)
+    finally:
+        _clear_sound_eta()
+
+    succeeded, value = results.get()
+    if not succeeded:
+        assert isinstance(value, BaseException)
+        raise value
+    return value
+
+
+def _sound_eta_budget(args: argparse.Namespace) -> tuple[float, float, str]:
+    if args.sound_action == "start":
+        estimate = float(SOUND_ARM_WAIT_SECONDS + args.max_seconds)
+        deadline = float(_sound_capture_wait_timeout("start", args.max_seconds))
+        return estimate, deadline, "upper bound"
+    if args.sound_action == "background":
+        estimate = float(args.max_seconds)
+        deadline = float(_sound_capture_wait_timeout("background", args.max_seconds))
+        return estimate, deadline, "estimate"
+    timeout = float(SOUND_STOP_WAIT_SECONDS)
+    return timeout, timeout, "upper bound"
+
+
+def _sound_capture_wait_timeout(action: str, max_seconds: int) -> int:
+    finalize_seconds = max(
+        SOUND_FINALIZE_MIN_SECONDS,
+        (max_seconds + 1) // 2,
+    )
+    arm_seconds = SOUND_ARM_WAIT_SECONDS if action == "start" else 0
+    return arm_seconds + max_seconds + finalize_seconds
+
+
+def _render_sound_eta(
+    *,
+    elapsed: float,
+    estimate_seconds: float,
+    deadline_seconds: float,
+    estimate_kind: str,
+) -> None:
+    width = 24
+    progress = min(max(elapsed / max(estimate_seconds, 0.001), 0.0), 1.0)
+    filled = min(width, int(progress * width))
+    bar = "#" * filled + "-" * (width - filled)
+    if elapsed < estimate_seconds:
+        remaining = estimate_seconds - elapsed
+        eta = f"ETA {'<=' if estimate_kind == 'upper bound' else '~'} {_format_eta(remaining)}"
+    else:
+        timeout_remaining = max(0.0, deadline_seconds - elapsed)
+        eta = f"finalizing; timeout <= {_format_eta(timeout_remaining)}"
+    sys.stderr.write(f"\r\033[2K SOUND WAIT [{bar}] {eta}")
+    sys.stderr.flush()
+
+
+def _clear_sound_eta() -> None:
+    sys.stderr.write("\r\033[2K")
+    sys.stderr.flush()
+
+
+def _format_eta(seconds: float) -> str:
+    total = max(0, int(seconds + 0.999))
+    minutes, remaining_seconds = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
+    return f"{minutes:02d}:{remaining_seconds:02d}"
+
+
+def _target_payload(
+    args: argparse.Namespace,
+    *,
+    required: bool = True,
+) -> dict[str, str]:
+    address = getattr(args, "address", None)
+    location = getattr(args, "location", None)
+    if address:
+        return {"address": str(address)}
+    if location:
+        return {"location": str(location)}
+    if required:
+        raise ValueError("provide exactly one target: --address MAC or --location NAME")
+    return {}
+
+
+def _config_target_payload(args: argparse.Namespace) -> dict[str, str]:
+    option_address = getattr(args, "target_address", None)
+    location = getattr(args, "target_location", None)
+    legacy_address = getattr(args, "legacy_address", None)
+    if legacy_address and (option_address or location):
+        raise ValueError(
+            "do not combine the compatibility positional ADDRESS with --address/--location"
+        )
+    if option_address:
+        return {"address": str(option_address)}
+    if location:
+        return {"location": str(location)}
+    if legacy_address:
+        return {"address": str(legacy_address)}
+    raise ValueError("provide exactly one target: --address MAC or --location NAME")
+
+
+def _resolve_local_target(paths: AppPaths, args: argparse.Namespace) -> str | None:
+    address = getattr(args, "address", None)
+    location = getattr(args, "location", None)
+    if not address and not location:
+        return None
+    return DeviceConfigStore(paths).resolve_target(address=address, location=location)
 
 
 def _run_database(paths: AppPaths, args: argparse.Namespace) -> dict[str, object]:
@@ -836,6 +1065,11 @@ def _run_database(paths: AppPaths, args: argparse.Namespace) -> dict[str, object
 
 
 def _print_result(args: argparse.Namespace, data: object) -> None:
+    if isinstance(data, dict):
+        warnings = data.get("warnings")
+        if isinstance(warnings, list):
+            for warning in warnings:
+                print(f"WARNING: {warning}", file=sys.stderr)
     if args.list_flag or args.subcommand == "devices":
         _print_devices(data)
         return
@@ -850,7 +1084,7 @@ def _print_result(args: argparse.Namespace, data: object) -> None:
         if args.sound_action == "status":
             print(json.dumps(data, ensure_ascii=False, indent=2))
         else:
-            _print_command_send(data)
+            _print_sound_outcome(data)
         return
     if args.subcommand == "battery":
         _print_battery_status(data)
@@ -866,14 +1100,31 @@ def _print_devices(data: object) -> None:
     if not devices:
         print("No devices")
         return
-    print(f"{'Address':<20}{'Type':<15}{'Name':<15}{'Location':<15}{'Connected':<10}")
+    print(
+        f"{'Address':<20}{'Type':<15}{'Name':<15}{'Location':<15}"
+        f"{'Connected':<10}{'Conflict':<10}"
+    )
+    conflict_groups: dict[str, set[str]] = {}
     for item in devices:
+        location = str(item.get("location", "undefined"))
+        if item.get("location_conflict"):
+            conflict_groups.setdefault(location, set()).update(
+                str(address)
+                for address in item.get("location_conflict_devices", [])
+            )
         print(
             f"{str(item.get('address', '')):<20}"
             f"{str(item.get('type') or ''):<15}"
             f"{str(item.get('configured_name') or item.get('name') or ''):<15}"
-            f"{str(item.get('location', 'undefined')):<15}"
+            f"{location:<15}"
             f"{str(item.get('connected', False)):<10}"
+            f"{'YES' if item.get('location_conflict') else '':<10}"
+        )
+    for location, addresses in conflict_groups.items():
+        print(
+            f"WARNING: duplicate location {location!r}: {', '.join(sorted(addresses))}. "
+            "Commands using --location are blocked until each device has a unique location.",
+            file=sys.stderr,
         )
 
 
@@ -887,6 +1138,83 @@ def _print_command_send(data: object) -> None:
         f"address={payload.get('address')} "
         f"session={session_payload.get('address')}"
     )
+
+
+def _print_sound_outcome(data: object) -> None:
+    payload = data if isinstance(data, dict) else {}
+    outcome = payload.get("outcome")
+    result = outcome if isinstance(outcome, dict) else {}
+    session_value = result.get("session")
+    session = session_value if isinstance(session_value, dict) else {}
+    status = str(result.get("status") or "failed")
+    prefix = {
+        "complete": "SOUND COMPLETE",
+        "armed": "SOUND ARMED",
+        "queued": "SOUND STOP QUEUED",
+    }.get(status, "SOUND FAILED")
+    fields = [
+        f"location={session.get('location', 'undefined')}",
+        f"label={session.get('label', 'unknown')}",
+        f"cid={session.get('cid') or 'unknown'}",
+        f"reason={result.get('reason') or 'unknown'}",
+    ]
+    if status == "complete":
+        fields.extend(
+            [
+                f"samples={session.get('samples')}",
+                f"blocks={session.get('blocks')}",
+            ]
+        )
+    if status == "failed":
+        fields.append(f"complete={1 if result.get('complete') else 0}")
+    fields.append("storage=node_sd")
+    print(f"{prefix} {' '.join(fields)}")
+
+
+def _result_exit_code(args: argparse.Namespace, data: object) -> int:
+    if args.subcommand != "sound" or args.sound_action == "status":
+        return 0
+    payload = data if isinstance(data, dict) else {}
+    outcome = payload.get("outcome")
+    if isinstance(outcome, dict):
+        return int(outcome.get("exit_code", 0))
+    return 1
+
+
+def _handle_sound_interrupt(paths: AppPaths, args: argparse.Namespace) -> int:
+    if (
+        args.subcommand != "sound"
+        or args.sound_action not in {"start", "background"}
+        or not getattr(args, "wait", False)
+    ):
+        return 130
+    print("SOUND interrupt: requesting Node stop...", file=sys.stderr)
+    try:
+        data = send_request_sync(
+            paths,
+            "sound.stop",
+            {
+                **_target_payload(args),
+                "wait": True,
+                "timeout": SOUND_INTERRUPT_STOP_WAIT_SECONDS,
+            },
+        )
+        _print_sound_outcome(data)
+        return _result_exit_code(args, data)
+    except KeyboardInterrupt:
+        print(
+            "SOUND warning: local CLI interrupted before stop confirmation; "
+            "Node capture may still be running.",
+            file=sys.stderr,
+        )
+        return 130
+    except Exception as exc:
+        print(
+            f"SOUND warning: stop confirmation failed ({exc}); "
+            "Node capture may still be running.",
+            file=sys.stderr,
+        )
+        return 1
 
 
 def _print_battery_status(data: object) -> None:

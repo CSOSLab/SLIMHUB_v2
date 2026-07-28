@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import struct
 import tempfile
@@ -418,24 +419,105 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status["uptime"], 12345)
             self.assertEqual(status["ok"], 1)
 
-    async def test_explicit_sound_capture_stores_audio_without_estimator_input(self) -> None:
+    async def test_command_can_target_unique_configured_location(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             address = "AA:BB:CC:DD:EE:01"
             daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
             session = FakeSession(address)
             await daemon.registry.add(session)
+            daemon.config_store.set_field(address, "location", "TOILET")
 
-            await daemon.send_command(
-                address,
-                "sound_start,label=pee,dest=ble,thr=800,max=60,silence=5",
+            response = await daemon.dispatch(
+                {
+                    "command": "command.send",
+                    "args": {"location": "toilet", "command": "enter"},
+                }
             )
+
+            self.assertTrue(response["ok"])
+            self.assertEqual(response["data"]["address"], address)
+            self.assertEqual(response["data"]["location"], "TOILET")
+            self.assertEqual(session.commands[-1].command, "enter")
+
+    async def test_duplicate_location_blocks_command_and_lists_devices(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = "AA:BB:CC:DD:EE:01"
+            second = "AA:BB:CC:DD:EE:02"
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            daemon.config_store.set_field(first, "location", "KITCHEN")
+            daemon.config_store.set_field(second, "location", "KITCHEN")
+
+            with self.assertRaises(ValueError) as error:
+                await daemon.dispatch(
+                    {
+                        "command": "command.send",
+                        "args": {"location": "KITCHEN", "command": "enter"},
+                    }
+                )
+
+            message = str(error.exception)
+            self.assertIn("cannot be used for a command", message)
+            self.assertIn(first, message)
+            self.assertIn(second, message)
+
+            devices = (await daemon.dispatch({"command": "devices"}))["data"]
+            conflicts = [item for item in devices if item["location_conflict"]]
+            self.assertEqual(len(conflicts), 2)
+            self.assertEqual(
+                set(conflicts[0]["location_conflict_devices"]),
+                {first, second},
+            )
+
+    async def test_config_location_collision_is_numbered_and_warned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = "AA:BB:CC:DD:EE:01"
+            second = "AA:BB:CC:DD:EE:02"
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            daemon.config_store.set_field(first, "location", "BEDROOM")
+
+            response = await daemon.dispatch(
+                {
+                    "command": "config.set",
+                    "args": {
+                        "address": second,
+                        "field": "location",
+                        "value": "BEDROOM",
+                    },
+                }
+            )
+
+            self.assertEqual(response["data"]["location"], "BEDROOM_2")
+            self.assertEqual(len(response["data"]["warnings"]), 1)
+            self.assertIn(first, response["data"]["warnings"][0])
+
+    async def test_waited_sound_capture_uses_reports_and_never_creates_central_wav(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            address = "AA:BB:CC:DD:EE:01"
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            session = FakeSession(address)
+            await daemon.registry.add(session)
+            daemon.config_store.set_field(address, "location", "TOILET")
+
+            request = asyncio.create_task(
+                daemon.dispatch(
+                    {
+                        "command": "sound.capture",
+                        "args": {
+                            "location": "TOILET",
+                            "command": "sound_start,label=pee,thr=800,max=60,silence=5",
+                            "wait": True,
+                            "timeout": 1.0,
+                        },
+                    }
+                )
+            )
+            await asyncio.sleep(0)
             await daemon.handle_frame(
                 address,
                 sound_report_frame(
                     address,
                     "CAPTURE_ARMED",
                     label="pee",
-                    dest="ble",
                 ),
             )
             await daemon.handle_frame(
@@ -444,7 +526,6 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
                     address,
                     "CAPTURE_START",
                     label="pee",
-                    dest="ble",
                 ),
             )
             await daemon.handle_frame(address, audio_frame(address))
@@ -458,17 +539,50 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
                     queue_drop="0",
                     ble_drop="0",
                     reason="command_stop",
+                    complete="1",
                 ),
             )
 
-            root = Path(tmpdir) / "data" / "sound" / address / "pee"
-            manifest = json.loads(
-                (root / "00ab12cd.json").read_text(encoding="utf-8")
-            )
-            self.assertTrue((root / "00ab12cd.wav").exists())
-            self.assertTrue(manifest["complete"])
+            response = await asyncio.wait_for(request, timeout=1.0)
+            self.assertTrue(response["data"]["outcome"]["success"])
+            self.assertFalse((Path(tmpdir) / "data" / "sound").exists())
             self.assertIsNone(daemon.estimator.snapshot()["last_address"])
             self.assertEqual(session.commands[0].command.split(",")[0], "sound_start")
+
+    async def test_sound_status_waits_for_fresh_node_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            address = "AA:BB:CC:DD:EE:01"
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            session = FakeSession(address)
+            await daemon.registry.add(session)
+            daemon.config_store.set_field(address, "location", "TOILET")
+
+            request = asyncio.create_task(
+                daemon.dispatch(
+                    {
+                        "command": "sound.status",
+                        "args": {"location": "TOILET"},
+                    }
+                )
+            )
+            await asyncio.sleep(0)
+            await daemon.handle_frame(
+                address,
+                sound_report_frame(
+                    address,
+                    "CAPTURE_STATUS",
+                    state="ACTIVE",
+                    label="background",
+                ),
+            )
+            response = await asyncio.wait_for(request, timeout=1.0)
+
+            self.assertTrue(response["data"]["fresh_report"])
+            self.assertEqual(
+                response["data"]["capture"]["status"]["state"],
+                "ACTIVE",
+            )
+            self.assertEqual(session.commands[0].command, "sound_status")
 
     async def test_two_node_ack_replay_confirms_only_destination_without_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -127,6 +127,7 @@ class DeviceSession:
         await self._wait_for_target_update()
         while not self._stop_event.is_set():
             disconnected_event = asyncio.Event()
+            command_failure_event = asyncio.Event()
             reported_connected = False
             loop = asyncio.get_running_loop()
 
@@ -146,7 +147,6 @@ class DeviceSession:
                     self._client = client
                     self.connected = bool(client.is_connected)
                     self.waiting_for_advertisement = False
-                    await self._request_maximum_mtu(client)
 
                     assembler = FrameAssembler()
                     await asyncio.wait_for(
@@ -165,12 +165,13 @@ class DeviceSession:
                     self._unavailable_logged = False
 
                 command_task = asyncio.create_task(
-                    self._command_worker(client),
+                    self._command_worker(client, command_failure_event),
                     name=f"ble-command:{self.address}",
                 )
                 wait_tasks = {
                     asyncio.create_task(self._stop_event.wait()),
                     asyncio.create_task(disconnected_event.wait()),
+                    asyncio.create_task(command_failure_event.wait()),
                 }
                 done, pending = await asyncio.wait(
                     wait_tasks,
@@ -223,7 +224,10 @@ class DeviceSession:
 
             if not self._stop_event.is_set():
                 self.waiting_for_advertisement = True
-                await self._wait_for_target_update()
+                # A scanner update may arrive first, but reconnecting must not
+                # depend on it.  In particular, --no-scan deployments used to
+                # remain offline forever after one transient disconnect.
+                await self._wait_for_reconnect()
 
     def _build_notify_handler(self, assembler: FrameAssembler) -> Callable[[object, bytearray], None]:
         def handle_notify(sender: object, data: bytearray) -> None:
@@ -257,9 +261,8 @@ class DeviceSession:
         return handle_notify
 
     async def _dispatch_frame(self, frame: ParsedFrame) -> None:
-        # Preserve wire order across notification callbacks. AUDIO gap
-        # detection depends on REPORT/AUDIO and consecutive blocks reaching
-        # the daemon in the same order in which the assembler emitted them.
+        # Preserve wire order across notification callbacks so state-changing
+        # REPORT and RAWDATA records reach the daemon in emission order.
         async with self._frame_handler_lock:
             await self.on_frame(self.address, frame)
 
@@ -271,27 +274,11 @@ class DeviceSession:
         if error is not None:
             self.logger.error("%s frame handler failed: %s", self.address, error)
 
-    async def _request_maximum_mtu(self, client: BleakClient) -> None:
-        try:
-            request_mtu = getattr(client, "request_mtu", None)
-            if callable(request_mtu):
-                await request_mtu(517)
-            else:
-                backend = getattr(client, "_backend", None)
-                acquire_mtu = getattr(backend, "_acquire_mtu", None)
-                if callable(acquire_mtu):
-                    await acquire_mtu()
-            self.logger.info(
-                "%s BLE MTU=%s",
-                self.address,
-                getattr(client, "mtu_size", "unknown"),
-            )
-        except Exception as exc:
-            # MTU negotiation is an optimization; NUS framing remains valid
-            # with smaller ATT notifications through the per-connection assembler.
-            self.logger.warning("%s BLE MTU negotiation failed: %s", self.address, exc)
-
-    async def _command_worker(self, client: BleakClient) -> None:
+    async def _command_worker(
+        self,
+        client: BleakClient,
+        command_failure_event: asyncio.Event | None = None,
+    ) -> None:
         while not self._stop_event.is_set():
             key = await self._command_queue.get()
             async with self._command_lock:
@@ -319,6 +306,13 @@ class DeviceSession:
                     if key not in self._pending_commands:
                         self._pending_commands[key] = command
                         await self._command_queue.put(key)
+                if command_failure_event is not None:
+                    # Continuing to write against a GATT link that has just
+                    # failed can strand a capture command indefinitely.  The
+                    # outer session loop tears the link down, reconnects, and
+                    # drains the preserved command queue on the new client.
+                    command_failure_event.set()
+                    return
                 await asyncio.sleep(min(self.reconnect_delay, 1.0))
 
     async def _notify_command_result(
@@ -347,6 +341,27 @@ class DeviceSession:
             for task in done:
                 with suppress(asyncio.CancelledError):
                     task.result()
+
+    async def _wait_for_reconnect(self) -> None:
+        """Wait for an explicit target refresh or the normal retry delay."""
+        if self._target_updated_event.is_set():
+            self._target_updated_event.clear()
+            return
+        stop_task = asyncio.create_task(self._stop_event.wait())
+        update_task = asyncio.create_task(self._target_updated_event.wait())
+        delay_task = asyncio.create_task(asyncio.sleep(self.reconnect_delay))
+        done, pending = await asyncio.wait(
+            {stop_task, update_task, delay_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if update_task in done:
+            self._target_updated_event.clear()
+        for task in done:
+            with suppress(asyncio.CancelledError):
+                task.result()
 
     def _is_expected_connect_failure(self, exc: Exception) -> bool:
         if isinstance(exc, (TimeoutError, ConnectionError)):

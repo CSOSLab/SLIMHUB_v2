@@ -11,6 +11,13 @@ from slimhub.protocol.nus import DEFAULT_DEVICE_NAME, normalize_mac
 
 DEFAULT_LOCATION = "undefined"
 DEFAULT_DEVICE_TYPE = DEFAULT_DEVICE_NAME
+UNASSIGNED_LOCATION_NAMES = frozenset(
+    {"", "undefined", "unnamed", "unknown", "none", "null", "unassigned"}
+)
+
+
+class LocationTargetError(ValueError):
+    """Raised when a location cannot safely identify exactly one device."""
 
 
 def get_mac_address() -> str:
@@ -201,6 +208,84 @@ class DeviceConfigStore:
         setattr(config, field, value)
         return self.save(config)
 
+    def set_field_unique(
+        self,
+        address: str,
+        field: str,
+        value: str,
+    ) -> tuple[DeviceConfig, str | None]:
+        """Set a field and number a colliding assigned location automatically."""
+        normalized = normalize_mac(address)
+        warning = None
+        requested = value.strip() if field == "location" else value
+        assigned = requested
+        if field == "location" and is_assigned_location(requested):
+            other_configs = [
+                config
+                for config in self.list_all()
+                if config.address != normalized and is_assigned_location(config.location)
+            ]
+            used = {location_key(config.location) for config in other_configs}
+            if location_key(requested) in used:
+                suffix = 2
+                while location_key(f"{requested}_{suffix}") in used:
+                    suffix += 1
+                assigned = f"{requested}_{suffix}"
+                conflicts = [
+                    config.address
+                    for config in other_configs
+                    if location_key(config.location) == location_key(requested)
+                ]
+                warning = (
+                    f"location {requested!r} is already assigned to "
+                    f"{', '.join(conflicts)}; assigned {assigned!r} to {normalized}. "
+                    "Use unique location names when targeting devices."
+                )
+        return self.set_field(normalized, field, assigned), warning
+
+    def resolve_target(
+        self,
+        *,
+        address: object | None = None,
+        location: object | None = None,
+    ) -> str:
+        """Resolve exactly one address or one unique, assigned location."""
+        has_address = isinstance(address, str) and bool(address.strip())
+        has_location = isinstance(location, str) and bool(location.strip())
+        if has_address == has_location:
+            raise ValueError("provide exactly one target: --address MAC or --location NAME")
+        if has_address:
+            return normalize_mac(str(address))
+
+        requested = str(location).strip()
+        if not is_assigned_location(requested):
+            raise LocationTargetError(
+                f"location {requested!r} is an initial/unassigned name and cannot be "
+                "used as a device target; configure a unique location using --address"
+            )
+        matches = [
+            config
+            for config in self.list_all()
+            if is_assigned_location(config.location)
+            and location_key(config.location) == location_key(requested)
+        ]
+        if not matches:
+            raise LocationTargetError(
+                f"no device is configured with location {requested!r}; run "
+                "'slimhub-v2 devices' and configure it using --address"
+            )
+        if len(matches) > 1:
+            devices = ", ".join(
+                f"{config.address} (location={config.location!r}, name={config.name or '-'!r})"
+                for config in matches
+            )
+            raise LocationTargetError(
+                f"location {requested!r} is duplicated and cannot be used for a command. "
+                f"Conflicting devices: {devices}. Fix them with 'slimhub-v2 config set "
+                "--address <MAC> location <UNIQUE_LOCATION>' before retrying"
+            )
+        return matches[0].address
+
     def ensure(
         self,
         address: str,
@@ -230,3 +315,11 @@ class DeviceConfigStore:
                 )
             )
         return configs
+
+
+def location_key(location: str) -> str:
+    return location.strip().casefold()
+
+
+def is_assigned_location(location: object) -> bool:
+    return isinstance(location, str) and location_key(location) not in UNASSIGNED_LOCATION_NAMES
