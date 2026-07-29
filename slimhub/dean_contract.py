@@ -221,14 +221,17 @@ class DeanContractStore:
             node.profile = _text(fields.get("profile")) or node.profile
             node.class_count = _int(fields.get("class_count"), node.class_count)
             node.semantic = _text(fields.get("semantic")) or node.semantic
-            node.config = _text(fields.get("status")) or node.config
+            node.config = _text(fields.get("status")) or "READY"
             node.model = _text(fields.get("model")) or node.model
             node.generation = _text(fields.get("generation")) or node.generation
             node.source = _text(fields.get("source")) or node.source
             node.timestamp = _text(fields.get("ts")) or node.timestamp
+            node.last_reason = None
             node.fields.update(fields)
         elif name == "REJECTED":
+            node.config = "REJECTED"
             node.last_reason = _text(fields.get("reason")) or "config_rejected"
+            node.fields.update(fields)
         else:
             node.fields.update(fields)
         self._record(

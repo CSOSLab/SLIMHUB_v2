@@ -349,13 +349,24 @@ JSON key, future schema, 31자를 넘은 sequence와 malformed JSON도 parser를
 
 ## Sound schema
 
-sound class index는 전역 semantic이 아닙니다. TOILET/toilet_v1은 10개,
-KITCHEN/kitchen_v1은 9개, LIVING/BEDROOM/living_v1은 5개 class입니다.
-예를 들어 index 4는 KITCHEN에서 `cooking`, TOILET에서 `brushing`,
-LIVING/BEDROOM에서 `snoring`입니다. Node REPORT의 semantic/profile/location/
-class_count/model을 함께 저장하고 `semantic=0` 또는 config not READY면 label을
-추측하지 않습니다. RAWDATA의 16개 int8 slot 중 class_count 이후 padding은
-score가 아니며 zero padding을 0.5로 변환하지 않습니다.
+sound class index는 전역 semantic이 아닙니다.
+`src=SOUND,event=INFERENCE,schema=2`에서는 Node가 보낸
+`location/model/class_count/label/semantic`이 authority입니다. 예를 들어 같은
+index 5도 TOILET model에서는 `flushing`, KITCHEN의 다른 model에서는
+`microwave`일 수 있으며 둘은 충돌하지 않습니다. 저장소와 catalog는 이를
+`(MAC,bid,model,location)`별로 분리합니다.
+
+```bash
+slimhub-v2 sound catalog
+slimhub-v2 sound catalog --location TOILET
+```
+
+`semantic=unknown`, semantic disabled, config not READY, 또는 Node metadata
+mismatch는 원문 label과 함께 저장하지만 ADL semantic으로 재해석하지 않습니다.
+RAWDATA의 16개 int8 slot은 legacy telemetry일 뿐이며 class_count 이후 padding은
+score가 아니고 zero padding도 0.5로 변환하지 않습니다. 상세 계약과 SQLite
+migration은 [dynamic sound catalog v2](docs/dynamic-sound-catalog-v2.md)를
+참고합니다.
 
 automatic capture 기본값은 Node에 저장된 57/52 dB를 사용하므로 threshold를
 전송하지 않습니다.

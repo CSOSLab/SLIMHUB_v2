@@ -57,7 +57,7 @@ MINIMAL_AUDIT_KINDS = {
     "multimodal_error",
     "raw_sound_metadata",
 }
-CONTRACT_RECORD_PREFIXES = ("node_", "config_", "inout_")
+CONTRACT_RECORD_PREFIXES = ("node_", "config_", "inout_", "sound_")
 
 
 class RawDataLogger:
@@ -285,8 +285,13 @@ class RawDataLogger:
             sound = [None] * schema.class_count
         else:
             try:
+                selector = event.sound_profile or event.sound_schema_version
+                if not selector:
+                    raise ValueError(
+                        "legacy sound scores require a per-device schema"
+                    )
                 schema = resolve_sound_schema(
-                    event.sound_profile or event.sound_schema_version,
+                    selector,
                     event.sound_class_count,
                 )
                 sound = list(packet.sound[: schema.class_count])

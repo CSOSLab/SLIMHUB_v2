@@ -348,6 +348,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  slimhub-v2 sound background --location TOILET --max-seconds 10\n"
             "  slimhub-v2 sound background --location TOILET --no-wait\n"
             "  slimhub-v2 sound status --location TOILET\n"
+            "  slimhub-v2 sound catalog --location TOILET\n"
             "  slimhub-v2 sound stop --location TOILET"
         ),
         formatter_class=_HelpFormatter,
@@ -420,6 +421,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_wait_option(sound_stop, no_wait_result="the stop command is queued")
     sound_status = sound_subparsers.add_parser("status", help="Request and show capture state.")
     _add_target_options(sound_status, required=True)
+    sound_catalog = sound_subparsers.add_parser(
+        "catalog",
+        help="Show Node-authoritative model labels and the latest inference.",
+    )
+    _add_target_options(
+        sound_catalog,
+        required=False,
+        address_help="Restrict the catalog to one Node; omit for every observed Node.",
+        location_help="Restrict the catalog to one uniquely configured location.",
+    )
 
     sound_automatic = sound_subparsers.add_parser(
         "automatic",
@@ -716,6 +727,7 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
             asyncio.run(daemon.run(address=target_address, scan=not args.no_scan))
             return 0
 
+        data: object
         if args.hubconfig:
             data = HubConfigStore(paths).set_field(args.hubconfig[0], args.hubconfig[1]).__dict__
         elif args.subcommand == "db":
@@ -947,6 +959,12 @@ def _send(paths: AppPaths, args: argparse.Namespace) -> object:
             paths,
             "sound.status",
             {**_target_payload(args), "command": SOUND_STATUS_COMMAND},
+        )
+    if args.subcommand == "sound" and args.sound_action == "catalog":
+        return send_request_sync(
+            paths,
+            "sound.catalog",
+            _target_payload(args, required=False),
         )
     if args.subcommand == "sound" and args.sound_action == "automatic":
         command = build_sound_auto_command(
@@ -1200,7 +1218,8 @@ def _print_result(args: argparse.Namespace, data: object) -> None:
         _print_devices(data)
         return
     if args.subcommand == "raw":
-        for line in (data or {}).get("lines", []):
+        raw_payload = data if isinstance(data, dict) else {}
+        for line in raw_payload.get("lines", []):
             print(line)
         return
     if args.subcommand == "command":
@@ -1209,6 +1228,8 @@ def _print_result(args: argparse.Namespace, data: object) -> None:
     if args.subcommand == "sound":
         if args.sound_action == "status":
             print(json.dumps(data, ensure_ascii=False, indent=2))
+        elif args.sound_action == "catalog":
+            _print_sound_catalog(data)
         else:
             _print_sound_outcome(data)
         return
@@ -1297,8 +1318,43 @@ def _print_sound_outcome(data: object) -> None:
     print(f"{prefix} {' '.join(fields)}")
 
 
+def _print_sound_catalog(data: object) -> None:
+    entries = (
+        [entry for entry in data if isinstance(entry, dict)]
+        if isinstance(data, list)
+        else []
+    )
+    if not entries:
+        print("No sound inference catalog entries")
+        return
+    for entry in entries:
+        latest_value = entry.get("last_inference")
+        latest = latest_value if isinstance(latest_value, dict) else {}
+        print(
+            f"ENTRY {entry.get('node_mac')} {entry.get('location')} "
+            f"model={entry.get('model')} classes={entry.get('class_count')}"
+        )
+        print(
+            "  last: "
+            f"index={latest.get('class_index')} "
+            f"label={latest.get('label')} "
+            f"semantic={latest.get('semantic')} "
+            f"conf={latest.get('confidence')} "
+            f"source={latest.get('source')}"
+        )
+        observed = entry.get("catalog")
+        if isinstance(observed, list):
+            labels = ", ".join(
+                f"{item.get('class_index')}={item.get('label')}"
+                for item in observed
+                if isinstance(item, dict)
+            )
+            if labels:
+                print(f"  catalog: {labels}")
+
+
 def _result_exit_code(args: argparse.Namespace, data: object) -> int:
-    if args.subcommand != "sound" or args.sound_action == "status":
+    if args.subcommand != "sound" or args.sound_action in {"status", "catalog"}:
         return 0
     payload = data if isinstance(data, dict) else {}
     outcome = payload.get("outcome")

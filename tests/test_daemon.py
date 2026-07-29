@@ -95,6 +95,19 @@ def raw_frame(address: str, detected: int) -> ParsedFrame:
     )
 
 
+def raw_sound_frame(address: str) -> ParsedFrame:
+    payload = struct.pack(
+        "<BB7HB16b",
+        0,
+        0,
+        *([0] * 7),
+        1,
+        *([-64] * 10),
+        *([0] * 6),
+    )
+    return parse_frame(build_frame(address, "RAWDATA", payload))
+
+
 def report_frame(address: str, message: str, fields: dict[str, str]) -> ParsedFrame:
     payload = message.encode("utf-8")
     return ParsedFrame(
@@ -717,6 +730,84 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
                 "ACTIVE",
             )
             self.assertEqual(session.commands[0].command, "sound_status")
+
+    async def test_sound_inference_and_adjacent_rawdata_count_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            address = "AA:BB:CC:DD:EE:01"
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            fields = {
+                "src": "SOUND",
+                "event": "INFERENCE",
+                "schema": "2",
+                "bid": "1a2b3c4d",
+                "location": "TOILET",
+                "class_index": "5",
+                "class_count": "10",
+                "label": "flushing",
+                "semantic": "flushing",
+                "confidence": "0.91",
+                "model": "0cb81518",
+                "source": "tflm",
+                "rms": "1420.5",
+                "db": "61.2",
+                "ts": "45000",
+                "duration_ms": "1000",
+            }
+            message = ",".join(f"{key}={value}" for key, value in fields.items())
+
+            await daemon.handle_frame(
+                address,
+                report_frame(address, message, fields),
+            )
+            await daemon.handle_frame(address, raw_sound_frame(address))
+
+            self.assertEqual(daemon.sound_inference.inference_count(), 1)
+            latest = daemon.sound_inference.snapshot(address)[0]["last_inference"]
+            self.assertEqual(latest["label"], "flushing")
+
+    async def test_malformed_sound_inference_is_diagnostic_and_daemon_continues(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            address = "AA:BB:CC:DD:EE:01"
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            fields = {
+                "src": "SOUND",
+                "event": "INFERENCE",
+                "schema": "2",
+                "bid": "1a2b3c4d",
+                "location": "TOILET",
+                "class_index": "20",
+                "class_count": "20",
+                "label": "invalid",
+                "semantic": "unknown",
+                "confidence": "0.4",
+                "model": "0cb81518",
+                "source": "tflm",
+                "ts": "45000",
+                "duration_ms": "1000",
+            }
+            message = ",".join(f"{key}={value}" for key, value in fields.items())
+
+            await daemon.handle_frame(
+                address,
+                report_frame(address, message, fields),
+            )
+
+            self.assertFalse(daemon.stop_event.is_set())
+            self.assertEqual(daemon.sound_inference.inference_count(), 0)
+            self.assertEqual(
+                daemon.sound_inference.diagnostic_count(
+                    "sound_inference_rejected"
+                ),
+                1,
+            )
+            audit = next(
+                (Path(tmpdir) / "programdata" / "reports").glob("*.jsonl")
+            ).read_text(encoding="utf-8")
+            self.assertIn(address, audit)
+            self.assertIn(message, audit)
+            self.assertIn("less than class_count", audit)
 
     async def test_two_node_ack_replay_confirms_only_destination_without_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

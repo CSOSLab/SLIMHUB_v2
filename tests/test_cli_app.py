@@ -155,6 +155,45 @@ class CliAppTests(unittest.TestCase):
         self.assertEqual(no_wait_call.args[2]["timeout"], 180)
         self.assertIn("SOUND ARMED", output)
 
+    def test_sound_catalog_formats_node_authoritative_latest_inference(self) -> None:
+        response = [
+            {
+                "node_mac": ADDRESS,
+                "boot_id": "1a2b3c4d",
+                "location": "TOILET",
+                "model": "0cb81518",
+                "class_count": 10,
+                "catalog": [
+                    {
+                        "class_index": 5,
+                        "label": "flushing",
+                        "class_count": 10,
+                        "observations": 1,
+                    }
+                ],
+                "last_inference": {
+                    "class_index": 5,
+                    "label": "flushing",
+                    "semantic": "flushing",
+                    "confidence": 0.91,
+                    "source": "tflm",
+                },
+            }
+        ]
+        status, call, output = self.run_command_cli(
+            ["sound", "catalog", "--address", ADDRESS],
+            response,
+        )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(call.args[1], "sound.catalog")
+        self.assertEqual(call.args[2], {"address": ADDRESS})
+        self.assertIn(
+            f"ENTRY {ADDRESS} TOILET model=0cb81518 classes=10",
+            output,
+        )
+        self.assertIn("index=5 label=flushing", output)
+
     def test_sound_completion_timeout_scales_with_capture_duration(self) -> None:
         self.assertEqual(_sound_capture_wait_timeout("background", 10), 190)
         self.assertEqual(_sound_capture_wait_timeout("background", 600), 900)

@@ -50,6 +50,7 @@ from slimhub.protocol.nus import (
 )
 from slimhub.power_shadow import ShadowPowerState
 from slimhub.sound_capture import SoundCaptureStore
+from slimhub.sound_inference import SoundInferenceStore
 from slimhub.unitspace.clock import EventReorderBuffer, NodeClockNormalizer
 from slimhub.unitspace.estimator import SimpleUnitspaceEstimator
 
@@ -117,6 +118,7 @@ class SlimHubDaemon:
         self._report_reorder_task: asyncio.Task[None] | None = None
         self.power_shadow = ShadowPowerState(paths)
         self.dean_contract = DeanContractStore(paths.node_state_path)
+        self.sound_inference = SoundInferenceStore(paths.sound_inference_db_path)
         self.registry = DeviceRegistry()
         self.battery_status: dict[str, dict[str, object]] = {}
         self._session_ids: dict[str, str] = {}
@@ -287,6 +289,7 @@ class SlimHubDaemon:
         return {
             "request": request,
             "cached": self.dean_contract.snapshot(normalized),
+            "sound_inference": self.sound_inference.snapshot(normalized),
         }
 
     async def node_config_get(
@@ -782,12 +785,58 @@ class SlimHubDaemon:
         if src in {"EVENT", "ADL"}:
             self.multimodal.handle(event)
             await self._log_multimodal_records()
+        if (
+            src == "SOUND"
+            and event.packet.fields.get("event", "").upper() == "INFERENCE"
+        ):
+            await self._handle_sound_inference(event)
         if src == "SOUND" or (
             src == "EVENT" and event.packet.fields.get("event", "").upper() == "SOUND"
         ):
             if src == "SOUND":
                 self.sound_capture.handle_report(event)
             self._remember_sound_schema(event.mac, event.packet)
+
+    async def _handle_sound_inference(self, event: ReportEvent) -> None:
+        outcome = self.sound_inference.handle_report(
+            event,
+            self.dean_contract.node_state(event.mac),
+        )
+        for diagnostic in outcome.diagnostics:
+            self.logger.warning(
+                "SOUND/INFERENCE diagnostic mac=%s reason=%s raw=%s",
+                normalize_mac(event.mac),
+                diagnostic.reason,
+                event.packet.message,
+            )
+            await self.raw_logger.log_structured(
+                StructuredEvent(
+                    timestamp=event.timestamp,
+                    kind=diagnostic.kind,
+                    mac=event.mac,
+                    data={
+                        "reason": diagnostic.reason,
+                        "raw_payload": event.packet.message,
+                    },
+                )
+            )
+        if outcome.inference is not None:
+            await self.raw_logger.log_structured(
+                StructuredEvent(
+                    timestamp=event.timestamp,
+                    kind=(
+                        "sound_inference_stored"
+                        if outcome.stored
+                        else "sound_inference_duplicate"
+                    ),
+                    mac=event.mac,
+                    data={
+                        "inference": outcome.inference.__dict__,
+                        "stored": outcome.stored,
+                        "duplicate": outcome.duplicate,
+                    },
+                )
+            )
 
     async def _log_contract_records(self) -> None:
         for record in self.dean_contract.drain_records():
@@ -1045,6 +1094,20 @@ class SlimHubDaemon:
             ) if args.get("address") or args.get("location") else None
             return self._ok(
                 self.sound_capture.snapshot(
+                    str(optional_address) if optional_address else None
+                )
+            )
+        if command == "sound.catalog":
+            optional_address = (
+                self.resolve_device_target(
+                    args.get("address"),
+                    args.get("location"),
+                )
+                if args.get("address") or args.get("location")
+                else None
+            )
+            return self._ok(
+                self.sound_inference.snapshot(
                     str(optional_address) if optional_address else None
                 )
             )

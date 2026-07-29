@@ -74,7 +74,9 @@ SCHEMAS = {
 
 
 def resolve_sound_schema(version: str | None, class_count: int | None = None) -> SoundSchema:
-    schema = SCHEMAS.get((version or "").strip().lower(), B_TFLM_V1_SCHEMA)
+    schema = SCHEMAS.get((version or "").strip().lower())
+    if schema is None:
+        raise ValueError(f"unknown per-device sound schema: {version!r}")
     if class_count is not None and class_count != schema.class_count:
         raise ValueError(
             f"sound schema {schema.version!r} expects {schema.class_count} classes, got {class_count}"
@@ -94,14 +96,8 @@ def resolve_node_sound_schema(
     if semantic_text in {"", "0", "false", "disabled", "not_ready"}:
         return None
     profile_key = str(profile or "").strip().lower()
-    if not profile_key:
-        room = str(location or "").strip().upper()
-        profile_key = {
-            "TOILET": "toilet_v1",
-            "KITCHEN": "kitchen_v1",
-            "LIVING": "living_v1",
-            "BEDROOM": "living_v1",
-        }.get(room, "")
+    # A room name alone is not a schema identity. Legacy fallback is allowed
+    # only when the Node's per-device profile is known.
     schema = SCHEMAS.get(profile_key)
     if schema is None:
         return None

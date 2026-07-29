@@ -73,6 +73,11 @@ class AppPaths:
         return self.programdata_dir / "dean_node_state.json"
 
     @property
+    def sound_inference_db_path(self) -> Path:
+        """Versioned DEAN Node sound inference and catalog database."""
+        return self.programdata_dir / "sound_inference.sqlite3"
+
+    @property
     def display_path(self) -> Path:
         """Current operator-facing display feed (append-only text)."""
         return self.programdata_dir / "display.txt"

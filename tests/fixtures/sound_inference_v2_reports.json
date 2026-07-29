@@ -1,0 +1,13 @@
+{
+  "description": "Golden DEAN Node v2 NUS REPORT payloads with the same index carrying room/model-specific labels",
+  "reports": [
+    {
+      "mac": "90:E5:10:00:00:01",
+      "payload": "src=SOUND,event=INFERENCE,schema=2,bid=1a2b3c4d,location=TOILET,class_index=5,class_count=10,label=flushing,semantic=flushing,confidence=0.910,model=0cb81518,source=tflm,rms=1420.5,db=61.2,ts=45000,duration_ms=1000"
+    },
+    {
+      "mac": "90:E5:10:00:00:02",
+      "payload": "src=SOUND,event=INFERENCE,schema=2,bid=5e6f7788,location=KITCHEN,class_index=5,class_count=9,label=microwave,semantic=microwave,confidence=0.880,model=91acbe22,source=tflm,rms=1310.0,db=59.8,ts=46000,duration_ms=1000"
+    }
+  ]
+}
