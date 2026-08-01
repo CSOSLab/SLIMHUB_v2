@@ -14,13 +14,17 @@ Recent integration commits:
 
 ## Implemented Central behavior
 
-### IN/OUT event sequence
-- `RAWDATA detected=10` is a preliminary enter candidate, not confirmed occupancy.
-- Adjacent RAW10 and `src=INOUT,event=ENTER,code=10` sidecar reports are coalesced.
-- `detected=1` is low-confidence legacy PIR evidence and cannot create an occupancy transition.
-- `EVENT id=C0/C1` is stored as command-application ACK; `SEQUENCE D0/D1` alone changes confirmed occupancy.
-- D0/D1 sequence reports are never fed back into the movement estimator.
-- Commands retain only each node's latest desired state while offline and retry idempotently after a write failure.
+### Home-wide IN/OUT token
+- PIR RAWDATA uses only `detected=0|1` and is an observation, never a
+  Node-local occupancy decision.
+- SLIMHUB owns one home-wide token. On a new-location observation it completes
+  `inout_sync state=out` for the previous Node before sending `state=in`.
+- Results correlate by `(source MAC,bid,rid,target state)` and only exact
+  `SYNC_ACK,source=slimhub,applied=1` is authoritative.
+- `changed=0,reason=already_applied` is idempotent and does not create a second
+  transition. `stale_boot` refreshes `node_status` before one fresh-rid retry.
+- Central enforces a one-hour maximum occupancy timeout.
+- D0/D1 sequence reports are never fed back into token assignment.
 - Node uptime is normalized per `(MAC, boot_id)` and INOUT/EVENT/ADL reports use a 1.5-second reorder buffer.
 
 ### Multimodal EVENT / ADL reports
@@ -72,6 +76,7 @@ Replay fixtures:
 1. Test with at least two physical DEAN Node v2 devices and retain their JSONL deployment logs.
 2. Create `programdata/deployment_manifest.json` from the template for every deployed MAC, using the fixed location profile and the intended private 10-class model hash.
 3. Verify firmware emits `EVENT/BASELINE` after subscription/reconnect and `EVENT/SOUND` with `schema=1,class_count=10`.
-4. Coordinate the future command-protocol-v2 firmware change before Central transmits non-legacy command payloads; current deployed Central traffic remains `enter`/`exit` strings for compatibility.
+4. Verify the deployed demo firmware rejects legacy `enter`/`exit` and accepts
+   only `inout_sync` for occupancy changes.
 
 No firmware source tree is present in this repository, so firmware-side changes and real BLE deployment capture were not performed here.

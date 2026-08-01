@@ -58,73 +58,35 @@ class SimpleUnitspaceEstimator:
         self._records: list[EstimatorRecord] = []
 
     def handle(self, event: RawDataEvent | UnitspaceSignalEvent) -> list[CommandEvent]:
-        """Consume raw evidence or a preliminary ENTER sidecar.
-
-        Legacy ``detected=1`` is stored as low-confidence evidence only.  It
-        cannot create an occupancy transition or an enter command.
-        """
+        """Retain PIR/legacy evidence without assigning demo occupancy."""
         if isinstance(event, RawDataEvent):
             address = normalize_mac(event.mac)
             timestamp = event.receipt_timestamp or event.timestamp
             if event.packet.flag_human_presence != 1:
                 return []
-            if event.packet.detected == RADAR_CONFIRMED_ENTER_SIGNAL:
-                self._last_raw_enter[address] = timestamp
-                self._record("candidate", address, timestamp, source="RAW10", confidence="strong")
-                return self._handle_enter(address, event.location, timestamp)
-            if event.packet.detected == LEGACY_PIR_ENTER_SIGNAL:
-                self._record(
-                    "candidate",
-                    address,
-                    timestamp,
-                    source="RAW1",
-                    confidence="low",
-                    discard_reason="legacy_pir_evidence",
-                )
+            self._record(
+                "pir_observation",
+                address,
+                timestamp,
+                detected=event.packet.detected,
+                occupancy_authority=False,
+                discard_reason=(
+                    None
+                    if event.packet.detected in {0, 1}
+                    else "demo_pir_must_be_binary"
+                ),
+            )
             return []
 
         address = normalize_mac(event.mac)
         timestamp = event.normalized_timestamp or event.timestamp
-        if event.confidence != "strong":
-            self._record(
-                "candidate",
-                address,
-                timestamp,
-                source=event.source,
-                confidence=event.confidence,
-                discard_reason="low_confidence",
-            )
-            return []
-        if self._is_exact_replay(event):
-            self._record("discard", address, timestamp, reason="exact_replay", source=event.source)
-            return []
-
-        if event.action == ENTER_ACTION:
-            raw_timestamp = self._last_raw_enter.get(address)
-            if raw_timestamp is not None and abs(timestamp - raw_timestamp) <= SIDECAR_COALESCE_SECONDS:
-                self._remember_current(address, event.location, timestamp)
-                self._record(
-                    "candidate",
-                    address,
-                    timestamp,
-                    source="ENTER_SIDECAR",
-                    coalesced_with="RAW10",
-                )
-                return []
-
-            fallback_key = (address, ENTER_ACTION)
-            previous = self._last_sidecar.get(fallback_key)
-            self._last_sidecar[fallback_key] = timestamp
-            if previous is not None and abs(timestamp - previous) <= SIDECAR_FALLBACK_DEDUPE_SECONDS:
-                self._record("discard", address, timestamp, reason="sidecar_fallback_dedupe")
-                return []
-            self._record("candidate", address, timestamp, source="ENTER_SIDECAR", coalesced_with=None)
-            return self._handle_enter(address, event.location, timestamp)
-
-        if event.action == EXIT_ACTION:
-            # Kept only for older nodes that still emit raw/report exit
-            # candidates. C1/D1 never reach here.
-            return self._handle_legacy_exit(address, event.location, timestamp)
+        self._record(
+            "discard",
+            address,
+            timestamp,
+            reason="demo_has_no_local_movement_candidates",
+            source=event.source,
+        )
         return []
 
     def handle_report(self, event: ReportEvent) -> list[CommandEvent]:
@@ -188,36 +150,22 @@ class SimpleUnitspaceEstimator:
             return []
 
         if _is_preliminary_enter_report(report):
-            return self.handle(
-                UnitspaceSignalEvent(
-                    timestamp=timestamp,
-                    mac=address,
-                    location=event.location,
-                    action=ENTER_ACTION,
-                    source="REPORT",
-                    boot_id=boot_id,
-                    event_seq=event_seq,
-                    event_id=event_id,
-                    event_timestamp_ms=node_timestamp,
-                    normalized_timestamp=timestamp,
-                )
+            self._record(
+                "discard",
+                address,
+                timestamp,
+                reason="legacy_enter_not_supported_by_demo",
             )
+            return []
 
-        # Legacy report support. New C1/D1 flows never match this condition.
         if inout_report_action(report) == EXIT_ACTION:
-            return self.handle(
-                UnitspaceSignalEvent(
-                    timestamp=timestamp,
-                    mac=address,
-                    location=event.location,
-                    action=EXIT_ACTION,
-                    source="REPORT_LEGACY",
-                    boot_id=boot_id,
-                    primary_seq=primary_seq,
-                    event_timestamp_ms=node_timestamp,
-                    normalized_timestamp=timestamp,
-                )
+            self._record(
+                "discard",
+                address,
+                timestamp,
+                reason="legacy_exit_not_supported_by_demo",
             )
+            return []
         return []
 
     def drain_records(self) -> list[EstimatorRecord]:
@@ -358,13 +306,6 @@ class SimpleUnitspaceEstimator:
 def inout_report_action(report: ReportPacket) -> str | None:
     if report.fields.get("src", "").strip().upper() != INOUT_REPORT_SRC:
         return None
-    if _is_preliminary_enter_report(report):
-        return ENTER_ACTION
-    event = report.fields.get("event", "").strip().upper()
-    signal = report.fields.get("signal", "").strip().lower()
-    code = _int_or_none(report.fields.get("code"))
-    if event == "EXIT" or signal == EXIT_ACTION or code == EXIT_SIGNAL:
-        return EXIT_ACTION
     return None
 
 

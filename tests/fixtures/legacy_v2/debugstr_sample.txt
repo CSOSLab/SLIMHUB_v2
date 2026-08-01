@@ -1,0 +1,2 @@
+{"device": "90:E5:B1:D1:22:6A", "type": "DEBUG", "event": "ENTER", "value": 10, "timestamp": "2026-07-31 10:00:00"}
+{"device": "90:E5:B1:D1:22:6A", "type": "INFERENCE", "ADL": "shower", "status": "COMPLETE", "sequence": "D0_S6_E1_D1_", "sequence_list": "flushing_end", "truth": 0.98, "missing": "", "timestamp": "2026-07-31 10:06:00"}

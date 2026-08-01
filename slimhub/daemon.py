@@ -14,15 +14,15 @@ from slimhub.ble.registry import DeviceRegistry
 from slimhub.ble.scanner import discover_named_devices
 from slimhub.config import (
     DEFAULT_DEVICE_TYPE,
+    DEFAULT_LOCATION,
     AppPaths,
     DeviceConfigStore,
     HubConfigStore,
     is_assigned_location,
     location_key,
+    normalize_node_location,
 )
 from slimhub.dean_contract import (
-    LOCAL_STANDALONE,
-    SLIMHUB_CONFIRMED,
     DeanContractStore,
     build_config_set_command,
     build_time_sync_command,
@@ -35,7 +35,14 @@ from slimhub.events import (
     ReportEvent,
     StructuredEvent,
 )
-from slimhub.logging import DisplayWriter, RawDataLogger
+from slimhub.logging import (
+    DisplayWriter,
+    LegacyReportValidationError,
+    LegacyReportWriter,
+    RawDataLogger,
+    validate_legacy_report,
+)
+from slimhub.location_sync import LocationSyncCoordinator
 from slimhub.multimodal import DeploymentManifestStore, MultimodalReportStore
 from slimhub.protocol.nus import (
     DEFAULT_DEVICE_NAME,
@@ -51,6 +58,7 @@ from slimhub.protocol.nus import (
 from slimhub.power_shadow import ShadowPowerState
 from slimhub.sound_capture import SoundCaptureStore
 from slimhub.sound_inference import SoundInferenceStore
+from slimhub.singleton import DaemonInstanceLock
 from slimhub.unitspace.clock import EventReorderBuffer, NodeClockNormalizer
 from slimhub.unitspace.estimator import SimpleUnitspaceEstimator
 
@@ -109,6 +117,7 @@ class SlimHubDaemon:
         self.hub_config_store = HubConfigStore(paths)
         self.raw_logger = RawDataLogger(paths)
         self.display_writer = DisplayWriter(paths)
+        self.legacy_report_writer = LegacyReportWriter(paths)
         self.estimator = SimpleUnitspaceEstimator()
         self.multimodal = MultimodalReportStore(
             DeploymentManifestStore(paths.deployment_manifest_path)
@@ -118,6 +127,7 @@ class SlimHubDaemon:
         self._report_reorder_task: asyncio.Task[None] | None = None
         self.power_shadow = ShadowPowerState(paths)
         self.dean_contract = DeanContractStore(paths.node_state_path)
+        self.location_sync = LocationSyncCoordinator()
         self.sound_inference = SoundInferenceStore(paths.sound_inference_db_path)
         self.registry = DeviceRegistry()
         self.battery_status: dict[str, dict[str, object]] = {}
@@ -139,12 +149,26 @@ class SlimHubDaemon:
         )
         self.stop_event = asyncio.Event()
         self._server: asyncio.AbstractServer | None = None
+        self._instance_lock = DaemonInstanceLock(paths.daemon_lock_path)
 
     async def run(self, *, address: str | None = None, scan: bool = True) -> None:
+        self._instance_lock.acquire()
+        try:
+            await self._run_locked(address=address, scan=scan)
+        finally:
+            self._instance_lock.release()
+
+    async def _run_locked(
+        self,
+        *,
+        address: str | None = None,
+        scan: bool = True,
+    ) -> None:
         self.paths.ensure()
         self.display_writer.ensure()
         self.hub_config_store.load_or_create()
         await self.raw_logger.start()
+        await self.legacy_report_writer.start()
         await self._start_server()
         self.logger.info(
             "BLE scan settings name=%s scan_timeout=%.1fs scan_interval=%.1fs "
@@ -166,6 +190,12 @@ class SlimHubDaemon:
             await self.connect_address(address)
         if scan:
             tasks.append(asyncio.create_task(self._scan_loop(), name="ble-scan"))
+        tasks.append(
+            asyncio.create_task(
+                self._occupancy_timeout_loop(),
+                name="occupancy-timeout",
+            )
+        )
         try:
             await self.stop_event.wait()
         finally:
@@ -178,6 +208,7 @@ class SlimHubDaemon:
                 await asyncio.gather(self._report_reorder_task, return_exceptions=True)
                 self._report_reorder_task = None
             await self.registry.stop_all()
+            await self.legacy_report_writer.stop()
             await self.raw_logger.stop()
             await self._stop_server()
 
@@ -290,6 +321,11 @@ class SlimHubDaemon:
             "request": request,
             "cached": self.dean_contract.snapshot(normalized),
             "sound_inference": self.sound_inference.snapshot(normalized),
+            "location_sync": self.location_sync.snapshot(normalized),
+            "writer_health": {
+                "rawdata": self.raw_logger.snapshot(),
+                "legacy_report": self.legacy_report_writer.snapshot(),
+            },
         }
 
     async def node_config_get(
@@ -309,13 +345,13 @@ class SlimHubDaemon:
         self,
         address: object,
         node_location: object,
-        profile: object,
+        profile: object | None,
         *,
         target_location: object | None = None,
     ) -> dict[str, object]:
         normalized = self.resolve_device_target(address, target_location)
         location_text = str(node_location)
-        profile_text = str(profile)
+        profile_text = str(profile) if profile is not None else None
         self.dean_contract.validate_config_change(
             normalized,
             location_text,
@@ -328,7 +364,11 @@ class SlimHubDaemon:
             "cached": self.dean_contract.snapshot(normalized),
             "pending": {
                 "location": location_text.strip().upper(),
-                "profile": profile_text.strip().lower(),
+                "profile": (
+                    profile_text.strip().lower()
+                    if profile_text is not None
+                    else "node-derived"
+                ),
                 "applies_on": "CONFIG/APPLIED",
             },
         }
@@ -395,6 +435,12 @@ class SlimHubDaemon:
         return f"{command_name}{suffix} is not supported by SLIMHUB_v2 NUS-only daemon"
 
     async def handle_frame(self, source_address: str, frame: ParsedFrame) -> None:
+        if (
+            isinstance(frame.parsed, ReportPacket)
+            and frame.parsed.format == "json"
+        ):
+            await self._handle_legacy_json_frame(source_address, frame)
+            return
         await self.registry.register_alias(frame.mac, source_address)
         if isinstance(frame.parsed, IgnoredPacket):
             self.logger.debug(
@@ -411,6 +457,11 @@ class SlimHubDaemon:
                 normalize_mac(frame.mac), (None, None)
             )
             node_state = self.dean_contract.node_state(frame.mac)
+            event_location = (
+                config.location
+                if is_assigned_location(config.location)
+                else DEFAULT_LOCATION
+            )
             semantic_ready = (
                 str(node_state.semantic or "").lower() in {"1", "true", "ready"}
                 and str(node_state.config or "").upper() == "READY"
@@ -418,7 +469,7 @@ class SlimHubDaemon:
             raw_event = RawDataEvent(
                 timestamp=timestamp,
                 mac=frame.mac,
-                location=config.location,
+                location=event_location,
                 packet=frame.parsed,
                 payload=frame.payload,
                 device_type=config.type,
@@ -434,24 +485,24 @@ class SlimHubDaemon:
                 ),
                 sound_profile=node_state.profile,
                 sound_model=node_state.model,
+                sound_raw_schema=node_state.raw_schema,
             )
             self.power_shadow.update_rawdata(frame.mac, frame.parsed, timestamp)
-            self.dean_contract.handle_raw(raw_event)
+            contract_commands = self.dean_contract.handle_raw(raw_event)
             await self.raw_logger.log(raw_event)
-            authority = self.dean_contract.node_state(frame.mac).authority
-            estimator_commands = self.estimator.handle(raw_event)
-            sent_commands = (
-                []
-                if authority in {SLIMHUB_CONFIRMED, LOCAL_STANDALONE}
-                else await self._send_unitspace_commands(estimator_commands)
-            )
+            self.estimator.handle(raw_event)
+            sent_commands = await self._send_unitspace_commands(contract_commands)
             if frame.parsed.flag_sound == 1:
                 node = self.dean_contract.node_state(frame.mac)
                 class_count = node.class_count
                 scores = (
-                    list(frame.parsed.sound[:class_count])
-                    if class_count is not None and 1 <= class_count <= 16
-                    else []
+                    list(frame.parsed.sound[:14])
+                    if node.raw_schema == 2
+                    else (
+                        list(frame.parsed.sound[:class_count])
+                        if class_count is not None and 1 <= class_count <= 16
+                        else []
+                    )
                 )
                 await self.raw_logger.log_structured(
                     StructuredEvent(
@@ -465,6 +516,7 @@ class SlimHubDaemon:
                             "profile": node.profile,
                             "location": node.location or config.location,
                             "model": node.model,
+                            "raw_schema": node.raw_schema,
                             "semantic_ready": (
                                 str(node.semantic or "").lower() in {"1", "true", "ready"}
                                 and str(node.config or "").upper() == "READY"
@@ -472,7 +524,24 @@ class SlimHubDaemon:
                         },
                     )
                 )
+                if node.raw_schema != 2:
+                    await self.raw_logger.log_structured(
+                        StructuredEvent(
+                            timestamp=timestamp,
+                            kind="sound_raw_schema_unconfirmed",
+                            mac=frame.mac,
+                            data={
+                                "reason": (
+                                    "profile tensor mapped into the 24-column "
+                                    "home union; unknown semantics are zero-filled"
+                                ),
+                                "raw_schema": node.raw_schema,
+                                "location": event_location,
+                            },
+                        )
+                    )
             await self._log_estimator_records()
+            await self._log_contract_records()
             self._log_commands(sent_commands)
         elif isinstance(frame.parsed, AlertPacket):
             config = self.config_store.load(frame.mac)
@@ -494,13 +563,7 @@ class SlimHubDaemon:
             timestamp = time.time()
             src = frame.parsed.fields.get("src", "").upper()
             connected = await self._source_connected(source_address)
-            identity_warning = self._json_identity_warning(frame)
-            if identity_warning is not None:
-                self.logger.warning(
-                    "REPORT JSON identity warning frame_mac=%s detail=%s",
-                    frame.mac,
-                    identity_warning,
-                )
+            identity_warning = None
             boot_id = frame.parsed.fields.get("boot_id") or frame.parsed.fields.get("bid")
             event_ts_ms = _int_or_none(
                 frame.parsed.fields.get("event_ts_ms") or frame.parsed.fields.get("ts")
@@ -555,11 +618,96 @@ class SlimHubDaemon:
             normalized = normalize_mac(device)
         except ValueError:
             return f"invalid_device:{device}"
-        if device != normalized:
-            return f"noncanonical_device:{device}"
         if normalized != normalize_mac(frame.mac):
             return f"device_mismatch:{normalized}"
         return None
+
+    async def _handle_legacy_json_frame(
+        self,
+        source_address: str,
+        frame: ParsedFrame,
+    ) -> None:
+        packet = frame.parsed
+        assert isinstance(packet, ReportPacket)
+        timestamp = time.time()
+        config = self.config_store.load(frame.mac)
+        connected = await self._source_connected(source_address)
+        identity_warning = self._json_identity_warning(frame)
+        report_event = ReportEvent(
+            timestamp=timestamp,
+            mac=frame.mac,
+            source_address=source_address,
+            location=config.location,
+            packet=packet,
+            payload=frame.payload,
+            device_type=config.type,
+            connected=connected,
+            session_id=self._session_ids.get(normalize_mac(source_address)),
+            receipt_timestamp=timestamp,
+            identity_warning=identity_warning,
+        )
+        await self.raw_logger.log_report(report_event)
+
+        reject_reason = packet.parse_error or identity_warning
+        validated = None
+        if reject_reason is None:
+            try:
+                validated = validate_legacy_report(frame.mac, packet.document)
+            except LegacyReportValidationError as exc:
+                reject_reason = str(exc)
+
+        if reject_reason is not None or validated is None:
+            self.logger.warning(
+                "Legacy REPORT rejected mac=%s type=%s declared=%d actual=%d reason=%s",
+                frame.mac,
+                frame.packet_type,
+                frame.packet_length,
+                len(frame.payload),
+                reject_reason,
+            )
+            await self.raw_logger.log_structured(
+                StructuredEvent(
+                    timestamp=timestamp,
+                    kind="legacy_report_rejected",
+                    mac=frame.mac,
+                    data={
+                        "frame_type": frame.packet_type,
+                        "declared_length": frame.packet_length,
+                        "actual_length": len(frame.payload),
+                        "reason": reject_reason or "validation_failed",
+                        "location": config.location,
+                    },
+                )
+            )
+            return
+
+        outcome = await self.legacy_report_writer.log(
+            validated,
+            timestamp=timestamp,
+            location=config.location,
+            device_type=config.type,
+        )
+        if outcome in {"unknown_location", "queue_full", "write_error"}:
+            self.logger.warning(
+                "Legacy REPORT not stored mac=%s location=%s reason=%s",
+                frame.mac,
+                config.location,
+                outcome,
+            )
+            await self.raw_logger.log_structured(
+                StructuredEvent(
+                    timestamp=timestamp,
+                    kind="legacy_report_rejected",
+                    mac=frame.mac,
+                    data={
+                        "frame_type": frame.packet_type,
+                        "declared_length": frame.packet_length,
+                        "actual_length": len(frame.payload),
+                        "reason": outcome,
+                        "location": config.location,
+                    },
+                )
+            )
 
     async def handle_connection_state(
         self,
@@ -577,6 +725,13 @@ class SlimHubDaemon:
             self.power_shadow.mark_disconnected(address, timestamp)
             self.sound_capture.handle_disconnect(address, timestamp)
         self.dean_contract.handle_connection(address, connected, timestamp)
+        desired_location = self.config_store.load(address).location
+        self.location_sync.handle_connection(
+            address,
+            connected,
+            desired_location,
+            timestamp,
+        )
         await self.raw_logger.log_connection_state(
             ConnectionStateEvent(
                 timestamp=timestamp,
@@ -635,6 +790,14 @@ class SlimHubDaemon:
             except Exception:
                 self.logger.exception("BLE scan failed")
             await self._wait_or_stop(self.scan_interval)
+
+    async def _occupancy_timeout_loop(self) -> None:
+        while not self.stop_event.is_set():
+            commands = self.dean_contract.expire_occupancy(time.time())
+            sent = await self._send_unitspace_commands(commands)
+            self._log_commands(sent)
+            await self._log_contract_records()
+            await self._wait_or_stop(1.0)
 
     async def _send_unitspace_commands(
         self,
@@ -722,22 +885,46 @@ class SlimHubDaemon:
         contract_commands = self.dean_contract.handle_report(event)
         if src in {"NODE", "CONFIG"}:
             self._remember_sound_schema(event.mac, event.packet)
+        config = self.config_store.load(event.mac)
+        central_location = normalize_node_location(config.location)
+        report_location = normalize_node_location(
+            event.packet.fields.get("location")
+        )
         if (
-            src == "CONFIG"
-            and event.packet.fields.get("event", "").upper() == "APPLIED"
-            and event.packet.fields.get("location")
+            central_location is not None
+            and report_location is not None
+            and central_location != report_location
         ):
-            self.config_store.set_field(
-                event.mac,
-                "location",
-                event.packet.fields["location"],
+            await self.raw_logger.log_structured(
+                StructuredEvent(
+                    timestamp=event.timestamp,
+                    kind="location_report_mismatch",
+                    mac=event.mac,
+                    data={
+                        "central_location": central_location,
+                        "report_location": report_location,
+                        "src": src,
+                        "event": event.packet.fields.get("event"),
+                    },
+                )
             )
+        location_sync_commands = self.location_sync.handle_report(
+            event,
+            self.dean_contract.node_state(event.mac),
+            config.location,
+        )
         if contract_commands:
             sent_contract_commands = await self._send_unitspace_commands(
                 contract_commands
             )
             self._log_commands(sent_contract_commands)
+        if location_sync_commands:
+            sent_location_commands = await self._send_unitspace_commands(
+                location_sync_commands
+            )
+            self._log_commands(sent_location_commands)
         await self._log_contract_records()
+        await self._log_location_sync_records()
         if src == "USD":
             self._remember_usd_status(
                 event.mac,
@@ -756,26 +943,8 @@ class SlimHubDaemon:
         if src == "INOUT":
             self.multimodal.handle_inout(event)
             self.power_shadow.update_report(event.mac, event.packet, event.timestamp)
-            fields = event.packet.fields
-            node_authority = self.dean_contract.node_state(event.mac).authority
-            schema2_candidate = (
-                fields.get("event", "").upper() in {"ENTER", "EXIT"}
-                and bool(fields.get("bid") or fields.get("boot_id"))
-                and bool(fields.get("cid") or fields.get("event_seq"))
-            )
-            use_contract_authority = (
-                node_authority in {SLIMHUB_CONFIRMED, LOCAL_STANDALONE}
-                or schema2_candidate
-                or fields.get("event", "").upper()
-                in {"CONFIRM_ACK", "CONFIRM_ERROR"}
-            )
-            sent_commands = (
-                []
-                if use_contract_authority
-                else await self._send_unitspace_commands(
-                    self.estimator.handle_report(event)
-                )
-            )
+            self.estimator.handle_report(event)
+            sent_commands: list[CommandEvent] = []
             await self._log_estimator_records()
             self._log_commands(sent_commands)
             self.display_writer.write_inout(event)
@@ -840,6 +1009,17 @@ class SlimHubDaemon:
 
     async def _log_contract_records(self) -> None:
         for record in self.dean_contract.drain_records():
+            await self.raw_logger.log_structured(
+                StructuredEvent(
+                    timestamp=record.timestamp,
+                    kind=record.kind,
+                    mac=record.mac,
+                    data=dict(record.data),
+                )
+            )
+
+    async def _log_location_sync_records(self) -> None:
+        for record in self.location_sync.drain_records():
             await self.raw_logger.log_structured(
                 StructuredEvent(
                     timestamp=record.timestamp,
@@ -1197,7 +1377,12 @@ class SlimHubDaemon:
                 )
             )
         if command == "unitspace.status":
-            return self._ok(self.estimator.snapshot())
+            return self._ok(
+                {
+                    **self.estimator.snapshot(),
+                    "home_token": self.dean_contract.home_snapshot(),
+                }
+            )
         if command == "multimodal.status":
             return self._ok(self.multimodal.snapshot())
         if command == "power.status":
@@ -1261,6 +1446,10 @@ class SlimHubDaemon:
             conflicting_addresses = locations.get(location_key(config.location), [])
             status["location_conflict"] = len(conflicting_addresses) > 1
             status["location_conflict_devices"] = conflicting_addresses
+            status["writer_health"] = {
+                "rawdata": self.raw_logger.snapshot(),
+                "legacy_report": self.legacy_report_writer.snapshot(),
+            }
         return list(statuses.values())
 
     def _tail_raw(self, address: str | None, lines: int) -> list[str]:

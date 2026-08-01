@@ -32,9 +32,11 @@ class DisplayWriter:
 
     def write_inout(self, event: ReportEvent) -> None:
         fields = event.packet.fields
-        if _display_int(fields.get("schema")) == 2:
-            # Schema 2 emits the NCS JSON EVENT beside this typed report. The
-            # JSON record owns the legacy display/debug timeline.
+        if _is_v2_typed_inout(fields):
+            # V2 emits the NCS JSON DEBUG record beside this typed report. Some
+            # deployed builds omit the optional schema field but still carry
+            # the stable boot/event/timestamp identity. The JSON record owns
+            # the legacy display/debug timeline in either representation.
             return
         event_name = fields.get("event", "").upper()
         event_id = (fields.get("event_id") or fields.get("id") or "").upper()
@@ -228,6 +230,20 @@ def _display_int(value: object) -> int:
         return int(str(value), 10)
     except (TypeError, ValueError):
         return -1
+
+
+def _is_v2_typed_inout(fields: dict[str, str]) -> bool:
+    if _display_int(fields.get("schema")) == 2:
+        return True
+    return (
+        _has_display_value(fields, "bid", "boot_id")
+        and _has_display_value(fields, "cid", "event_seq")
+        and _has_display_value(fields, "timestamp", "event_ts_ms", "ts")
+    )
+
+
+def _has_display_value(fields: dict[str, str], *names: str) -> bool:
+    return any(str(fields.get(name) or "").strip() for name in names)
 
 
 def _is_operator_line(line: str) -> bool:

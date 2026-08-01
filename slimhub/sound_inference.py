@@ -12,7 +12,7 @@ from slimhub.protocol.nus import normalize_mac
 
 
 SCHEMA_VERSION = 1
-LOCATIONS = frozenset({"TOILET", "KITCHEN", "LIVING", "BEDROOM"})
+LOCATIONS = frozenset({"ENTRY", "LIVING", "BEDROOM", "KITCHEN", "TOILET"})
 SOURCES = frozenset({"tflm", "rms_gate"})
 REQUIRED_FIELDS = (
     "schema",
@@ -592,7 +592,7 @@ def parse_sound_inference(event: ReportEvent) -> SoundInference:
     location = fields["location"]
     if location not in LOCATIONS:
         raise SoundInferenceValidationError(
-            "location must be TOILET, KITCHEN, LIVING or BEDROOM"
+            "location must be ENTRY, LIVING, BEDROOM, KITCHEN or TOILET"
         )
     class_count = _integer(fields, "class_count")
     if not 2 <= class_count <= 20:

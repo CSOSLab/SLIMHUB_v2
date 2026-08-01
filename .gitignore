@@ -14,3 +14,4 @@ logs/
 build/
 dist/
 *.egg-info/
+*.zip

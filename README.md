@@ -40,6 +40,11 @@ tail -f logs/slimhub-v2.out
 slimhub-v2 --quit
 ```
 
+Daemon은 runtime root마다 한 인스턴스만 실행됩니다. 이미 실행 중일 때
+`run`, `run --background`, `--run` 또는 legacy background entry point를 다시
+호출하면 새 process를 만들지 않고 warning을 출력한 뒤 성공적인 no-op으로
+종료합니다. 일반 status/control command는 기존 daemon에 계속 전달됩니다.
+
 SLIMHUB v1 호환 flag 스타일도 유지하지만, 새 운영에는 계층형 v2 command를
 권장합니다. 호환 option 목록은 `slimhub-v2 --legacy-help`로 확인할 수 있습니다.
 
@@ -255,26 +260,24 @@ CRLF는 bounded resynchronization으로 폐기하므로 작은 ATT notification�
 header/payload/CRLF 분할과 연결된 frame stream도 처리합니다. sound capture를 위한
 MTU 또는 connection-interval bulk-transfer tuning은 사용하지 않습니다.
 
-### DEAN_Node_v2 PIR+RADAR IN/OUT
+### DEAN_Node_v2 PIR 및 home-wide occupancy token
 
-production Node는 `authority=slimhub_confirmed`를 사용합니다.
-RAWDATA `detected=10/20`은 PIR+RADAR ENTER/EXIT candidate이지만 bid/cid가
-없으므로 이것만으로 confirmation을 보내지 않습니다. 같은 MAC의 typed REPORT가
-boot/candidate identity를 제공한 뒤에만 다음 명령을 보냅니다.
+PIR RAWDATA의 `detected=0|1`은 이진 관찰이며 Node 자체의 occupancy를 바꾸지
+않습니다. `detected=1`이 새 unit space에서 관찰되면 SLIMHUB가 이전 Node를 먼저
+OUT으로 동기화하고 ACK 뒤 새 Node를 IN으로 동기화합니다.
 
 ```text
-src=INOUT,event=ENTER,schema=2,boot_id=12ab34cd,event_seq=41,event_ts_ms=123456
-inout_confirm,bid=12ab34cd,cid=41,state=in,rid=<nonzero-hex>
-src=INOUT,event=CONFIRM_ACK,schema=2,bid=12ab34cd,cid=41,rid=...,state=in,source=slimhub,applied=1
+inout_sync,bid=12ab34cd,state=in,rid=<new-nonzero-hex>
+src=INOUT,event=SYNC_ACK,schema=2,bid=12ab34cd,rid=...,state=in,\
+source=slimhub,applied=1,changed=1
 ```
 
-상태는 Node `(MAC)`, candidate `(MAC,bid,cid)`, command
-`(MAC,bid,cid,rid)`로 분리됩니다. 정확히 일치하는
-`CONFIRM_ACK,source=slimhub,applied=1`만 authoritative입니다. reconnect 후
-NODE/STATUS의 bid가 바뀌면 이전 pending transaction은 stale로 종료됩니다.
-`no_pending_candidate`는 45초 window 안에서 새 rid로 한 번만 retry합니다.
-`authority=local_standalone`은 시험 전용이며 Central confirmation을 억제하고
-`source=local,applied=1` 결과만 관찰합니다.
+상관관계와 dedupe key는 `(source MAC,bid,rid,target state)`입니다. 정확히
+일치하는 `SYNC_ACK,source=slimhub,applied=1`만 authoritative입니다.
+`changed=0,reason=already_applied`는 중복 transition을 만들지 않는 성공입니다.
+`stale_boot`은 `node_status` 갱신 후 새 rid로 한 번만 재시도합니다. 점유는 최대
+1시간이며 timeout은 SLIMHUB가 OUT 동기화합니다. demo firmware에 legacy
+`enter/exit` 또는 `inout_confirm`은 보내지 않습니다.
 
 notification subscription 직후 연결 session마다 `time_sync`, `node_status`,
 `config_get`을 순서대로 전송합니다. 상태/config cache는 MAC별로
@@ -285,7 +288,7 @@ slimhub-v2 --debug --run --scan-timeout 8 --scan-interval 5
 slimhub-v2 node status --address AA:BB:CC:DD:EE:FF
 slimhub-v2 node config get --address AA:BB:CC:DD:EE:FF
 slimhub-v2 node config set --address AA:BB:CC:DD:EE:FF \
-  --node-location KITCHEN --profile kitchen_v1
+  --node-location KITCHEN
 slimhub-v2 node config reload --address AA:BB:CC:DD:EE:FF
 slimhub-v2 raw tail --address AA:BB:CC:DD:EE:FF --lines 20
 slimhub-v2 unitspace status
@@ -293,6 +296,10 @@ slimhub-v2 unitspace status
 
 `config_set/config_reload`는 cached occupancy OUT, capture IDLE일 때만
 허용하며 CONFIG/APPLIED가 오기 전에는 cached configuration을 바꾸지 않습니다.
+연결 시에도 Central의 MAC별 JSON location이 다섯 production location 중 하나이면
+NODE/CONFIG status를 비교해 `config_set,location=<LOCATION>`을 한 번만
+전송합니다. IN/capture 중에는 다음 OUT+IDLE까지 미루며 Unknown/undefined는
+Node 설정을 덮어쓰지 않습니다.
 전체 wire/correlation 계약은
 [docs/command-protocol-v2.md](docs/command-protocol-v2.md), 운영 절차는
 [docs/dean-node-v2-integration.md](docs/dean-node-v2-integration.md)에 있습니다.
@@ -301,8 +308,9 @@ slimhub-v2 unitspace status
 
 `src=EVENT`의 `BASELINE`, `ENV`, `SOUND`와 `src=ADL`의 `PREDETECT`, `POP`,
 `COMPLETE`, `PARTIAL`, `NO_MATCH`는 메모리에서 typed record로 처리됩니다.
-확정 inference만 `data/.../debugstr`에 기록되며 이 stream은 IN/OUT estimator에 절대 재입력하지
-않습니다. `analysis_seq`는 `(MAC, boot_id, analysis_seq)` replay dedupe key이며
+schema-2 typed record는 structured detail에만 남고 `data/.../debugstr`는 strict
+legacy JSON만 기록하며, 이 stream은 IN/OUT estimator에 절대 재입력하지 않습니다.
+`analysis_seq`는 `(MAC, boot_id, analysis_seq)` replay dedupe key이며
 gap은 허용됩니다. EVENT history는 wrap-aware `event_ts_ms`, 동일 시각에서는
 `analysis_seq`로 정렬합니다.
 
@@ -321,31 +329,28 @@ profile 판정에 사용하지 않습니다.
 
 ### NCS-compatible JSON migration reports
 
-`REPORT` payload의 첫 non-whitespace byte가 `{`이면 comma-separated REPORT가
-아닌 one-frame JSON record로 파싱합니다. notification 분할/합침은 기존
+`REPORT` payload의 첫 non-whitespace byte가 `{` 또는 `[`이면 JSON으로
+검증합니다. notification 분할/합침은 기존
 connection별 frame accumulator에서 먼저 복원하므로 ATT notification 경계와
-JSON 경계를 같다고 가정하지 않습니다. JSON의 uppercase colon `device`와 frame
-MAC이 다르면 security warning을 기록하고 frame MAC을 authoritative node identity로
-사용합니다.
+JSON 경계를 같다고 가정하지 않습니다. strict legacy JSON의 `device`는
+대소문자와 무관하게 frame MAC과 같아야 하며, 불일치 시 occupancy/pending/file
+state를 변경하지 않고 reject 진단만 기록합니다.
 
-Schema 2 JSON `EVENT`(`ENTER=10`, `EXIT=20`)는 legacy UI timeline에만 기록하고
-movement estimator에는 다시 입력하지 않습니다. 값 또는 identity가 유효하지 않은
-record는 minimal audit JSONL에는 남지만 movement timeline에서는 제외합니다. JSON
-`INFERENCE`의 `PRE-DETECT`, `POP`, `COMPLETE`, `PARTIAL`, `NO_MATCH`는
-`(frame MAC,bid,aid)`로 activity upsert됩니다. 같은 key의 typed `src=ADL`
-record가 도착하면 score/coverage/margin/reset을 가진 typed detail을 canonical로
-보존하고 activity를 두 번 세지 않습니다. POP은 final activity이며 같은 `sid`의
-D1 terminal 결과와 별도 activity로 유지합니다.
+Strict JSON `DEBUG`(`ENTER=10`, `EXIT=20`)와 필수 필드를 모두 가진
+`INFERENCE`만 legacy UI/debugstr timeline에 기록합니다. typed schema-2
+INOUT/ADL report는 structured detail과 correlation에만 사용하며 legacy line을
+만들지 않습니다. reconnect retry는 MAC별 4초 TTL fingerprint로만 제거하므로
+실제 반복 activity를 영구 dedupe하지 않습니다.
 
 현재 schema 2 compact ADL의 `cov/m/dur/rst/seq` alias도 canonical detail로
 정규화합니다. payload가 routing용 `src=ADL` 뒤에 source-count metric `src=N`을
 다시 포함하면 첫 `src`를 routing identity로 유지하고 두 번째 값은
 `source_count`와 `duplicate_fields`에 보존합니다.
 
-JSON schema 2의 `truth`는 adaptive matcher의 0–1 score ratio이고 display에
-`(adaptive)`로 표시합니다. 기존 heap truth는 `(legacy)`로 구분합니다. unknown
-JSON key, future schema, 31자를 넘은 sequence와 malformed JSON도 parser를
-중단시키지 않고 원문과 validation error를 minimal audit JSONL에 보존합니다.
+legacy `truth`는 JSON number 그대로 기록하고 display에 별도 `(adaptive)` 문구를
+붙이지 않습니다. unknown JSON key는 decode하되 legacy 출력에서 제외합니다.
+malformed/non-object JSON은 parser를 중단시키지 않고 validation error를 minimal
+audit JSONL에 보존합니다.
 
 ## Sound schema
 
@@ -363,8 +368,11 @@ slimhub-v2 sound catalog --location TOILET
 
 `semantic=unknown`, semantic disabled, config not READY, 또는 Node metadata
 mismatch는 원문 label과 함께 저장하지만 ADL semantic으로 재해석하지 않습니다.
-RAWDATA의 16개 int8 slot은 legacy telemetry일 뿐이며 class_count 이후 padding은
-score가 아니고 zero padding도 0.5로 변환하지 않습니다. 상세 계약과 SQLite
+`raw=2`가 확인된 RAWDATA의 16개 int8 slot은 `home_semantic_v1` 순서이며
+slot 0–13을 모든 room에서 같은 24열 union CSV header로 기록합니다. profile별
+10/9/5-class tensor도 label 기준으로 같은 union에 매핑하며 없는 semantic은 `0.0`,
+reserved slot은 저장하지 않습니다. `gas_oven`은 현재 catalog/model에 없으므로
+`cooking`을 rename하지 않습니다. 상세 계약과 SQLite
 migration은 [dynamic sound catalog v2](docs/dynamic-sound-catalog-v2.md)를
 참고합니다.
 

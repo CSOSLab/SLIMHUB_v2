@@ -18,6 +18,7 @@ from slimhub.protocol.nus import (
     ParsedFrame,
     VALID_COMMANDS,
     build_command_frame,
+    mac_to_bytes,
     normalize_mac,
     parse_frame,
 )
@@ -130,6 +131,7 @@ class DeviceSession:
             command_failure_event = asyncio.Event()
             reported_connected = False
             loop = asyncio.get_running_loop()
+            assembler = FrameAssembler()
 
             def on_disconnect(_: BleakClient) -> None:
                 loop.call_soon_threadsafe(disconnected_event.set)
@@ -148,7 +150,6 @@ class DeviceSession:
                     self.connected = bool(client.is_connected)
                     self.waiting_for_advertisement = False
 
-                    assembler = FrameAssembler()
                     await asyncio.wait_for(
                         client.start_notify(
                             NUS_TX_NOTIFY_UUID,
@@ -217,6 +218,7 @@ class DeviceSession:
                         *list(self._inflight_frame_tasks),
                         return_exceptions=True,
                     )
+                assembler.clear()
                 self.connected = False
                 self._client = None
                 if reported_connected and self.on_connection_state is not None:
@@ -230,18 +232,42 @@ class DeviceSession:
                 await self._wait_for_reconnect()
 
     def _build_notify_handler(self, assembler: FrameAssembler) -> Callable[[object, bytearray], None]:
+        expected_mac = mac_to_bytes(self.address)
+
         def handle_notify(sender: object, data: bytearray) -> None:
             chunk = bytes(data)
 
             for frame_bytes in assembler.push(chunk):
+                if frame_bytes[:6] != expected_mac:
+                    self.logger.error(
+                        "%s frame rejected before payload parsing: source MAC mismatch",
+                        self.address,
+                    )
+                    continue
                 try:
                     frame = parse_frame(frame_bytes)
                 except PacketParseError as exc:
+                    raw_type = (
+                        frame_bytes[6:14].rstrip(b"\x00").decode(
+                            "ascii", errors="replace"
+                        )
+                        if len(frame_bytes) >= 14
+                        else "unknown"
+                    )
+                    declared_length = (
+                        int.from_bytes(frame_bytes[14:16], "little")
+                        if len(frame_bytes) >= 16
+                        else -1
+                    )
+                    actual_length = max(0, len(frame_bytes) - 18)
                     self.logger.error(
-                        "%s parse_error=%s frame_len=%d",
+                        "%s frame_type=%s declared_length=%d actual_length=%d "
+                        "reject_reason=%s",
                         self.address,
+                        raw_type,
+                        declared_length,
+                        actual_length,
                         exc,
-                        len(frame_bytes),
                     )
                     continue
                 task = asyncio.create_task(self._dispatch_frame(frame))

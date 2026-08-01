@@ -5,7 +5,12 @@ import re
 from dataclasses import asdict, dataclass
 
 from slimhub.config import AppPaths
-from slimhub.protocol.nus import RawDataPacket, ReportPacket, normalize_mac, validate_command
+from slimhub.protocol.nus import (
+    RawDataPacket,
+    ReportPacket,
+    normalize_mac,
+    validate_command_payload,
+)
 
 
 ABSENT_SLEEP = "ABSENT_SLEEP"
@@ -196,7 +201,7 @@ class ShadowPowerState:
         state = self._get(address)
         old = state.state
         state.last_update = timestamp
-        state.last_command_hint = validate_command(command)
+        state.last_command_hint = validate_command_payload(command)
         state.last_command_hint_at = timestamp
         self._log_if_changed(state, old, timestamp, "command_hint")
         return state

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 
 from slimhub.config import AppPaths
-from slimhub.dean_contract import DeanContractStore
+from slimhub.dean_contract import MAX_OCCUPANCY_SECONDS, DeanContractStore
 from slimhub.events import RawDataEvent, ReportEvent
 from slimhub.protocol.nus import RawDataPacket, ReportPacket
 
@@ -26,7 +26,7 @@ def report(mac: str, timestamp: float, **fields: object) -> ReportEvent:
     )
 
 
-def raw(mac: str, timestamp: float, detected: int) -> RawDataEvent:
+def pir(mac: str, timestamp: float, detected: int, location: str) -> RawDataEvent:
     packet = RawDataPacket(
         flag_human_presence=1,
         detected=detected,
@@ -39,20 +39,14 @@ def raw(mac: str, timestamp: float, detected: int) -> RawDataEvent:
         accuracy=0,
         flag_sound=0,
         sound=[0] * 16,
-        is_pir_human_detection_event=False,
+        is_pir_human_detection_event=True,
     )
-    return RawDataEvent(
-        timestamp=timestamp,
-        mac=mac,
-        location="TOILET",
-        packet=packet,
-        payload=b"\x00" * 33,
-    )
+    return RawDataEvent(timestamp, mac, location, packet, b"\x00" * 33)
 
 
 class DeanContractTests(unittest.TestCase):
     def make_store(self) -> DeanContractStore:
-        rids = iter((0x11, 0x22, 0x33, 0x44, 0x55))
+        rids = iter((0x11, 0x22, 0x33, 0x44, 0x55, 0x66))
         return DeanContractStore(rid_factory=lambda: next(rids))
 
     @staticmethod
@@ -60,12 +54,11 @@ class DeanContractTests(unittest.TestCase):
         store: DeanContractStore,
         mac: str,
         *,
-        bid: str = "a1b2c3d4",
-        authority: str = "slimhub_confirmed",
+        bid: str,
         occupancy: str = "OUT",
-        capture: str = "IDLE",
-    ) -> None:
-        store.handle_report(
+        location: str = "TOILET",
+    ) -> list:
+        return store.handle_report(
             report(
                 mac,
                 1.0,
@@ -73,210 +66,235 @@ class DeanContractTests(unittest.TestCase):
                 event="STATUS",
                 schema=2,
                 bid=bid,
-                authority=authority,
+                location=location,
+                source="node",
                 occupancy=occupancy,
-                capture=capture,
+                authority="slimhub",
+                capture="IDLE",
                 config="READY",
                 semantic=1,
                 class_count=10,
                 profile="toilet_v1",
+                model="cafebabe",
+                commands=0,
             )
         )
 
-    def test_raw_candidate_never_builds_confirmation_without_bid_and_cid(self) -> None:
+    @staticmethod
+    def sync_result(
+        store: DeanContractStore,
+        mac: str,
+        timestamp: float,
+        *,
+        bid: str,
+        rid: int,
+        state: str,
+        event: str = "SYNC_ACK",
+        applied: int = 1,
+        changed: int = 1,
+        reason: str = "applied",
+    ) -> list:
+        return store.handle_report(
+            report(
+                mac,
+                timestamp,
+                src="INOUT",
+                event=event,
+                schema=2,
+                bid=bid,
+                rid=f"{rid:x}",
+                state=state,
+                location="TOILET",
+                source="slimhub",
+                ts=1000,
+                applied=applied,
+                changed=changed,
+                reason=reason,
+            )
+        )
+
+    def test_pir_zero_is_observation_only_and_one_assigns_token(self) -> None:
         store = self.make_store()
-        self.status(store, MAC_A)
+        self.status(store, MAC_A, bid="aaa1")
 
-        store.handle_raw(raw(MAC_A, 2.0, 10))
+        self.assertEqual(store.handle_raw(pir(MAC_A, 2.0, 0, "TOILET")), [])
+        commands = store.handle_raw(pir(MAC_A, 3.0, 1, "TOILET"))
 
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(
+            commands[0].command,
+            "inout_sync,bid=aaa1,state=in,rid=11",
+        )
         self.assertEqual(store.snapshot(MAC_A)["occupancy"], "OUT")
-        record = store.drain_records()[-1]
-        self.assertEqual(record.kind, "inout_raw_candidate")
-        self.assertFalse(record.data["confirmable"])
 
-    def test_two_nodes_with_same_bid_and_cid_are_independently_correlated(self) -> None:
+    def test_home_token_exits_previous_before_entering_new_node(self) -> None:
         store = self.make_store()
-        self.status(store, MAC_A)
-        self.status(store, MAC_B)
+        self.status(store, MAC_A, bid="aaa1")
+        self.status(store, MAC_B, bid="bbb2", location="LIVING")
+        store.handle_raw(pir(MAC_A, 2.0, 1, "TOILET"))
+        self.sync_result(store, MAC_A, 2.1, bid="aaa1", rid=0x11, state="in")
 
-        first = store.handle_report(
-            report(
-                MAC_A, 2.0, src="INOUT", event="ENTER", schema=2,
-                boot_id="a1b2c3d4", event_seq=7, event_ts_ms=10,
-            )
-        )
-        second = store.handle_report(
-            report(
-                MAC_B, 2.1, src="INOUT", event="ENTER", schema=2,
-                boot_id="a1b2c3d4", event_seq=7, event_ts_ms=11,
-            )
-        )
+        exit_commands = store.handle_raw(pir(MAC_B, 3.0, 1, "LIVING"))
 
-        self.assertEqual(first[0].address, MAC_A)
-        self.assertEqual(second[0].address, MAC_B)
-        self.assertIn("rid=11", first[0].command)
-        self.assertIn("rid=22", second[0].command)
-
-        store.handle_report(
-            report(
-                MAC_B, 2.2, src="INOUT", event="CONFIRM_ACK", schema=2,
-                bid="a1b2c3d4", cid=7, rid=22, state="in",
-                source="slimhub", applied=1,
-            )
+        self.assertEqual(
+            [command.command for command in exit_commands],
+            ["inout_sync,bid=aaa1,state=out,rid=22"],
         )
+        enter_commands = self.sync_result(
+            store,
+            MAC_A,
+            3.1,
+            bid="aaa1",
+            rid=0x22,
+            state="out",
+        )
+        self.assertEqual(
+            [command.command for command in enter_commands],
+            ["inout_sync,bid=bbb2,state=in,rid=33"],
+        )
+        self.sync_result(store, MAC_B, 3.2, bid="bbb2", rid=0x33, state="in")
+        self.assertEqual(store.home_snapshot()["confirmed_occupant"], MAC_B)
+        self.assertEqual(store.snapshot(MAC_A)["occupancy"], "OUT")
         self.assertEqual(store.snapshot(MAC_B)["occupancy"], "IN")
-        self.assertEqual(store.snapshot(MAC_A)["occupancy"], "OUT")
 
-    def test_foreign_or_delayed_ack_cannot_complete_current_waiter(self) -> None:
+    def test_idempotent_and_duplicate_ack_do_not_emit_transition(self) -> None:
         store = self.make_store()
-        self.status(store, MAC_A)
-        store.handle_report(
-            report(
-                MAC_A, 2.0, src="INOUT", event="ENTER",
-                bid="a1b2c3d4", cid=7,
-            )
+        self.status(store, MAC_A, bid="aaa1", occupancy="IN")
+        store.handle_raw(pir(MAC_A, 2.0, 1, "TOILET"))
+
+        first = self.sync_result(
+            store,
+            MAC_A,
+            2.1,
+            bid="aaa1",
+            rid=0x11,
+            state="in",
+            changed=0,
+            reason="already_applied",
+        )
+        duplicate = self.sync_result(
+            store,
+            MAC_A,
+            2.2,
+            bid="aaa1",
+            rid=0x11,
+            state="in",
+            changed=0,
+            reason="already_applied",
         )
 
-        store.handle_report(
-            report(
-                MAC_A, 2.1, src="INOUT", event="CONFIRM_ACK",
-                bid="a1b2c3d4", cid=8, rid=11, state="in",
-                source="slimhub", applied=1,
-            )
+        self.assertEqual(first + duplicate, [])
+        self.assertEqual(store.home_snapshot()["confirmed_occupant"], MAC_A)
+        self.assertEqual(
+            [record.kind for record in store.drain_records()].count(
+                "inout_sync_applied"
+            ),
+            1,
         )
 
-        self.assertEqual(store.snapshot(MAC_A)["occupancy"], "OUT")
-        self.assertEqual(store.drain_records()[-1].kind, "inout_confirmation_unmatched")
-
-    def test_only_applied_slimhub_ack_is_authoritative(self) -> None:
+    def test_stale_boot_refreshes_status_then_retries_once(self) -> None:
         store = self.make_store()
-        self.status(store, MAC_A)
-        store.handle_report(
-            report(
-                MAC_A, 2.0, src="INOUT", event="ENTER",
-                bid="a1b2c3d4", cid=7,
-            )
+        self.status(store, MAC_A, bid="aaa1")
+        store.handle_raw(pir(MAC_A, 2.0, 1, "TOILET"))
+
+        refresh = self.sync_result(
+            store,
+            MAC_A,
+            2.1,
+            bid="aaa1",
+            rid=0x11,
+            state="in",
+            event="SYNC_ERROR",
+            applied=0,
+            changed=0,
+            reason="stale_boot",
+        )
+        retry = self.status(store, MAC_A, bid="aaa2")
+
+        self.assertEqual([command.command for command in refresh], ["node_status"])
+        self.assertEqual(
+            [command.command for command in retry],
+            ["inout_sync,bid=aaa2,state=in,rid=22"],
         )
 
-        store.handle_report(
-            report(
-                MAC_A, 2.1, src="INOUT", event="CONFIRM_ACK",
-                bid="a1b2c3d4", cid=7, rid=11, state="in",
-                source="slimhub", applied=0, reason="state_mismatch",
-            )
-        )
-
-        self.assertEqual(store.snapshot(MAC_A)["occupancy"], "OUT")
-        self.assertEqual(store.snapshot(MAC_A)["last_reason"], "state_mismatch")
-
-    def test_no_pending_candidate_retries_once_with_new_rid(self) -> None:
+    def test_presence_during_out_transition_replaces_only_final_in_target(self) -> None:
         store = self.make_store()
-        self.status(store, MAC_A)
-        store.handle_report(
-            report(
-                MAC_A, 2.0, src="INOUT", event="ENTER",
-                bid="a1b2c3d4", cid=7,
-            )
+        mac_c = "AA:BB:CC:DD:EE:03"
+        self.status(store, MAC_A, bid="aaa1")
+        self.status(store, MAC_B, bid="bbb2", location="LIVING")
+        self.status(store, mac_c, bid="ccc3", location="BEDROOM")
+        store.handle_raw(pir(MAC_A, 2.0, 1, "TOILET"))
+        self.sync_result(store, MAC_A, 2.1, bid="aaa1", rid=0x11, state="in")
+        store.handle_raw(pir(MAC_B, 3.0, 1, "LIVING"))
+
+        replacement = store.handle_raw(pir(mac_c, 3.05, 1, "BEDROOM"))
+        after_out = self.sync_result(
+            store,
+            MAC_A,
+            3.1,
+            bid="aaa1",
+            rid=0x22,
+            state="out",
         )
 
-        retry = store.handle_report(
-            report(
-                MAC_A, 3.0, src="INOUT", event="CONFIRM_ERROR",
-                bid="a1b2c3d4", cid=7, rid=11, state="in",
-                source="slimhub", applied=0, reason="no_pending_candidate",
-            )
-        )
-        exhausted = store.handle_report(
-            report(
-                MAC_A, 4.0, src="INOUT", event="CONFIRM_ERROR",
-                bid="a1b2c3d4", cid=7, rid=22, state="in",
-                source="slimhub", applied=0, reason="no_pending_candidate",
-            )
+        self.assertEqual(replacement, [])
+        self.assertEqual(
+            [command.command for command in after_out],
+            ["inout_sync,bid=ccc3,state=in,rid=33"],
         )
 
-        self.assertEqual(len(retry), 1)
-        self.assertIn("rid=22", retry[0].command)
-        self.assertEqual(exhausted, [])
-
-    def test_reconnect_status_with_new_boot_expires_old_pending(self) -> None:
+    def test_missing_boot_refresh_waiters_are_mac_scoped(self) -> None:
         store = self.make_store()
-        self.status(store, MAC_A)
-        store.handle_report(
-            report(
-                MAC_A, 2.0, src="INOUT", event="EXIT",
-                bid="a1b2c3d4", cid=7,
-            )
+
+        first = store.handle_raw(pir(MAC_A, 2.0, 1, "TOILET"))
+        second = store.handle_raw(pir(MAC_B, 2.1, 1, "LIVING"))
+        retry_a = self.status(store, MAC_A, bid="aaa1")
+        retry_b = self.status(store, MAC_B, bid="bbb2", location="LIVING")
+
+        self.assertEqual([command.command for command in first], ["node_status"])
+        self.assertEqual([command.command for command in second], ["node_status"])
+        self.assertEqual(retry_a, [])
+        self.assertEqual(
+            [command.command for command in retry_b],
+            ["inout_sync,bid=bbb2,state=in,rid=11"],
         )
 
-        self.status(store, MAC_A, bid="deadbeef")
-        store.handle_report(
-            report(
-                MAC_A, 3.0, src="INOUT", event="CONFIRM_ACK",
-                bid="a1b2c3d4", cid=7, rid=11, state="out",
-                source="slimhub", applied=1,
-            )
-        )
-
-        self.assertEqual(store.snapshot(MAC_A)["bid"], "deadbeef")
-        self.assertEqual(store.drain_records()[-1].kind, "inout_confirmation_unmatched")
-
-    def test_local_standalone_suppresses_confirm_but_observes_local_result(self) -> None:
+    def test_one_hour_maximum_expires_current_token(self) -> None:
         store = self.make_store()
-        self.status(store, MAC_A, authority="local_standalone")
+        self.status(store, MAC_A, bid="aaa1")
+        store.handle_raw(pir(MAC_A, 2.0, 1, "TOILET"))
+        self.sync_result(store, MAC_A, 2.1, bid="aaa1", rid=0x11, state="in")
 
-        commands = store.handle_report(
-            report(
-                MAC_A, 2.0, src="INOUT", event="ENTER",
-                bid="a1b2c3d4", cid=7,
-            )
-        )
-        store.handle_report(
-            report(
-                MAC_A, 2.1, src="INOUT", event="CONFIRM_ACK",
-                bid="a1b2c3d4", cid=7, rid=99, state="in",
-                source="local", applied=1,
-            )
+        self.assertEqual(store.expire_occupancy(2.0 + MAX_OCCUPANCY_SECONDS - 1), [])
+        expired = store.expire_occupancy(2.0 + MAX_OCCUPANCY_SECONDS)
+
+        self.assertEqual(
+            [command.command for command in expired],
+            ["inout_sync,bid=aaa1,state=out,rid=22"],
         )
 
-        self.assertEqual(commands, [])
-        self.assertEqual(store.snapshot(MAC_A)["occupancy"], "IN")
-
-    def test_config_cache_changes_only_on_applied_and_requires_out_idle(self) -> None:
-        store = self.make_store()
-        self.status(store, MAC_A)
-        store.validate_config_change(MAC_A, "KITCHEN", "kitchen_v1")
-        store.handle_report(
-            report(
-                MAC_A, 2.0, src="CONFIG", event="REJECTED",
-                location="KITCHEN", profile="kitchen_v1", reason="busy",
-            )
-        )
-        self.assertEqual(store.snapshot(MAC_A)["profile"], "toilet_v1")
-
-        store.handle_report(
-            report(
-                MAC_A, 3.0, src="CONFIG", event="APPLIED",
-                location="KITCHEN", profile="kitchen_v1", class_count=9,
-                semantic=1, status="READY", model="cafebabe",
-            )
-        )
-        self.assertEqual(store.snapshot(MAC_A)["profile"], "kitchen_v1")
-        self.assertEqual(store.snapshot(MAC_A)["class_count"], 9)
-
-        self.status(store, MAC_B, occupancy="IN")
-        with self.assertRaisesRegex(ValueError, "occupancy OUT"):
-            store.validate_config_change(MAC_B, "TOILET", "toilet_v1")
-
-    def test_node_metadata_is_persisted_by_mac(self) -> None:
+    def test_config_cache_and_home_token_are_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = AppPaths.from_base(tmpdir)
             store = DeanContractStore(paths.node_state_path, rid_factory=lambda: 1)
-            self.status(store, MAC_A)
+            self.status(store, MAC_A, bid="aaa1")
+            store.handle_raw(pir(MAC_A, 2.0, 1, "TOILET"))
 
-            document = paths.node_state_path.read_text(encoding="utf-8")
+            restored = DeanContractStore(paths.node_state_path, rid_factory=lambda: 2)
 
-            self.assertIn(MAC_A, document)
-            self.assertIn('"authority": "slimhub_confirmed"', document)
+            self.assertEqual(restored.home_snapshot()["desired_occupant"], MAC_A)
+            self.assertEqual(restored.snapshot(MAC_A)["bid"], "aaa1")
+
+    def test_config_requires_supported_room_and_out_idle(self) -> None:
+        store = self.make_store()
+        self.status(store, MAC_A, bid="aaa1")
+        store.validate_config_change(MAC_A, "KITCHEN", "kitchen_v1")
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            store.validate_config_change(MAC_A, "ENTRY")
+
+        self.status(store, MAC_B, bid="bbb2", occupancy="IN")
+        with self.assertRaisesRegex(ValueError, "occupancy OUT"):
+            store.validate_config_change(MAC_B, "TOILET")
 
 
 if __name__ == "__main__":

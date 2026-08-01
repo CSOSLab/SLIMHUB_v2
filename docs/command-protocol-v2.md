@@ -1,8 +1,7 @@
 # DEAN Node v2 command protocol
 
-This integration follows DEAN Node v2 firmware contract commit
-`66c6b45bcc2dda40dd1046819aae717c8acbbf28`. Production Nodes use
-`authority=slimhub_confirmed`; `local_standalone` is a test-only profile.
+This integration follows the DEAN Node v2 home-wide token demo contract.
+SLIMHUB is the only occupancy authority.
 
 ## NUS framing
 
@@ -32,46 +31,34 @@ config_get
 
 Reconnect creates a new session and repeats this sequence. NODE/STATUS is
 cached by source MAC in `programdata/dean_node_state.json`. A new `bid`
-expires pending confirmation transactions for the previous boot.
+expires pending synchronization transactions for the previous boot.
 
 ## Occupancy authority
 
-RAWDATA direction values (`detected=10` ENTER, `detected=20` EXIT) are
-diagnostic candidates only because the 33-byte payload has no `bid` or `cid`.
-Central waits for the matching typed REPORT:
+PIR RAWDATA is a binary observation (`detected=0|1`) and never changes Node
+occupancy by itself. A presence observation at a new unit space makes Central
+move its single home-wide token. It synchronizes the previous Node OUT first,
+waits for its authoritative ACK, and then synchronizes the new Node IN:
 
 ```text
-src=INOUT,event=ENTER|EXIT,schema=2,
-boot_id=<hex>,event_seq=<decimal>,event_ts_ms=<decimal>,...
+inout_sync,bid=<hex>,state=out,rid=<new-nonzero-hex>
+inout_sync,bid=<hex>,state=in,rid=<new-nonzero-hex>
 ```
 
-The parser preserves original fields and also normalizes:
-
-- `boot_id` or `bid` to `bid`
-- `event_seq` or `cid` to `cid`
-- `event_ts_ms` or `ts` to `timestamp`
-
-An approved production candidate is confirmed using the frame's actual
-source MAC:
+Results use:
 
 ```text
-inout_confirm,bid=<hex>,cid=<decimal>,state=in|out,rid=<nonzero-hex>
+src=INOUT,event=SYNC_ACK|SYNC_ERROR,schema=2,bid=<hex>,
+rid=<hex>,state=in|out,source=slimhub,applied=0|1,changed=0|1,reason=...
 ```
 
-Transactions are keyed by `(MAC,bid,cid,rid)`. Request IDs are nonzero,
-32-bit, unique per Node process lifetime, and a retry gets a new ID.
-Only `CONFIRM_ACK,source=slimhub,applied=1` with the exact key and state changes
-authoritative cached occupancy. `stale_boot`, `stale_candidate`,
-`state_mismatch`, `duplicate_request`, and `no_pending_candidate` remain
-diagnostic outcomes. `no_pending_candidate` permits one retry with a new rid
-inside the 45-second feedback window.
-
-For `authority=local_standalone`, Central never sends `inout_confirm` or legacy
-`enter`/`exit`. It only observes `source=local,applied=1`.
-
-Legacy `enter`/`exit` remains available for Nodes that have not advertised the
-schema-2 authority contract. It is not used for unsolicited synchronization
-once a Node is known to be schema 2.
+Transactions and result dedupe use `(source MAC,bid,rid,target state)`.
+Only exact `SYNC_ACK,source=slimhub,applied=1` is authoritative.
+`changed=0,reason=already_applied` is an idempotent success and does not create
+another legacy event. `stale_boot` triggers `node_status`, followed by at most
+one retry with a fresh request ID. Legacy `enter`, `exit`, and
+`inout_confirm` are rejected. Central expires an occupied token after one
+hour and synchronizes that Node OUT.
 
 ## Node configuration
 
@@ -80,13 +67,15 @@ Supported commands are:
 ```text
 node_status
 config_get
+config_set,location=<LOCATION>
 config_set,location=<LOCATION>,sound_profile=<PROFILE>
 config_reload
 ```
 
-Allowed pairs are TOILET/toilet_v1 (10 classes),
-KITCHEN/kitchen_v1 (9), LIVING/living_v1 (5), and
-BEDROOM/living_v1 (5). `config_set` and `config_reload` require cached
+Allowed pairs are TOILET/toilet_v1 (10 classes), KITCHEN/kitchen_v1 (9),
+LIVING/living_v1 (5), and BEDROOM/living_v1 (5). Location-only lets the Node derive
+the profile; the explicit profile form remains compatible. `config_set` and
+`config_reload` require cached
 occupancy OUT and capture IDLE. Cached configuration changes only after
 CONFIG/APPLIED; CONFIG/REJECTED preserves the old values and reason.
 

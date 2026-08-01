@@ -13,10 +13,7 @@ NUS_RX_WRITE_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 NUS_TX_NOTIFY_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
 DEFAULT_DEVICE_NAME = "DEAN_NODE_V2"
-VALID_COMMANDS = (
-    "enter",
-    "exit",
-)
+VALID_COMMANDS: tuple[str, ...] = ()
 RECORD_COMMAND = "record"
 RECORD_STOP_COMMAND = "record_stop"
 SOUND_STOP_COMMAND = "sound_stop"
@@ -30,12 +27,7 @@ MIN_SOUND_SECONDS = 1
 MAX_SOUND_SECONDS = 1800
 MAX_SOUND_SILENCE_SECONDS = 60
 SOUND_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
-COMMAND_ALIASES = {
-    "strong_enter": "enter",
-    "weak_enter": "enter",
-    "strong_exit": "exit",
-    "weak_exit": "exit",
-}
+COMMAND_ALIASES: dict[str, str] = {}
 END_FLAG = b"\x0d\x0a"
 MAC_LEN = 6
 PACKET_TYPE_LEN = 8
@@ -145,12 +137,17 @@ class FrameAssembler:
                 (packet_type == "RAWDATA" and packet_length != RAWDATA_PAYLOAD_LEN)
                 or (packet_type == "REPORT" and packet_length > MAX_REPORT_PAYLOAD_LEN)
             ):
+                mac = ":".join(f"{byte:02X}" for byte in self._buffer[:MAC_LEN])
                 bad_byte = self._buffer.pop(0)
                 logging.warning(
-                    "Dropping byte 0x%02x while resynchronizing: invalid %s payload length %d",
-                    bad_byte,
+                    "NUS reject mac=%s frame_type=%s declared_length=%d "
+                    "actual_available=%d reason=invalid_payload_length "
+                    "resync_byte=0x%02x",
+                    mac,
                     packet_type,
                     packet_length,
+                    max(0, len(self._buffer) - HEADER_LEN),
+                    bad_byte,
                 )
                 continue
             frame_len = HEADER_LEN + packet_length + END_FLAG_LEN
@@ -168,9 +165,16 @@ class FrameAssembler:
                 break
 
             if self._buffer[frame_len - END_FLAG_LEN : frame_len] != END_FLAG:
+                mac = ":".join(f"{byte:02X}" for byte in self._buffer[:MAC_LEN])
                 bad_byte = self._buffer.pop(0)
                 logging.warning(
-                    "Dropping byte 0x%02x while resynchronizing: invalid frame CRLF",
+                    "NUS reject mac=%s frame_type=%s declared_length=%d "
+                    "actual_available=%d reason=invalid_frame_crlf "
+                    "resync_byte=0x%02x",
+                    mac,
+                    packet_type,
+                    packet_length,
+                    max(0, len(self._buffer) - HEADER_LEN),
                     bad_byte,
                 )
                 continue
@@ -181,6 +185,32 @@ class FrameAssembler:
         return frames
 
     def clear(self) -> None:
+        if self._buffer:
+            mac = (
+                ":".join(f"{byte:02X}" for byte in self._buffer[:MAC_LEN])
+                if len(self._buffer) >= MAC_LEN
+                else "unknown"
+            )
+            packet_type = (
+                bytes(self._buffer[MAC_LEN : MAC_LEN + PACKET_TYPE_LEN])
+                .rstrip(b"\x00")
+                .decode("ascii", errors="replace")
+                if len(self._buffer) >= MAC_LEN + PACKET_TYPE_LEN
+                else "unknown"
+            )
+            declared = (
+                int.from_bytes(self._buffer[MAC_LEN + PACKET_TYPE_LEN : HEADER_LEN], "little")
+                if len(self._buffer) >= HEADER_LEN
+                else -1
+            )
+            logging.warning(
+                "NUS reject mac=%s frame_type=%s declared_length=%d "
+                "actual_available=%d reason=truncated_on_disconnect",
+                mac,
+                packet_type,
+                declared,
+                max(0, len(self._buffer) - HEADER_LEN),
+            )
         self._buffer.clear()
 
 
@@ -401,8 +431,13 @@ def validate_command_payload(command: str) -> str:
         )
     if normalized.startswith("config_set"):
         name, fields = _command_fields(normalized)
-        if name != "config_set" or set(fields) != {"location", "sound_profile"}:
-            raise ValueError("config_set requires location and sound_profile")
+        if name != "config_set" or set(fields) not in (
+            {"location"},
+            {"location", "sound_profile"},
+        ):
+            raise ValueError(
+                "config_set requires location and optionally sound_profile"
+            )
         allowed = {
             ("TOILET", "toilet_v1"),
             ("KITCHEN", "kitchen_v1"),
@@ -410,28 +445,31 @@ def validate_command_payload(command: str) -> str:
             ("BEDROOM", "living_v1"),
         }
         location = fields["location"].strip().upper()
+        if "sound_profile" not in fields:
+            if location not in {item[0] for item in allowed}:
+                raise ValueError("unsupported config_set location")
+            return _validate_command_size(f"config_set,location={location}")
         profile = fields["sound_profile"].strip().lower()
         if (location, profile) not in allowed:
             raise ValueError("unsupported config_set location/profile combination")
         return _validate_command_size(
             f"config_set,location={location},sound_profile={profile}"
         )
-    if normalized.startswith("inout_confirm"):
+    if normalized.startswith("inout_sync"):
         name, fields = _command_fields(normalized)
-        if name != "inout_confirm" or set(fields) != {"bid", "cid", "state", "rid"}:
-            raise ValueError("inout_confirm requires bid, cid, state and rid")
+        if name != "inout_sync" or set(fields) != {"bid", "state", "rid"}:
+            raise ValueError("inout_sync requires bid, state and rid")
         bid = fields["bid"].strip().lower()
         if not re.fullmatch(r"[0-9a-f]{1,32}", bid):
-            raise ValueError("inout_confirm bid must be hexadecimal")
-        cid = _integer_field(fields, "cid")
+            raise ValueError("inout_sync bid must be hexadecimal")
         state = fields["state"].strip().lower()
         rid_text = fields["rid"].strip().lower().removeprefix("0x")
-        if cid < 0 or state not in {"in", "out"}:
-            raise ValueError("invalid inout_confirm cid or state")
+        if state not in {"in", "out"}:
+            raise ValueError("invalid inout_sync state")
         if not re.fullmatch(r"[0-9a-f]{1,8}", rid_text) or int(rid_text, 16) == 0:
-            raise ValueError("inout_confirm rid must be a nonzero 32-bit hexadecimal value")
+            raise ValueError("inout_sync rid must be a nonzero 32-bit hexadecimal value")
         return _validate_command_size(
-            f"inout_confirm,bid={bid},cid={cid},state={state},rid={rid_text}"
+            f"inout_sync,bid={bid},state={state},rid={rid_text}"
         )
     if normalized.startswith("sound_start"):
         name, fields = _command_fields(normalized)
@@ -486,9 +524,9 @@ def validate_command_payload(command: str) -> str:
             )
         )
     raise ValueError(
-        "command must be one of: enter, exit, record, record:<seconds>, record_stop, "
+        "command must be one of: record, record:<seconds>, record_stop, "
         "sound_start, sound_bg, sound_auto, sound_stop, sound_status, node_status, "
-        "config_get, config_set, config_reload, time_sync, inout_confirm"
+        "config_get, config_set, config_reload, time_sync, inout_sync"
     )
 
 
@@ -534,6 +572,32 @@ def parse_rawdata(payload: bytes) -> RawDataPacket:
     flag_sound = unpacked[9]
     sound = list(unpacked[10:])
 
+    flags = (flag_human_presence, flag_env, flag_sound)
+    if any(flag not in {0, 1} for flag in flags) or sum(flags) != 1:
+        raise PacketParseError("RAWDATA must contain exactly one active producer flag")
+    environment_values_are_zero = (
+        temperature_raw == 0
+        and humidity == 0
+        and iaq == 0
+        and eco2 == 0
+        and bvoc == 0
+        and accuracy == 0
+    )
+    if flag_human_presence == 1 and (
+        detected not in {0, 1}
+        or not environment_values_are_zero
+        or any(value != 0 for value in sound)
+    ):
+        raise PacketParseError("PIR RAWDATA contains an invalid observation or inactive data")
+    if flag_env == 1 and (
+        detected != 0 or any(value != 0 for value in sound)
+    ):
+        raise PacketParseError("ENV RAWDATA contains inactive PIR or SOUND data")
+    if flag_sound == 1 and (
+        detected != 0 or not environment_values_are_zero
+    ):
+        raise PacketParseError("SOUND RAWDATA contains inactive PIR or ENV data")
+
     remaining_fields_are_zero = (
         flag_env == 0
         and temperature_raw == 0
@@ -545,9 +609,7 @@ def parse_rawdata(payload: bytes) -> RawDataPacket:
         and flag_sound == 0
         and all(value == 0 for value in sound)
     )
-    is_pir_event = (
-        flag_human_presence == 1 and detected == 1 and remaining_fields_are_zero
-    )
+    is_pir_event = flag_human_presence == 1 and remaining_fields_are_zero
 
     return RawDataPacket(
         flag_human_presence=flag_human_presence,
@@ -580,7 +642,7 @@ def parse_report(payload: bytes) -> ReportPacket:
         message = payload.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise PacketParseError("REPORT payload is not valid UTF-8") from exc
-    if payload.lstrip().startswith(b"{"):
+    if payload.lstrip().startswith((b"{", b"[")):
         try:
             document = json.loads(message)
         except json.JSONDecodeError as exc:

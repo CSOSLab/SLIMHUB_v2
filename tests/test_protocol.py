@@ -24,6 +24,18 @@ from slimhub.protocol.nus import (
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_location_only_config_set_targets_node_without_profile(self) -> None:
+        frame = build_command_frame(
+            "AA:BB:CC:DD:EE:FF",
+            "config_set,location=TOILET",
+        )
+
+        payload_len = int.from_bytes(frame[14:16], byteorder="little")
+        self.assertEqual(
+            frame[16 : 16 + payload_len],
+            b"config_set,location=TOILET",
+        )
+
     def command_payload(self, command: str) -> bytes:
         frame = build_command_frame("AA:BB:CC:DD:EE:FF", command)
         payload_len = int.from_bytes(frame[14:16], byteorder="little")
@@ -139,16 +151,17 @@ class ProtocolTests(unittest.TestCase):
         for encoded in fixture["notification_chunks_base64"]:
             frame_bytes.extend(assembler.push(base64.b64decode(encoded)))
 
-        frames = [parse_frame(data) for data in frame_bytes]
+        frames = [parse_frame(data) for data in frame_bytes[:2]]
 
         self.assertEqual(
             [frame.packet_type for frame in frames],
-            ["AUDIO", "REPORT", "RAWDATA"],
+            ["AUDIO", "REPORT"],
         )
         self.assertIsInstance(frames[0].parsed, IgnoredPacket)
         self.assertEqual(frames[0].parsed.packet_type, "AUDIO")
         self.assertEqual(frames[1].parsed.fields["event"], "CAPTURE_DONE")
-        self.assertIsInstance(frames[2].parsed, RawDataPacket)
+        with self.assertRaisesRegex(PacketParseError, "one active producer"):
+            parse_frame(frame_bytes[2])
 
     def test_assembler_discards_bad_crlf_and_resynchronizes_to_next_frame(self) -> None:
         valid = build_frame("AA:BB:CC:DD:EE:FF", "ALERT", b"ready")
@@ -176,15 +189,15 @@ class ProtocolTests(unittest.TestCase):
     def test_rawdata_frame_parses_payload(self) -> None:
         payload = struct.pack(
             "<BB7HB16b",
-            1,
-            1,
-            1,
-            2350,
-            55,
-            100,
-            450,
-            7,
-            3,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
             1,
             *range(-8, 8),
         )
@@ -192,9 +205,33 @@ class ProtocolTests(unittest.TestCase):
 
         self.assertIsInstance(frame.parsed, RawDataPacket)
         self.assertEqual(frame.mac, "AA:BB:CC:DD:EE:FF")
-        self.assertEqual(frame.parsed.detected, 1)
-        self.assertEqual(frame.parsed.temperature_c, 23.5)
+        self.assertEqual(frame.parsed.detected, 0)
+        self.assertEqual(frame.parsed.temperature_c, 0)
         self.assertEqual(frame.parsed.sound[0], -8)
+
+    def test_rawdata_rejects_mixed_producers_and_inactive_cached_data(self) -> None:
+        mixed = struct.pack("<BB7HB16b", 1, 1, 1, 2350, 55, 100, 450, 7, 3, 0, *([0] * 16))
+        pir_with_sound = struct.pack(
+            "<BB7HB16b",
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            *([-128] * 16),
+        )
+
+        with self.assertRaises(PacketParseError):
+            parse_frame(build_frame("AA:BB:CC:DD:EE:FF", "RAWDATA", mixed))
+        with self.assertRaises(PacketParseError):
+            parse_frame(
+                build_frame("AA:BB:CC:DD:EE:FF", "RAWDATA", pir_with_sound)
+            )
 
     def test_alert_frame_parses_text(self) -> None:
         frame = parse_frame(build_frame("AA:BB:CC:DD:EE:FF", "ALERT", b"ready"))
@@ -254,6 +291,9 @@ class ProtocolTests(unittest.TestCase):
         malformed = parse_frame(
             build_frame("AA:BB:CC:DD:EE:FF", "REPORT", b'{"type":"EVENT"')
         ).parsed
+        non_object = parse_frame(
+            build_frame("AA:BB:CC:DD:EE:FF", "REPORT", b'["not","an","object"]')
+        ).parsed
 
         self.assertEqual(parsed.format, "json")
         self.assertEqual(parsed.document["future_detail"], {"weight": 3})
@@ -261,6 +301,8 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(malformed.format, "json")
         self.assertIn("invalid_json", malformed.parse_error)
         self.assertEqual(malformed.message, '{"type":"EVENT"')
+        self.assertEqual(non_object.format, "json")
+        self.assertEqual(non_object.parse_error, "json_report_must_be_an_object")
 
     def test_inout_report_frame_parses_state_payload(self) -> None:
         payload = (
@@ -276,20 +318,30 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(frame.parsed.fields["state"], "inside_moving")
 
     def test_command_frame_uses_target_mac_and_command_packet_type(self) -> None:
-        frame = build_command_frame("AA:BB:CC:DD:EE:FF", "enter")
+        frame = build_command_frame(
+            "AA:BB:CC:DD:EE:FF",
+            "inout_sync,bid=a1b2c3d4,state=in,rid=1",
+        )
 
         self.assertEqual(frame[:6], bytes.fromhex("AABBCCDDEEFF"))
         self.assertEqual(frame[6:14], b"COMMAND\x00")
-        self.assertIn(b"enter", frame)
+        self.assertIn(b"inout_sync", frame)
 
-    def test_exit_command_frame_builds_exit_payload(self) -> None:
-        self.assertEqual(self.command_payload("exit"), b"exit")
-
-    def test_command_frame_maps_legacy_enter_to_enter(self) -> None:
-        frame = build_command_frame("AA:BB:CC:DD:EE:FF", "strong_enter")
-
-        self.assertIn(b"enter", frame)
-        self.assertNotIn(b"strong_enter", frame)
+    def test_inout_sync_is_strict_and_legacy_feedback_is_rejected(self) -> None:
+        self.assertEqual(
+            self.command_payload("inout_sync,bid=A1B2,state=out,rid=0x2"),
+            b"inout_sync,bid=a1b2,state=out,rid=2",
+        )
+        for command in (
+            "enter",
+            "exit",
+            "inout_confirm,bid=a1,cid=1,state=in,rid=1",
+            "inout_sync,bid=a1,state=in,rid=0",
+            "inout_sync,bid=a1,state=in,rid=1,extra=1",
+            "inout_sync,bid=a1,bid=a2,state=in,rid=1",
+        ):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                build_command_frame("AA:BB:CC:DD:EE:FF", command)
 
     def test_record_command_frame_builds_record_payload(self) -> None:
         self.assertEqual(self.command_payload("record"), b"record")

@@ -136,12 +136,23 @@ class ShadowPowerStateTests(unittest.TestCase):
     def test_command_hints_do_not_change_active_sleep_decision(self) -> None:
         shadow = ShadowPowerState()
 
-        enter = shadow.update_command_hint(ADDRESS, "enter", 1.0)
-        exit_ = shadow.update_command_hint(ADDRESS, "exit", 2.0)
+        enter = shadow.update_command_hint(
+            ADDRESS,
+            "inout_sync,bid=a1,state=in,rid=1",
+            1.0,
+        )
+        exit_ = shadow.update_command_hint(
+            ADDRESS,
+            "inout_sync,bid=a1,state=out,rid=2",
+            2.0,
+        )
 
         self.assertEqual(enter.state, ABSENT_SLEEP)
         self.assertEqual(exit_.state, ABSENT_SLEEP)
-        self.assertEqual(exit_.last_command_hint, "exit")
+        self.assertEqual(
+            exit_.last_command_hint,
+            "inout_sync,bid=a1,state=out,rid=2",
+        )
 
     def test_disconnect_marks_disconnected_without_command_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

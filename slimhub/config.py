@@ -11,9 +11,18 @@ from slimhub.protocol.nus import DEFAULT_DEVICE_NAME, normalize_mac
 
 DEFAULT_LOCATION = "undefined"
 DEFAULT_DEVICE_TYPE = DEFAULT_DEVICE_NAME
+NODE_LOCATIONS = frozenset(
+    {"ENTRY", "LIVING", "BEDROOM", "KITCHEN", "TOILET"}
+)
 UNASSIGNED_LOCATION_NAMES = frozenset(
     {"", "undefined", "unnamed", "unknown", "none", "null", "unassigned"}
 )
+
+
+def normalize_node_location(value: object) -> str | None:
+    """Return a Node-configurable room or None for unknown/local-only names."""
+    normalized = str(value or "").strip().upper()
+    return normalized if normalized in NODE_LOCATIONS else None
 
 
 class LocationTargetError(ValueError):
@@ -54,6 +63,10 @@ class AppPaths:
     @property
     def socket_path(self) -> Path:
         return self.programdata_dir / "slimhub.sock"
+
+    @property
+    def daemon_lock_path(self) -> Path:
+        return self.programdata_dir / "slimhub.lock"
 
     @property
     def hub_config_path(self) -> Path:

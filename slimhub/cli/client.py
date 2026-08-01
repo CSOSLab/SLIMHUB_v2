@@ -31,3 +31,19 @@ def send_request_sync(
     args: dict[str, object] | None = None,
 ) -> object:
     return asyncio.run(send_request(paths, command, args))
+
+
+def daemon_is_running(paths: AppPaths) -> bool:
+    """Probe the existing socket instead of trusting a possibly stale path."""
+    if not paths.socket_path.exists():
+        return False
+    try:
+        asyncio.run(
+            asyncio.wait_for(
+                send_request(paths, "devices"),
+                timeout=0.5,
+            )
+        )
+    except (OSError, RuntimeError, ValueError, TimeoutError):
+        return False
+    return True

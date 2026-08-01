@@ -22,6 +22,7 @@ class RawDataEvent:
     sound_semantic_ready: bool | None = None
     sound_profile: str | None = None
     sound_model: str | None = None
+    sound_raw_schema: int | None = None
 
 
 @dataclass(frozen=True)

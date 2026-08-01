@@ -78,17 +78,25 @@ class DeviceSessionQueueTests(unittest.IsolatedAsyncioTestCase):
         logger.warning.assert_called_once()
         logger.exception.assert_not_called()
 
-    async def test_offline_commands_coalesce_to_final_desired_state(self) -> None:
+    async def test_inout_sync_attempts_keep_distinct_request_ids(self) -> None:
         session = DeviceSession("AA:BB:CC:DD:EE:01", on_frame=ignore_frame)
 
-        await session.send_command(CommandEvent(session.address, "enter", "ENTRY", desired_epoch=1))
-        await session.send_command(CommandEvent(session.address, "exit", "ENTRY", desired_epoch=2))
+        await session.send_command(
+            CommandEvent(
+                session.address,
+                "inout_sync,bid=a1,state=in,rid=1",
+                "TOILET",
+            )
+        )
+        await session.send_command(
+            CommandEvent(
+                session.address,
+                "inout_sync,bid=a1,state=out,rid=2",
+                "TOILET",
+            )
+        )
 
-        self.assertEqual(session.status()["queued_commands"], 1)
-        key = await session._command_queue.get()
-        command = session._pending_commands.pop(key)
-        self.assertEqual(command.command, "exit")
-        self.assertEqual(command.desired_epoch, 2)
+        self.assertEqual(session.status()["queued_commands"], 2)
 
     async def test_failed_write_is_retried_and_remains_ack_pending(self) -> None:
         results: list[tuple[bool, str | None]] = []
@@ -110,7 +118,9 @@ class DeviceSessionQueueTests(unittest.IsolatedAsyncioTestCase):
             on_command_result=on_result,
             reconnect_delay=0.0,
         )
-        await session.send_command(CommandEvent(session.address, "enter", "ENTRY", cmd_id="c1"))
+        await session.send_command(
+            CommandEvent(session.address, "node_status", "TOILET", cmd_id="c1")
+        )
         worker = asyncio.create_task(session._command_worker(FlakyClient()))
         await asyncio.wait_for(completed.wait(), timeout=1.0)
         session._stop_event.set()
@@ -185,6 +195,32 @@ class DeviceSessionQueueTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*list(session._inflight_frame_tasks))
 
         self.assertEqual(handled, ["first", "second"])
+
+    async def test_source_mac_mismatch_is_rejected_before_payload_parse(self) -> None:
+        handled: list[object] = []
+
+        async def on_frame(_: str, frame: object) -> None:
+            handled.append(frame)
+
+        logger = MagicMock()
+        session = DeviceSession(
+            "AA:BB:CC:DD:EE:01",
+            on_frame=on_frame,
+            logger=logger,
+        )
+        notify = session._build_notify_handler(FrameAssembler())
+        mismatched = build_frame(
+            "AA:BB:CC:DD:EE:02",
+            "RAWDATA",
+            b"\x00" * 33,
+        )
+
+        notify(None, bytearray(mismatched))
+        await asyncio.sleep(0)
+
+        self.assertEqual(handled, [])
+        logger.error.assert_called_once()
+        self.assertIn("source MAC mismatch", logger.error.call_args.args[0])
 
 
 if __name__ == "__main__":

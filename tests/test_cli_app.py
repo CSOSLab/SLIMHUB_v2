@@ -448,6 +448,31 @@ class CliAppTests(unittest.TestCase):
         )
         self.assertEqual(reload_call.args[1], "node.config.reload")
 
+    def test_node_config_set_defaults_to_node_derived_profile(self) -> None:
+        status, call, _ = self.run_command_cli(
+            [
+                "node",
+                "config",
+                "set",
+                "--address",
+                ADDRESS,
+                "--node-location",
+                "TOILET",
+            ],
+            {"cached": {}},
+        )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(call.args[1], "node.config.set")
+        self.assertEqual(
+            call.args[2],
+            {
+                "address": ADDRESS,
+                "node_location": "TOILET",
+                "profile": None,
+            },
+        )
+
     def test_sound_cli_rejects_invalid_label_and_ranges(self) -> None:
         parser = build_parser()
         invalid_arguments = (
@@ -492,7 +517,7 @@ class CliAppTests(unittest.TestCase):
 
     def test_command_and_config_location_targets_remain_supported(self) -> None:
         command_status, command_call, _ = self.run_command_cli(
-            ["command", "send", "--location", "TOILET", "--command", "enter"]
+            ["command", "send", "--location", "TOILET", "--command", "node_status"]
         )
         config_status, config_call, _ = self.run_command_cli(
             ["config", "set", "--location", "TOILET", "name", "toilet-node"]
@@ -501,7 +526,7 @@ class CliAppTests(unittest.TestCase):
         self.assertEqual(command_status, 0)
         self.assertEqual(
             command_call.args[2],
-            {"location": "TOILET", "command": "enter"},
+            {"location": "TOILET", "command": "node_status"},
         )
         self.assertEqual(config_status, 0)
         self.assertEqual(
@@ -567,6 +592,35 @@ class CliAppTests(unittest.TestCase):
 
         self.assertEqual(status, 0)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_duplicate_daemon_start_commands_warn_and_are_ignored(self) -> None:
+        variants = (
+            ["run"],
+            ["run", "--background"],
+            ["--run"],
+            ["--run", "--background"],
+        )
+        for arguments in variants:
+            with self.subTest(arguments=arguments):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    with patch(
+                        "slimhub.cli.app.daemon_is_running",
+                        return_value=True,
+                    ):
+                        with patch("slimhub.cli.app.subprocess.Popen") as popen:
+                            with patch(
+                                "sys.stderr",
+                                new_callable=io.StringIO,
+                            ) as stderr:
+                                status = run_cli(
+                                    ["--base-dir", tmpdir, *arguments]
+                                )
+
+                self.assertEqual(status, 0)
+                popen.assert_not_called()
+                self.assertIn("WARNING:", stderr.getvalue())
+                self.assertIn("already running", stderr.getvalue())
+                self.assertIn("ignored", stderr.getvalue())
 
     def test_background_compatibility_entry_point_starts_daemon(self) -> None:
         class FakeProcess:

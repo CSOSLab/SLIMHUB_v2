@@ -227,7 +227,7 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIn("epoch_ms=100000", session.commands[0].command)
 
-    async def test_schema2_candidate_uses_exact_confirmation_and_applied_ack(self) -> None:
+    async def test_pir_observation_uses_inout_sync_and_applied_ack(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             address = "AA:BB:CC:DD:EE:01"
             daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
@@ -237,42 +237,28 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
                 address,
                 report_frame(
                     address,
-                    "src=NODE,event=STATUS,bid=a1b2c3d4,authority=slimhub_confirmed,"
-                    "occupancy=OUT,capture=IDLE,config=READY,semantic=1",
+                    "src=NODE,event=STATUS,bid=a1b2c3d4,authority=slimhub,"
+                    "occupancy=OUT,capture=IDLE,config=READY,semantic=1,location=TOILET",
                     {
                         "src": "NODE",
                         "event": "STATUS",
                         "bid": "a1b2c3d4",
-                        "authority": "slimhub_confirmed",
+                        "authority": "slimhub",
                         "occupancy": "OUT",
                         "capture": "IDLE",
                         "config": "READY",
                         "semantic": "1",
+                        "location": "TOILET",
                     },
                 ),
             )
-            await daemon.handle_frame(
-                address,
-                report_frame(
-                    address,
-                    "src=INOUT,event=ENTER,schema=2,bid=a1b2c3d4,cid=7,timestamp=100",
-                    {
-                        "src": "INOUT",
-                        "event": "ENTER",
-                        "schema": "2",
-                        "bid": "a1b2c3d4",
-                        "cid": "7",
-                        "timestamp": "100",
-                    },
-                ),
-            )
-            await daemon.flush_report_reorder_buffer()
+            await daemon.handle_frame(address, raw_frame(address, detected=1))
 
             self.assertEqual(len(session.commands), 1)
             command = session.commands[0].command
             self.assertTrue(
                 command.startswith(
-                    "inout_confirm,bid=a1b2c3d4,cid=7,state=in,rid="
+                    "inout_sync,bid=a1b2c3d4,state=in,rid="
                 )
             )
             rid = command.rsplit("=", 1)[1]
@@ -280,19 +266,19 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
                 address,
                 report_frame(
                     address,
-                    "src=INOUT,event=CONFIRM_ACK,schema=2,bid=a1b2c3d4,cid=7,"
-                    f"rid={rid},state=in,source=slimhub,applied=1,timestamp=101",
+                    "src=INOUT,event=SYNC_ACK,schema=2,bid=a1b2c3d4,"
+                    f"rid={rid},state=in,source=slimhub,applied=1,changed=1,ts=101",
                     {
                         "src": "INOUT",
-                        "event": "CONFIRM_ACK",
+                        "event": "SYNC_ACK",
                         "schema": "2",
                         "bid": "a1b2c3d4",
-                        "cid": "7",
                         "rid": rid,
                         "state": "in",
                         "source": "slimhub",
                         "applied": "1",
-                        "timestamp": "101",
+                        "changed": "1",
+                        "ts": "101",
                     },
                 ),
             )
@@ -302,7 +288,10 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
                 daemon.dean_contract.snapshot(address)["occupancy"],
                 "IN",
             )
-            self.assertIsNone(daemon.estimator.snapshot()["last_address"])
+            self.assertEqual(
+                daemon.dean_contract.home_snapshot()["confirmed_occupant"],
+                address,
+            )
 
     async def test_node_config_dispatch_waits_for_applied_report(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -346,17 +335,70 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(response["data"]["cached"]["profile"], "toilet_v1")
 
-    def test_json_device_requires_canonical_uppercase_colon_mac(self) -> None:
+    async def test_location_sync_routes_location_only_command_to_report_mac(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            address = "AA:BB:CC:DD:EE:01"
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            session = FakeSession(address)
+            await daemon.registry.add(session)
+            daemon.config_store.set_field(address, "location", "TOILET")
+            node_fields = {
+                "src": "NODE",
+                "event": "STATUS",
+                "bid": "1a2b3c4d",
+                "occupancy": "OUT",
+                "capture": "IDLE",
+                "location": "LIVING",
+                "config": "file_not_found",
+                "semantic": "0",
+            }
+            config_fields = {
+                "src": "CONFIG",
+                "event": "STATUS",
+                "bid": "1a2b3c4d",
+                "location": "LIVING",
+                "profile": "living_v1",
+                "config": "file_not_found",
+                "semantic": "0",
+                "class_count": "5",
+                "model": "11223344",
+                "raw": "2",
+            }
+
+            for fields in (node_fields, config_fields):
+                message = ",".join(
+                    f"{key}={value}" for key, value in fields.items()
+                )
+                await daemon.handle_frame(
+                    address,
+                    report_frame(address, message, fields),
+                )
+
+            self.assertEqual(
+                [command.command for command in session.commands],
+                ["config_set,location=TOILET"],
+            )
+            self.assertEqual(session.commands[0].address, address)
+            self.assertEqual(
+                daemon.dean_contract.snapshot(address)["raw_schema"],
+                2,
+            )
+            audit = next(
+                (Path(tmpdir) / "programdata" / "reports").glob("*.jsonl")
+            ).read_text(encoding="utf-8")
+            self.assertIn("location_report_mismatch", audit)
+            self.assertIn('"central_location": "TOILET"', audit)
+
+    def test_json_device_match_is_case_insensitive(self) -> None:
         address = "AA:BB:CC:DD:EE:01"
         frame = json_report_frame(
             address,
             {"device": "aa:bb:cc:dd:ee:01", "type": "EVENT"},
         )
 
-        self.assertEqual(
-            SlimHubDaemon._json_identity_warning(frame),
-            "noncanonical_device:aa:bb:cc:dd:ee:01",
-        )
+        self.assertIsNone(SlimHubDaemon._json_identity_warning(frame))
 
     async def test_json_event_validates_device_identity_and_never_feeds_estimator(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -381,7 +423,7 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("device_mismatch:11:22:33:44:55:66", "\n".join(captured.output))
             self.assertIsNone(daemon.estimator.snapshot()["last_address"])
             timeline = daemon.multimodal.snapshot()["legacy_events"]
-            self.assertIn(f"{frame_mac}/12ab34cd/840000/ENTER", timeline)
+            self.assertEqual(timeline, {})
             report_file = next((Path(tmpdir) / "programdata" / "reports").glob("*.jsonl"))
             rows = [
                 json.loads(line)
@@ -393,12 +435,12 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(raw["json_document"]["device"], "11:22:33:44:55:66")
             self.assertIn("device_mismatch", raw["identity_warning"])
 
-    async def test_invalid_json_enter_value_is_preserved_but_not_timeline_movement(self) -> None:
+    async def test_invalid_strict_debug_value_is_diagnostic_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             address = "AA:BB:CC:DD:EE:01"
             document = {
                 "device": address,
-                "type": "EVENT",
+                "type": "DEBUG",
                 "event": "ENTER",
                 "value": 20,
                 "schema": 2,
@@ -418,10 +460,11 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
                 json.loads(line)
                 for line in report_file.read_text(encoding="utf-8").splitlines()
             ]
-            invalid = next(row for row in rows if row["kind"] == "legacy_event_invalid")
-            self.assertEqual(invalid["raw_document"]["future_key"], "preserved")
+            invalid = next(row for row in rows if row["kind"] == "legacy_report_rejected")
+            self.assertEqual(invalid["reason"], "invalid_debug_value")
+            self.assertEqual(invalid["declared_length"], invalid["actual_length"])
 
-    async def test_new_node_enter_sends_exit_command_to_previous_node(self) -> None:
+    async def test_legacy_detected_10_does_not_assign_demo_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
             entry = FakeSession("AA:BB:CC:DD:EE:01")
@@ -434,10 +477,28 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             await daemon.handle_frame(entry.address, raw_frame(entry.address, detected=10))
             await daemon.handle_frame(living.address, raw_frame(living.address, detected=10))
 
-            self.assertEqual([command.command for command in entry.commands], ["enter", "exit"])
-            self.assertEqual([command.location for command in entry.commands], ["ENTRY", "ENTRY"])
-            self.assertEqual([command.command for command in living.commands], ["enter"])
-            self.assertEqual(living.commands[0].location, "LIVING")
+            self.assertEqual(entry.commands, [])
+            self.assertEqual(living.commands, [])
+
+    async def test_legacy_detected_20_does_not_assign_demo_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            entry = FakeSession("AA:BB:CC:DD:EE:01")
+            living = FakeSession("AA:BB:CC:DD:EE:02")
+            await daemon.registry.add(entry)
+            await daemon.registry.add(living)
+            daemon.config_store.set_field(entry.address, "location", "ENTRY")
+            daemon.config_store.set_field(living.address, "location", "LIVING")
+
+            await daemon.handle_frame(entry.address, raw_frame(entry.address, detected=10))
+            await daemon.handle_frame(living.address, raw_frame(living.address, detected=20))
+            await daemon.handle_frame(entry.address, raw_frame(entry.address, detected=20))
+
+            self.assertEqual(entry.commands, [])
+            self.assertEqual(living.commands, [])
+            self.assertIsNone(
+                daemon.dean_contract.home_snapshot()["desired_occupant"]
+            )
 
     async def test_inout_report_updates_power_shadow_visibility(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -452,7 +513,7 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(snapshot["last_inout_state"], "inside_moving")
             self.assertEqual(snapshot["last_inout_code"], "10")
 
-    async def test_inout_report_enter_sends_enter_command(self) -> None:
+    async def test_legacy_inout_report_enter_is_not_command_authority(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             address = "AA:BB:CC:DD:EE:01"
             daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
@@ -462,10 +523,9 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
 
             await daemon.handle_frame(address, inout_report_frame(address, "ENTER"))
 
-            self.assertEqual([command.command for command in session.commands], ["enter"])
-            self.assertEqual(session.commands[0].location, "ENTRY")
+            self.assertEqual(session.commands, [])
 
-    async def test_report_command_routes_by_frame_mac_alias(self) -> None:
+    async def test_legacy_report_does_not_route_feedback_by_alias(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             ble_address = "AA:BB:CC:DD:EE:01"
             frame_mac = "11:22:33:44:55:66"
@@ -475,12 +535,9 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
 
             await daemon.handle_frame(ble_address, inout_report_frame(frame_mac, "ENTER"))
 
-            self.assertEqual([command.command for command in session.commands], ["enter"])
-            self.assertEqual(session.commands[0].address, frame_mac)
-            self.assertEqual(session.commands[0].canonical_node_id, frame_mac)
-            self.assertEqual(session.commands[0].ble_address, ble_address)
+            self.assertEqual(session.commands, [])
 
-    async def test_report_enter_new_node_sends_enter_new_then_exit_previous(self) -> None:
+    async def test_legacy_report_enter_cannot_move_home_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             sent: list[tuple[str, str]] = []
             daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
@@ -494,16 +551,9 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             await daemon.handle_frame(entry.address, inout_report_frame(entry.address, "ENTER"))
             await daemon.handle_frame(living.address, inout_report_frame(living.address, "ENTER"))
 
-            self.assertEqual(
-                sent,
-                [
-                    ("enter", "AA:BB:CC:DD:EE:01"),
-                    ("enter", "AA:BB:CC:DD:EE:02"),
-                    ("exit", "AA:BB:CC:DD:EE:01"),
-                ],
-            )
+            self.assertEqual(sent, [])
 
-    async def test_inout_report_exit_sends_exit_and_clears_current(self) -> None:
+    async def test_legacy_report_exit_cannot_clear_home_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             address = "AA:BB:CC:DD:EE:01"
             daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
@@ -513,8 +563,10 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             await daemon.handle_frame(address, inout_report_frame(address, "ENTER"))
             await daemon.handle_frame(address, inout_report_frame(address, "EXIT"))
 
-            self.assertEqual([command.command for command in session.commands], ["enter", "exit"])
-            self.assertIsNone(daemon.estimator.snapshot()["last_address"])
+            self.assertEqual(session.commands, [])
+            self.assertIsNone(
+                daemon.dean_contract.home_snapshot()["desired_occupant"]
+            )
 
     async def test_malformed_inout_report_does_not_raise_or_send_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -577,14 +629,14 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             response = await daemon.dispatch(
                 {
                     "command": "command.send",
-                    "args": {"location": "toilet", "command": "enter"},
+                    "args": {"location": "toilet", "command": "node_status"},
                 }
             )
 
             self.assertTrue(response["ok"])
             self.assertEqual(response["data"]["address"], address)
             self.assertEqual(response["data"]["location"], "TOILET")
-            self.assertEqual(session.commands[-1].command, "enter")
+            self.assertEqual(session.commands[-1].command, "node_status")
 
     async def test_duplicate_location_blocks_command_and_lists_devices(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -748,6 +800,7 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
                 "confidence": "0.91",
                 "model": "0cb81518",
                 "source": "tflm",
+                "raw": "2",
                 "rms": "1420.5",
                 "db": "61.2",
                 "ts": "45000",
@@ -809,7 +862,7 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(message, audit)
             self.assertIn("less than class_count", audit)
 
-    async def test_two_node_ack_replay_confirms_only_destination_without_feedback(self) -> None:
+    async def test_legacy_sequence_reports_never_emit_demo_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
             a = FakeSession("AA:BB:CC:DD:EE:01")
@@ -857,8 +910,8 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
 
             await daemon.flush_report_reorder_buffer()
 
-            self.assertEqual([command.command for command in a.commands], ["enter", "exit"])
-            self.assertEqual([command.command for command in b.commands], ["enter"])
+            self.assertEqual(a.commands, [])
+            self.assertEqual(b.commands, [])
             self.assertEqual(
                 daemon.estimator.snapshot()["confirmed_occupants"],
                 [b.address],

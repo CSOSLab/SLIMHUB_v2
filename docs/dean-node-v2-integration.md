@@ -1,7 +1,7 @@
 # DEAN Node v2 integration operations
 
-Production setup expects at least one Node reporting
-`authority=slimhub_confirmed`, `config=READY`, and `semantic=1`.
+Production setup expects the home-wide token demo firmware with
+`config=READY` and `semantic=1`. SLIMHUB owns occupancy authority.
 
 ## Inspect and configure a Node
 
@@ -9,13 +9,20 @@ Production setup expects at least one Node reporting
 slimhub-v2 node status --address AA:BB:CC:DD:EE:FF
 slimhub-v2 node config get --address AA:BB:CC:DD:EE:FF
 slimhub-v2 node config set --address AA:BB:CC:DD:EE:FF \
-  --node-location KITCHEN --profile kitchen_v1
+  --node-location KITCHEN
 slimhub-v2 node config reload --address AA:BB:CC:DD:EE:FF
 ```
 
 Set/reload is rejected unless the last NODE/STATUS says occupancy OUT and
 capture IDLE. The set response is pending; verify CONFIG/APPLIED before using
 the new cached profile.
+
+On each connection SLIMHUB compares the normalized MAC's local JSON location
+after fresh NODE/STATUS and CONFIG/STATUS reports. A valid production room is
+applied once with `config_set,location=<LOCATION>` when the Node is OUT+IDLE.
+IN/active capture defers the change; unknown/undefined local locations never
+overwrite Node persistence. CONFIG/REJECTED or command errors are terminal for
+that connection and remain in the diagnostic JSONL.
 
 ## Automatic capture
 
@@ -34,7 +41,7 @@ CAPTURE_COMPLETE. `sound status` and `sound stop` remain available.
 
 ## Location sound classes
 
-| Index | TOILET | KITCHEN | LIVING/BEDROOM |
+| Index | TOILET | KITCHEN | ENTRY/LIVING/BEDROOM |
 |---:|---|---|---|
 | 0 | background | background | background |
 | 1 | hitting | hitting | hitting |
@@ -48,17 +55,28 @@ CAPTURE_COMPLETE. `sound status` and `sound stop` remain available.
 | 9 | watering_high | — | — |
 
 Never interpret an index without the same Node's profile/location,
-class_count, semantic flag, and model identifier. The legacy CSV keeps its
-fixed toilet-v1 columns; dynamic raw scores and metadata are written to
-`programdata/reports/*.jsonl`.
+class_count, semantic flag, and model identifier. Every accepted room writes
+the same 24-column home-wide union CSV. Firmware-confirmed `raw=2` uses the
+common `home_semantic_v1` slots directly; profile tensors are mapped by label
+into that union and unavailable labels are written as `0.0`. The deployed
+catalog has no `gas_oven`; adding it requires a model manifest and an explicit
+schema migration.
+
+Strict legacy JSON `REPORT` objects use `type=DEBUG` or `type=INFERENCE` and
+are the only source for `display/YYYY-MM-DD.txt` and per-node `debugstr`.
+Typed schema-2 reports remain structured/correlation evidence and never add a
+second legacy line.
 
 ## Field gate before production
 
 With two physical Nodes, verify:
 
 - command frame target MAC equals each Node's actual source MAC;
-- identical bid/cid values on two Nodes do not collide;
-- PIR+RADAR ENTER and EXIT candidates require SLIMHUB confirmation;
+- identical bid/rid values on two Nodes do not collide;
+- PIR `detected=0|1` never acts as a Node-local occupancy decision;
+- the previous Node ACKs `inout_sync state=out` before the new Node receives
+  `state=in`;
+- `SYNC_ACK changed=0` does not create a duplicate transition;
 - D0/D1 and EVENT/ADL reports arrive without feedback loops;
 - KITCHEN index 4 resolves to cooking while TOILET index 4 resolves to brushing;
 - automatic capture arms, segments, completes, and stops;

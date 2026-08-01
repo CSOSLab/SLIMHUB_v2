@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from slimhub.cli.client import send_request_sync
+from slimhub.cli.client import daemon_is_running, send_request_sync
 from slimhub.config import AppPaths, DeviceConfigStore, HubConfigStore
 from slimhub.integrations.database import DataDirectoryDatabaseUpdater
 from slimhub.protocol.nus import (
@@ -23,13 +23,13 @@ from slimhub.protocol.nus import (
     MIN_RECORD_SECONDS,
     RECORD_STOP_COMMAND,
     SOUND_STATUS_COMMAND,
-    VALID_COMMANDS,
     build_record_command,
     build_sound_background_command,
     build_sound_auto_command,
     build_sound_start_command,
     validate_sound_label,
 )
+from slimhub.singleton import DaemonAlreadyRunning, daemon_lock_is_held
 
 SOUND_ARM_WAIT_SECONDS = 120
 SOUND_FINALIZE_MIN_SECONDS = 180
@@ -283,8 +283,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Examples:\n"
-            "  slimhub-v2 command send --address AA:BB:CC:DD:EE:FF --command enter\n"
-            "  slimhub-v2 command send --location TOILET --command enter\n"
+            "  slimhub-v2 command send --address AA:BB:CC:DD:EE:FF "
+            "--command node_status\n"
             "  slimhub-v2 command record --location TOILET --seconds 30"
         ),
         formatter_class=_HelpFormatter,
@@ -295,17 +295,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     command_send = command_subparsers.add_parser(
         "send",
-        help="Send an enter/exit feedback command.",
-        description="Queue a manual IN/OUT feedback COMMAND for one connected Node.",
+        help="Send a validated NUS command.",
+        description="Queue one validated COMMAND for a connected Node.",
         formatter_class=_HelpFormatter,
     )
     _add_target_options(command_send, required=True)
     command_send.add_argument(
         "--command",
         dest="nus_command",
-        choices=VALID_COMMANDS,
         required=True,
-        help="Feedback state to send to the Node.",
+        help="Validated NUS command payload.",
     )
     command_record = command_subparsers.add_parser(
         "record",
@@ -491,12 +490,15 @@ def build_parser() -> argparse.ArgumentParser:
     node_config_set.add_argument(
         "--node-location",
         required=True,
-        choices=("TOILET", "KITCHEN", "LIVING", "BEDROOM"),
+        choices=("ENTRY", "LIVING", "BEDROOM", "KITCHEN", "TOILET"),
     )
     node_config_set.add_argument(
         "--profile",
-        required=True,
         choices=("toilet_v1", "kitchen_v1", "living_v1"),
+        help=(
+            "Legacy compatibility override; omit to let the Node derive its "
+            "profile from --node-location."
+        ),
     )
     node_config_reload = node_config_subparsers.add_parser(
         "reload",
@@ -707,6 +709,18 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
 
     try:
         if _is_run_command(args):
+            if daemon_is_running(paths) or daemon_lock_is_held(
+                paths.daemon_lock_path
+            ):
+                warning = (
+                    "SLIMHUB daemon is already running; start command ignored."
+                )
+                logging.warning(warning)
+                print(
+                    f"WARNING: {warning}",
+                    file=sys.stderr,
+                )
+                return 0
             target_address = _resolve_local_target(paths, args)
             if args.background:
                 return _run_background(argv, paths)
@@ -743,6 +757,10 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
         return 1 if args.subcommand == "sound" else 0
     except KeyboardInterrupt:
         return _handle_sound_interrupt(paths, args)
+    except DaemonAlreadyRunning as exc:
+        logging.warning("%s.", exc)
+        print(f"WARNING: {exc}.", file=sys.stderr)
+        return 0
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

@@ -4,15 +4,16 @@ import json
 import unittest
 from pathlib import Path
 
+from slimhub.dean_contract import DeanContractStore
 from slimhub.events import RawDataEvent, ReportEvent
 from slimhub.protocol.nus import RawDataPacket, ReportPacket
-from slimhub.unitspace import SimpleUnitspaceEstimator
 
 
 class TwoNodeReplayTests(unittest.TestCase):
-    def test_fixture_replay_converges_to_destination_node(self) -> None:
+    def test_fixture_replay_converges_to_one_home_token(self) -> None:
         fixture = Path(__file__).with_name("fixtures") / "two_node_inout_replay.jsonl"
-        estimator = SimpleUnitspaceEstimator()
+        rids = iter((0x11, 0x22, 0x33))
+        store = DeanContractStore(rid_factory=lambda: next(rids))
         commands: list[tuple[str, str]] = []
 
         for line in fixture.read_text(encoding="utf-8").splitlines():
@@ -30,15 +31,26 @@ class TwoNodeReplayTests(unittest.TestCase):
                     accuracy=0,
                     flag_sound=0,
                     sound=[0] * 16,
-                    is_pir_human_detection_event=False,
+                    is_pir_human_detection_event=True,
                 )
-                result = estimator.handle(
-                    RawDataEvent(item["receipt_ts"], item["mac"], item["location"], packet, b"")
+                result = store.handle_raw(
+                    RawDataEvent(
+                        item["receipt_ts"],
+                        item["mac"],
+                        item["location"],
+                        packet,
+                        b"",
+                    )
                 )
             else:
-                fields = {key: str(value) for key, value in item.items() if key not in {"kind", "mac", "location", "receipt_ts"}}
+                fields = {
+                    key: str(value)
+                    for key, value in item.items()
+                    if key not in {"kind", "mac", "location", "receipt_ts"}
+                }
+                fields["location"] = item["location"]
                 message = ",".join(f"{key}={value}" for key, value in fields.items())
-                result = estimator.handle_report(
+                result = store.handle_report(
                     ReportEvent(
                         timestamp=item["receipt_ts"],
                         receipt_timestamp=item["receipt_ts"],
@@ -54,12 +66,15 @@ class TwoNodeReplayTests(unittest.TestCase):
         self.assertEqual(
             commands,
             [
-                ("enter", "AA:BB:CC:DD:EE:01"),
-                ("enter", "AA:BB:CC:DD:EE:02"),
-                ("exit", "AA:BB:CC:DD:EE:01"),
+                ("inout_sync,bid=aaa1,state=in,rid=11", "AA:BB:CC:DD:EE:01"),
+                ("inout_sync,bid=aaa1,state=out,rid=22", "AA:BB:CC:DD:EE:01"),
+                ("inout_sync,bid=bbb2,state=in,rid=33", "AA:BB:CC:DD:EE:02"),
             ],
         )
-        self.assertEqual(estimator.snapshot()["confirmed_occupants"], ["AA:BB:CC:DD:EE:02"])
+        self.assertEqual(
+            store.home_snapshot()["confirmed_occupant"],
+            "AA:BB:CC:DD:EE:02",
+        )
 
 
 if __name__ == "__main__":

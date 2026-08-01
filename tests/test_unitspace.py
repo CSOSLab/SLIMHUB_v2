@@ -65,13 +65,13 @@ def inout_report(
 
 
 class UnitspaceTests(unittest.TestCase):
-    def test_raw10_and_matching_enter_sidecar_make_one_candidate(self) -> None:
+    def test_raw10_and_legacy_sidecar_never_assign_demo_occupancy(self) -> None:
         estimator = SimpleUnitspaceEstimator()
 
         first = estimator.handle(make_event("AA:BB:CC:DD:EE:01", "ENTRY", 10.0))
         sidecar = estimator.handle_report(inout_report("AA:BB:CC:DD:EE:01"))
 
-        self.assertEqual([command.command for command in first], ["enter"])
+        self.assertEqual(first, [])
         self.assertEqual(sidecar, [])
 
     def test_lost_sidecar_raw10_falls_back_once_and_late_sidecar_is_not_movement(self) -> None:
@@ -82,7 +82,7 @@ class UnitspaceTests(unittest.TestCase):
             inout_report("AA:BB:CC:DD:EE:01", timestamp=13.0)
         )
 
-        self.assertEqual([command.command for command in first], ["enter"])
+        self.assertEqual(first, [])
         self.assertEqual(late_sidecar, [])
 
     def test_same_node_repeated_candidate_updates_evidence_without_command_spam(self) -> None:
@@ -92,7 +92,7 @@ class UnitspaceTests(unittest.TestCase):
         commands = estimator.handle(make_event("AA:BB:CC:DD:EE:01", "ENTRY", 10.2))
 
         self.assertEqual(commands, [])
-        self.assertEqual(estimator.snapshot()["last_timestamp"], 10.2)
+        self.assertIsNone(estimator.snapshot()["desired_address"])
 
     def test_new_candidate_enters_new_node_then_exits_previous(self) -> None:
         estimator = SimpleUnitspaceEstimator()
@@ -108,11 +108,40 @@ class UnitspaceTests(unittest.TestCase):
 
         commands = estimator.handle(make_event("AA:BB:CC:DD:EE:02", "LIVING", 12.0))
 
-        self.assertEqual([command.command for command in commands], ["enter", "exit"])
-        self.assertEqual([command.address for command in commands], [
-            "AA:BB:CC:DD:EE:02",
-            "AA:BB:CC:DD:EE:01",
-        ])
+        self.assertEqual(commands, [])
+        self.assertIsNone(estimator.snapshot()["desired_address"])
+
+    def test_raw20_exits_only_the_current_desired_node(self) -> None:
+        estimator = SimpleUnitspaceEstimator()
+        a = "AA:BB:CC:DD:EE:01"
+        b = "AA:BB:CC:DD:EE:02"
+        estimator.handle(make_event(a, "ENTRY", 10.0))
+
+        unrelated_exit = estimator.handle(
+            make_event(b, "LIVING", 10.5, detected=20)
+        )
+        current_exit = estimator.handle(
+            make_event(a, "ENTRY", 11.0, detected=20)
+        )
+
+        self.assertEqual(unrelated_exit, [])
+        self.assertEqual(current_exit, [])
+        self.assertIsNone(estimator.snapshot()["desired_address"])
+
+    def test_late_raw20_from_previous_node_cannot_evict_new_occupant(self) -> None:
+        estimator = SimpleUnitspaceEstimator()
+        a = "AA:BB:CC:DD:EE:01"
+        b = "AA:BB:CC:DD:EE:02"
+        estimator.handle(make_event(a, "ENTRY", 10.0))
+        estimator.handle(make_event(b, "LIVING", 11.0))
+
+        commands = estimator.handle(
+            make_event(a, "ENTRY", 12.0, detected=20)
+        )
+
+        self.assertEqual(commands, [])
+        self.assertIsNone(estimator.snapshot()["desired_address"])
+        self.assertIsNone(estimator.snapshot()["last_location"])
 
     def test_d0_d1_transitions_set_confirmed_shadow_without_feedback_commands(self) -> None:
         estimator = SimpleUnitspaceEstimator()
@@ -168,8 +197,8 @@ class UnitspaceTests(unittest.TestCase):
         second = estimator.handle_report(b)
         duplicate = estimator.handle_report(a)
 
-        self.assertEqual([item.command for item in first], ["enter"])
-        self.assertEqual([item.command for item in second], ["enter", "exit"])
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])
         self.assertEqual(duplicate, [])
 
     def test_legacy_detected_one_flood_never_creates_strong_transition(self) -> None:
@@ -183,11 +212,11 @@ class UnitspaceTests(unittest.TestCase):
         self.assertTrue(all(command == [] for command in commands))
         self.assertIsNone(estimator.snapshot()["last_address"])
 
-    def test_inout_report_action_only_treats_enter_10_as_preliminary(self) -> None:
+    def test_legacy_inout_reports_have_no_demo_action(self) -> None:
         enter = inout_report("AA:BB:CC:DD:EE:01").packet
         ack = inout_report("AA:BB:CC:DD:EE:01", event="EVENT", event_id="C0").packet
 
-        self.assertEqual(inout_report_action(enter), "enter")
+        self.assertIsNone(inout_report_action(enter))
         self.assertIsNone(inout_report_action(ack))
 
     def test_reorder_uses_normalized_event_time(self) -> None:

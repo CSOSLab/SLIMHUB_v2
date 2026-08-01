@@ -273,12 +273,14 @@ class DisplayWriterTests(unittest.TestCase):
                         message="",
                         fields={
                             "src": "INOUT",
+                            "kind": "sequence",
                             "event": "SEQUENCE",
                             "result": "ENTER_CONFIRMED",
                             "event_id": "D0",
-                            "schema": "2",
-                            "bid": "12ab34cd",
-                            "ts": "840000",
+                            "boot_id": "12ab34cd",
+                            "cid": "17",
+                            "event_seq": "17",
+                            "event_ts_ms": "840000",
                         },
                     ),
                 )

@@ -39,8 +39,9 @@ slimhub-v2 node status --address AA:BB:CC:DD:EE:FF
 ```
 
 Every connection queues `time_sync`, `node_status`, then `config_get` after
-notification subscription. Production status must report
-`authority=slimhub_confirmed`. `local_standalone` is test-only.
+notification subscription. The demo uses SLIMHUB's single home-wide
+occupancy token and `inout_sync`; legacy `enter`, `exit`, and
+`inout_confirm` are not sent.
 
 Stop it after a deployment check with `slimhub-v2 --quit`.
 
@@ -60,13 +61,14 @@ errors plus lossless schema-2 NODE/CONFIG/INOUT/EVENT/ADL/SOUND contract
 records under `programdata/reports/`. Use `full` only for short raw transport
 diagnostics.
 
-During the schema 2 migration, JSON `EVENT` and `INFERENCE` records share the
-same framed NUS `REPORT` transport as typed CSV records. The display uses the
-JSON activity timeline, while `(frame MAC,bid,aid)` dedupe keeps the richer
-typed ADL detail canonical. Adaptive JSON truth is labeled `(adaptive)` and is
-not calibrated as legacy heap truth. A JSON/frame MAC mismatch is a security
-warning; the frame MAC remains authoritative. Invalid JSON EVENT values remain
-in minimal audit JSONL but never enter the movement timeline or estimator.
+Strict JSON `DEBUG` and `INFERENCE` records share the same framed NUS `REPORT`
+transport as typed schema-2 records. Strict JSON alone owns the legacy
+display/debugstr timeline; typed reports stay in structured diagnostics and
+correlation state. The JSON intentionally has no schema/session IDs or node
+timestamp. SLIMHUB uses the complete-frame receipt wall clock in
+`Asia/Seoul`, applies a 4-second MAC-scoped retry dedupe, and hard-rejects a
+JSON/frame MAC mismatch before occupancy, pending-command, or legacy file state
+can change. Invalid objects remain diagnostic-only.
 Compact typed ADL aliases (`cov/m/dur/rst/seq`) are normalized, and a repeated
 numeric `src` metric cannot overwrite the leading `src=ADL` routing field.
 
