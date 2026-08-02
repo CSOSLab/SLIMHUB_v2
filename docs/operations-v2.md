@@ -40,8 +40,10 @@ slimhub-v2 node status --address AA:BB:CC:DD:EE:FF
 
 Every connection queues `time_sync`, `node_status`, then `config_get` after
 notification subscription. The demo uses SLIMHUB's single home-wide
-occupancy token and candidate-correlated `inout_confirm`; legacy `enter`,
-`exit`, and `inout_sync` are not sent.
+occupancy token and candidate-correlated `inout_confirm`. During an A→B
+handoff only, Central sends `exit` to occupied A, waits for A's successful
+legacy-mode ACK plus `EXIT_SYNC/D1` and committed DEBUG EXIT, then confirms
+B. `enter` and `inout_sync` are not sent.
 
 Stop it after a deployment check with `slimhub-v2 --quit`.
 

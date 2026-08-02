@@ -76,8 +76,9 @@ With two physical Nodes, verify:
 - PIR `detected=10|20` never acts as a Node-local occupancy decision;
 - each confirmation maps candidate `boot_id/event_seq/signal` to
   `bid/cid/state`;
-- the previous Node's candidate-correlated OUT confirmation completes before
-  a queued new Node IN confirmation;
+- a new Node ENTER candidate sends `exit` to the previous occupied Node;
+- the previous Node's `legacy=1` ACK, `EXIT_SYNC/D1`, and committed strict
+  DEBUG EXIT complete before the queued new Node IN confirmation;
 - reused rid and `CONFIRM_ERROR` never trigger an automatic retry;
 - D0/D1 and EVENT/ADL reports arrive without feedback loops;
 - KITCHEN index 4 resolves to cooking while TOILET index 4 resolves to brushing;

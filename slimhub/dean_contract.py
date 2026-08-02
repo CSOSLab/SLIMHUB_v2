@@ -73,6 +73,21 @@ class PendingConfirmation:
     status: str = "CANDIDATE_RECEIVED"
 
 
+@dataclass
+class OccupantHandoff:
+    source_mac: str
+    target: InoutCandidate
+    created_at: float
+    status: str = "HANDOFF_EXIT_SENT"
+    exit_sent_at: float | None = None
+    exit_attempts: int = 0
+    exit_ack_changed: int | None = None
+    exit_ack_bid: str | None = None
+    exit_ack_cid: int | None = None
+    exit_sync_seen: bool = False
+    exit_legacy_committed: bool = False
+
+
 @dataclass(frozen=True)
 class ContractRecord:
     timestamp: float
@@ -104,6 +119,7 @@ class DeanContractStore:
         self._confirmed_occupant: str | None = None
         self._last_entered_at: float | None = None
         self._queued_in: InoutCandidate | None = None
+        self._handoff: OccupantHandoff | None = None
         self._records: list[ContractRecord] = []
         self._load()
 
@@ -150,6 +166,8 @@ class DeanContractStore:
             return self._handle_candidate(event, name)
         if name in {"CONFIRM_ACK", "CONFIRM_ERROR"}:
             return self._handle_confirm_result(event, name)
+        if name == "SEQUENCE":
+            return self._handle_sequence(event)
         return []
 
     def snapshot(self, address: str | None = None) -> object:
@@ -167,6 +185,7 @@ class DeanContractStore:
             "confirmed_occupant": self._confirmed_occupant,
             "last_entered_at": self._last_entered_at,
             "queued_in": self._queued_in.mac if self._queued_in else None,
+            "handoff": self._handoff_snapshot(),
             "pending": [
                 {
                     "mac": pending.mac,
@@ -215,6 +234,14 @@ class DeanContractStore:
                 continue
             pending.status = "ACK_TIMEOUT"
             if pending.attempts >= MAX_CONFIRM_ATTEMPTS:
+                if (
+                    self._handoff is not None
+                    and self._handoff.target.mac == pending.mac
+                    and self._handoff.target.bid == pending.bid
+                    and self._handoff.target.cid == pending.cid
+                    and self._handoff.target.state == pending.state
+                ):
+                    self._handoff.status = "RECONCILIATION_REQUIRED"
                 self._record(
                     "inout_confirm_timeout",
                     pending.mac,
@@ -243,6 +270,66 @@ class DeanContractStore:
             # retry before this write attempt reports its transport result.
             pending.sent_at = None
             commands.append(self._command(pending, pending.location))
+        handoff = self._handoff
+        if (
+            handoff is not None
+            and handoff.status == "WAIT_A_EXIT_ACK"
+            and handoff.exit_sent_at is not None
+            and timestamp - handoff.exit_sent_at >= CONFIRM_ACK_TIMEOUT_SECONDS
+        ):
+            handoff.status = "ACK_TIMEOUT"
+            if handoff.exit_attempts >= MAX_CONFIRM_ATTEMPTS:
+                handoff.status = "RECONCILIATION_REQUIRED"
+                handoff.exit_sent_at = None
+                self._record(
+                    "inout_handoff_exit_timeout",
+                    handoff.source_mac,
+                    timestamp,
+                    target=handoff.target.mac,
+                    attempts=handoff.exit_attempts,
+                    terminal=True,
+                    occupant_changed=False,
+                )
+            else:
+                self._record(
+                    "inout_handoff_exit_retry",
+                    handoff.source_mac,
+                    timestamp,
+                    target=handoff.target.mac,
+                    attempts=handoff.exit_attempts,
+                    command="exit",
+                )
+                handoff.exit_sent_at = None
+                handoff.status = "HANDOFF_EXIT_SENT"
+                commands.append(self._handoff_exit_command(handoff))
+        self._save()
+        return commands
+
+    def handle_legacy_debug_committed(
+        self,
+        address: str,
+        action: str,
+        timestamp: float,
+    ) -> list[CommandEvent]:
+        """Advance a handoff only after strict legacy DEBUG is on disk."""
+        handoff = self._handoff
+        mac = normalize_mac(address)
+        if (
+            handoff is None
+            or mac != handoff.source_mac
+            or action.strip().upper() != "EXIT"
+            or timestamp < handoff.created_at
+        ):
+            return []
+        if not handoff.exit_legacy_committed:
+            handoff.exit_legacy_committed = True
+            self._record(
+                "inout_handoff_exit_legacy_committed",
+                mac,
+                timestamp,
+                target=handoff.target.mac,
+            )
+        commands = self._advance_handoff(timestamp)
         self._save()
         return commands
 
@@ -434,6 +521,7 @@ class DeanContractStore:
         )
         node = self._node(mac)
         node.bid = bid
+        node.location = event.location or node.location
         self._record(
             "inout_candidate",
             mac,
@@ -446,31 +534,238 @@ class DeanContractStore:
             radar_state=fields.get("state"),
         )
 
+        if (
+            state == "out"
+            and self._handoff is not None
+            and self._handoff.source_mac == mac
+        ):
+            self._record(
+                "inout_handoff_local_exit_candidate",
+                mac,
+                timestamp,
+                bid=bid,
+                cid=cid,
+                state=state,
+                command_sent=False,
+                reason="authoritative_exit_command_already_pending",
+            )
+            self._save()
+            return []
+
         if state == "in":
-            self._desired_occupant = mac
-            self._last_entered_at = timestamp
             if (
                 self._confirmed_occupant is not None
                 and self._confirmed_occupant != mac
             ):
+                if self._handoff is not None:
+                    self._record(
+                        "inout_confirm_deferred",
+                        mac,
+                        timestamp,
+                        bid=bid,
+                        cid=cid,
+                        state=state,
+                        reason="handoff_already_in_progress",
+                        active_source=self._handoff.source_mac,
+                        active_target=self._handoff.target.mac,
+                        bounded=True,
+                    )
+                    self._save()
+                    return []
+                self._desired_occupant = mac
+                self._last_entered_at = timestamp
                 self._queued_in = candidate
+                self._handoff = OccupantHandoff(
+                    source_mac=self._confirmed_occupant,
+                    target=candidate,
+                    created_at=timestamp,
+                )
                 self._record(
-                    "inout_confirm_deferred",
+                    "inout_handoff_exit_pending",
                     mac,
                     timestamp,
                     bid=bid,
                     cid=cid,
                     state=state,
-                    reason="previous_occupant_requires_exit_candidate",
-                    previous=self._confirmed_occupant,
+                    source=self._confirmed_occupant,
+                    command="exit",
                 )
                 self._save()
-                return []
+                return [self._handoff_exit_command(self._handoff)]
+            self._desired_occupant = mac
+            self._last_entered_at = timestamp
             self._queued_in = None
 
         command = self._new_confirmation(candidate)
         self._save()
         return [command]
+
+    def _handle_sequence(self, event: ReportEvent) -> list[CommandEvent]:
+        handoff = self._handoff
+        fields = event.packet.fields
+        mac = normalize_mac(event.mac)
+        result = str(fields.get("result") or "").strip().upper()
+        event_id = str(fields.get("event_id") or fields.get("id") or "").strip().upper()
+        if (
+            handoff is None
+            or mac != handoff.source_mac
+            or result != "EXIT_SYNC"
+            or event_id != "D1"
+            or (event.receipt_timestamp or event.timestamp) < handoff.created_at
+        ):
+            return []
+        if not handoff.exit_sync_seen:
+            handoff.exit_sync_seen = True
+            self._record(
+                "inout_handoff_exit_sync",
+                mac,
+                event.receipt_timestamp or event.timestamp,
+                target=handoff.target.mac,
+                boot_id=fields.get("boot_id") or fields.get("bid"),
+                event_seq=fields.get("event_seq") or fields.get("cid"),
+                event_id=event_id,
+                result=result,
+            )
+        commands = self._advance_handoff(event.receipt_timestamp or event.timestamp)
+        self._save()
+        return commands
+
+    def _handle_handoff_exit_result(
+        self,
+        event: ReportEvent,
+        name: str,
+        *,
+        bid: str,
+        cid: int,
+        applied: bool,
+        changed: int | None,
+        reason: str | None,
+        source: str,
+    ) -> list[CommandEvent]:
+        handoff = self._handoff
+        if handoff is None:
+            return []
+        mac = handoff.source_mac
+        if handoff.exit_ack_changed is not None:
+            self._record(
+                "inout_handoff_exit_ack_duplicate",
+                mac,
+                event.timestamp,
+                target=handoff.target.mac,
+                bid=bid,
+                cid=cid,
+                changed=changed,
+            )
+            return []
+        node = self._node(mac)
+        if node.bid is not None and node.bid != bid:
+            self._record(
+                "inout_handoff_exit_ack_unmatched",
+                mac,
+                event.timestamp,
+                target=handoff.target.mac,
+                reason="boot_id_mismatch",
+                expected_bid=node.bid,
+                reported_bid=bid,
+                cid=cid,
+            )
+            return []
+        first_applied = (
+            name == "CONFIRM_ACK"
+            and applied
+            and changed == 1
+            and reason == "applied"
+            and source == "slimhub"
+        )
+        already_applied = (
+            name == "CONFIRM_ACK"
+            and applied
+            and changed == 0
+            and reason == "already_applied"
+            and source == "slimhub"
+        )
+        if not (first_applied or already_applied):
+            node.last_reason = reason or name.lower()
+            handoff.status = "RECONCILIATION_REQUIRED"
+            self._record(
+                "inout_handoff_exit_rejected",
+                mac,
+                event.timestamp,
+                target=handoff.target.mac,
+                bid=bid,
+                cid=cid,
+                applied=applied,
+                changed=changed,
+                reason=reason,
+                event=name,
+                terminal=True,
+                occupant_changed=False,
+            )
+            self._save()
+            return []
+
+        handoff.exit_ack_changed = changed
+        handoff.exit_ack_bid = bid
+        handoff.exit_ack_cid = cid
+        handoff.exit_sent_at = None
+        handoff.status = (
+            "WAIT_A_EXIT_LEGACY_COMMIT"
+            if first_applied
+            else "WAIT_B_ENTER_ACK"
+        )
+        node.bid = bid
+        node.occupancy = "OUT"
+        node.last_reason = None
+        if self._confirmed_occupant == mac:
+            self._confirmed_occupant = None
+        self._record(
+            "inout_handoff_exit_applied",
+            mac,
+            event.timestamp,
+            target=handoff.target.mac,
+            bid=bid,
+            cid=cid,
+            rid="00000000",
+            changed=changed,
+            reason=reason,
+            legacy=1,
+            authoritative=True,
+        )
+        commands = self._advance_handoff(event.timestamp)
+        self._save()
+        return commands
+
+    def _advance_handoff(self, timestamp: float) -> list[CommandEvent]:
+        handoff = self._handoff
+        if handoff is None or handoff.exit_ack_changed is None:
+            return []
+        if handoff.status == "RECONCILIATION_REQUIRED":
+            return []
+        if handoff.exit_ack_changed == 1 and not (
+            handoff.exit_sync_seen and handoff.exit_legacy_committed
+        ):
+            handoff.status = "WAIT_A_EXIT_LEGACY_COMMIT"
+            return []
+        pending_key = (
+            handoff.target.mac,
+            handoff.target.bid,
+            handoff.target.cid,
+            handoff.target.state,
+        )
+        if pending_key in self._pending:
+            handoff.status = "WAIT_B_ENTER_ACK"
+            return []
+        handoff.status = "WAIT_B_ENTER_ACK"
+        self._record(
+            "inout_handoff_barrier_complete",
+            handoff.source_mac,
+            timestamp,
+            target=handoff.target.mac,
+            exit_changed=handoff.exit_ack_changed,
+            exit_sync_seen=handoff.exit_sync_seen,
+            exit_legacy_committed=handoff.exit_legacy_committed,
+        )
+        return [self._new_confirmation(handoff.target)]
 
     def _handle_confirm_result(
         self,
@@ -506,6 +801,23 @@ class DeanContractStore:
                 fields=dict(fields),
             )
             return []
+        if (
+            self._handoff is not None
+            and mac == self._handoff.source_mac
+            and rid == 0
+            and state == "out"
+            and legacy == "1"
+        ):
+            return self._handle_handoff_exit_result(
+                event,
+                name,
+                bid=bid,
+                cid=cid,
+                applied=applied,
+                changed=changed,
+                reason=reason,
+                source=source,
+            )
         identity = (mac, bid, cid, rid, state)
         if identity in self._seen_results:
             self._record(
@@ -607,15 +919,35 @@ class DeanContractStore:
                 authoritative=True,
             )
             commands: list[CommandEvent] = []
-            if state == "out" and self._queued_in is not None:
-                queued = self._queued_in
+            if (
+                state == "in"
+                and self._handoff is not None
+                and self._handoff.target.mac == mac
+                and self._handoff.target.bid == bid
+                and self._handoff.target.cid == cid
+            ):
+                self._record(
+                    "inout_handoff_complete",
+                    mac,
+                    event.timestamp,
+                    source=self._handoff.source_mac,
+                    target=mac,
+                    changed=changed,
+                )
+                self._handoff = None
                 self._queued_in = None
-                commands.append(self._new_confirmation(queued))
             self._save()
             return commands
 
         node.last_reason = reason or name.lower()
         pending.status = "CONFIRM_REJECTED"
+        if (
+            self._handoff is not None
+            and self._handoff.target.mac == mac
+            and self._handoff.target.bid == bid
+            and self._handoff.target.cid == cid
+        ):
+            self._handoff.status = "RECONCILIATION_REQUIRED"
         self._record(
             "inout_confirm_diagnostic",
             mac,
@@ -642,6 +974,35 @@ class DeanContractStore:
         error: str | None,
         timestamp: float,
     ) -> None:
+        if command.command == "exit":
+            handoff = self._handoff
+            if handoff is None or normalize_mac(command.address) != handoff.source_mac:
+                return
+            if succeeded:
+                handoff.exit_sent_at = timestamp
+                handoff.exit_attempts += 1
+                handoff.status = "WAIT_A_EXIT_ACK"
+                self._record(
+                    "inout_handoff_exit_written",
+                    handoff.source_mac,
+                    timestamp,
+                    target=handoff.target.mac,
+                    attempts=handoff.exit_attempts,
+                )
+            else:
+                handoff.exit_sent_at = None
+                handoff.status = "HANDOFF_EXIT_SENT"
+                self._record(
+                    "inout_handoff_exit_write_failed",
+                    handoff.source_mac,
+                    timestamp,
+                    target=handoff.target.mac,
+                    error=error,
+                    retry=True,
+                    occupant_changed=False,
+                )
+            self._save()
+            return
         if not command.command.startswith("inout_confirm,"):
             return
         rid = _hex_int(command.cmd_id)
@@ -737,6 +1098,33 @@ class DeanContractStore:
             canonical_node_id=pending.mac,
             created_at=pending.created_at,
         )
+
+    def _handoff_exit_command(self, handoff: OccupantHandoff) -> CommandEvent:
+        node = self._node(handoff.source_mac)
+        return CommandEvent(
+            address=handoff.source_mac,
+            command="exit",
+            location=node.location or "undefined",
+            cmd_id="handoff-exit",
+            canonical_node_id=handoff.source_mac,
+            created_at=handoff.created_at,
+        )
+
+    def _handoff_snapshot(self) -> dict[str, object] | None:
+        handoff = self._handoff
+        if handoff is None:
+            return None
+        return {
+            "source_mac": handoff.source_mac,
+            "target_mac": handoff.target.mac,
+            "target_bid": handoff.target.bid,
+            "target_cid": handoff.target.cid,
+            "status": handoff.status,
+            "exit_attempts": handoff.exit_attempts,
+            "exit_ack_changed": handoff.exit_ack_changed,
+            "exit_sync_seen": handoff.exit_sync_seen,
+            "exit_legacy_committed": handoff.exit_legacy_committed,
+        }
 
     def _node(self, address: str) -> NodeState:
         mac = normalize_mac(address)

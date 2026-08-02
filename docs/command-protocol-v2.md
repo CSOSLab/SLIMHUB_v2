@@ -69,9 +69,17 @@ the ACK was lost. A transport write retry also preserves that identity.
 `CONFIRM_ERROR` is terminal.
 Reusing a successful rid for a different bid/cid/state returns terminal
 `request_id_conflict`.
-Legacy `enter`, `exit`, and `inout_sync` are rejected. Because a confirmation
-requires a live Node candidate, Central records the one-hour timeout but does
-not invent an OUT command without a matching bid/cid.
+`enter` and `inout_sync` are rejected. `exit` is reserved for authoritative
+multi-node handoff: when A owns the home token and B supplies a typed ENTER
+candidate, Central sends `exit` to A without inventing a candidate-correlated
+OUT transaction. A responds with `rid=00000000,state=out,legacy=1`.
+
+For `changed=1,reason=applied`, Central waits for both A's typed
+`EXIT_SYNC/D1` boundary and the durable strict DEBUG EXIT display/debugstr
+write before sending B's correlated `inout_confirm`. For
+`changed=0,reason=already_applied`, A is already OUT and Central proceeds
+without waiting for legacy replay. A failure or timeout never promotes B
+first.
 
 ## Node configuration
 

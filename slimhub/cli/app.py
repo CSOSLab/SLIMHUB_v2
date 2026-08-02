@@ -814,7 +814,7 @@ Modern equivalents include:
   slimhub-v2 devices
   slimhub-v2 config set --address ADDRESS {type,name,location} VALUE
   slimhub-v2 config apply
-  slimhub-v2 command send --address ADDRESS --command {enter,exit}
+  slimhub-v2 command send --address ADDRESS --command exit
   slimhub-v2 sound start --address ADDRESS --label LABEL
 
 Run 'slimhub-v2 <command> --help' to see modern command options."""

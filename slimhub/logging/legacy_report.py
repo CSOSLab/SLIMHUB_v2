@@ -214,6 +214,7 @@ class LegacyReportWriter:
         timestamp: float,
         location: str,
         device_type: str = DEFAULT_DEVICE_TYPE,
+        wait_for_commit: bool = False,
     ) -> str:
         normalized_location = normalize_node_location(location)
         if normalized_location not in NODE_LOCATIONS:
@@ -265,6 +266,25 @@ class LegacyReportWriter:
                 )
             )
 
+        write_errors_before = self.health["write_errors"]
+        if wait_for_commit and self._task is not None:
+            # Preserve FIFO order with previously queued reports, then perform
+            # this small DEBUG write inline so returning "written" is the
+            # handoff's durable file-commit barrier.
+            while self._queue._unfinished_tasks:  # noqa: SLF001
+                await asyncio.sleep(0.001)
+            for item in items:
+                try:
+                    self._write_item(item)
+                except OSError:
+                    self.health["write_errors"] += 1
+                    logging.exception(
+                        "Legacy report write failed mac=%s location=%s",
+                        item.report.mac,
+                        item.location,
+                    )
+                    return "write_error"
+            return "written"
         for item in items:
             if self._task is None:
                 try:
@@ -288,6 +308,8 @@ class LegacyReportWriter:
                     item.location,
                 )
                 return "queue_full"
+        if self.health["write_errors"] > write_errors_before:
+            return "write_error"
         return "written" if self._task is None else "queued"
 
     def snapshot(self) -> dict[str, int]:

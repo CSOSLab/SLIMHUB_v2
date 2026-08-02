@@ -394,6 +394,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn(b"inout_confirm", frame)
 
     def test_inout_confirm_is_strict_and_old_sync_is_rejected(self) -> None:
+        self.assertEqual(self.command_payload("exit"), b"exit")
         self.assertEqual(
             self.command_payload(
                 "inout_confirm,bid=A1B2,cid=41,state=out,rid=0x2"
@@ -402,7 +403,6 @@ class ProtocolTests(unittest.TestCase):
         )
         for command in (
             "enter",
-            "exit",
             "inout_sync,bid=a1,state=in,rid=1",
             "inout_confirm,bid=0,cid=1,state=in,rid=1",
             "inout_confirm,bid=a1,cid=0,state=in,rid=1",

@@ -42,6 +42,12 @@ class TwoNodeReplayTests(unittest.TestCase):
                         b"",
                     )
                 )
+            elif item["kind"] == "legacy_commit":
+                result = store.handle_legacy_debug_committed(
+                    item["mac"],
+                    item["event"],
+                    item["receipt_ts"],
+                )
             else:
                 fields = {
                     key: str(value)
@@ -71,11 +77,11 @@ class TwoNodeReplayTests(unittest.TestCase):
                     "AA:BB:CC:DD:EE:01",
                 ),
                 (
-                    "inout_confirm,bid=aaaa0001,cid=2,state=out,rid=22",
+                    "exit",
                     "AA:BB:CC:DD:EE:01",
                 ),
                 (
-                    "inout_confirm,bid=bbbb0002,cid=7,state=in,rid=33",
+                    "inout_confirm,bid=bbbb0002,cid=7,state=in,rid=22",
                     "AA:BB:CC:DD:EE:02",
                 ),
             ],

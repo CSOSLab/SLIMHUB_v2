@@ -26,8 +26,12 @@ Recent integration commits:
 - ACK timeout after a successful write retries the exact same identity and
   rid. Transport write retry also preserves it; `CONFIRM_ERROR` and
   `request_id_conflict` are terminal.
-- A one-hour timeout is recorded, but Central cannot invent an OUT
-  confirmation without a live Node candidate bid/cid.
+- When A owns the token and B provides a typed ENTER candidate, Central sends
+  `exit` to A. A's `legacy=1` ACK, `EXIT_SYNC/D1`, and committed strict DEBUG
+  EXIT gate B's correlated `inout_confirm`; `changed=0` skips the legacy
+  replay barrier.
+- A handoff failure preserves the old authoritative state or enters explicit
+  reconciliation; B is never promoted before A's successful EXIT.
 - D0/D1 sequence reports are never fed back into token assignment.
 - Node uptime is normalized per `(MAC, boot_id)` and INOUT/EVENT/ADL reports use a 1.5-second reorder buffer.
 
@@ -80,7 +84,8 @@ Replay fixtures:
 1. Test with at least two physical DEAN Node v2 devices and retain their JSONL deployment logs.
 2. Create `programdata/deployment_manifest.json` from the template for every deployed MAC, using the fixed location profile and the intended private 10-class model hash.
 3. Verify firmware emits `EVENT/BASELINE` after subscription/reconnect and `EVENT/SOUND` with `schema=1,class_count=10`.
-4. Verify the deployed demo firmware rejects `enter`/`exit`/`inout_sync` and
-   accepts only candidate-correlated `inout_confirm` for occupancy changes.
+4. Verify the deployed demo firmware rejects `enter`/`inout_sync`, accepts
+   handoff `exit` with a `rid=00000000,legacy=1` ACK, and accepts correlated
+   `inout_confirm` for the new occupant.
 
 No firmware source tree is present in this repository, so firmware-side changes and real BLE deployment capture were not performed here.

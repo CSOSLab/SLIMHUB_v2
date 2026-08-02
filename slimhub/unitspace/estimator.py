@@ -155,7 +155,7 @@ class SimpleUnitspaceEstimator:
             if result == "ENTER_CONFIRMED" and event_id == "D0":
                 self._confirmed_occupants.add(address)
                 self._record("transition", address, timestamp, result=result, event_id=event_id)
-            elif result == "EXIT_CONFIRMED" and event_id == "D1":
+            elif result in {"EXIT_CONFIRMED", "EXIT_SYNC"} and event_id == "D1":
                 self._confirmed_occupants.discard(address)
                 self._record("transition", address, timestamp, result=result, event_id=event_id)
             else:

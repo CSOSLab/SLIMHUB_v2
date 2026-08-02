@@ -280,8 +280,15 @@ state=in,source=slimhub,applied=1,changed=1,reason=applied,legacy=0
 `CONFIRM_ACK,applied=1,changed=0,reason=already_applied`를 모두 authoritative
 success로 처리합니다. GATT write 성공 뒤 ACK timeout이면 같은
 `bid/cid/rid/state`를 유지해 재전송하고 새 rid를 만들지 않습니다.
-`CONFIRM_ERROR`와 `request_id_conflict`는 terminal이며 `inout_sync`와 legacy
-`enter/exit`는 보내지 않습니다.
+`CONFIRM_ERROR`와 `request_id_conflict`는 terminal입니다.
+
+home-wide occupant가 A인 상태에서 B의 typed ENTER candidate가 들어오면 B
+candidate를 보존하고 A에 기존 `exit` COMMAND를 한 번 보냅니다. A의
+`CONFIRM_ACK,legacy=1,changed=1` 이후 `EXIT_SYNC/D1`과 strict DEBUG EXIT가
+실제 display/debugstr에 기록된 뒤에만 B의 correlated `inout_confirm`을
+전송합니다. A가 이미 OUT이라 `changed=0,reason=already_applied`를 반환하면
+legacy replay를 기다리지 않고 B confirmation으로 진행합니다. 일반 `enter`와
+`inout_sync`는 보내지 않습니다.
 
 notification subscription 직후 연결 session마다 `time_sync`, `node_status`,
 `config_get`을 순서대로 전송합니다. 상태/config cache는 MAC별로

@@ -400,7 +400,7 @@ class DeanContractTests(unittest.TestCase):
             [record.kind for record in store.drain_records()],
         )
 
-    def test_exit_ack_releases_queued_enter_in_home_token_order(self) -> None:
+    def test_exit_ack_and_legacy_barrier_release_queued_enter(self) -> None:
         store = self.make_store()
         store.handle_report(
             candidate(MAC_A, 1.0, bid="aaaaaaaa", cid=1, state="in")
@@ -415,23 +415,89 @@ class DeanContractTests(unittest.TestCase):
             state="in",
         )
 
+        exit_commands = store.handle_report(
+            candidate(
+                MAC_B,
+                2.0,
+                bid="bbbbbbbb",
+                cid=7,
+                state="in",
+                location="LIVING",
+            )
+        )
+        self.assertEqual(
+            [(command.command, command.address) for command in exit_commands],
+            [("exit", MAC_A)],
+        )
+        store.handle_command_write_result(exit_commands[0], True, None, 2.1)
+        self.assertEqual(
+            confirmation(
+                store,
+                MAC_A,
+                2.2,
+                bid="aaaaaaaa",
+                cid=2,
+                rid=0,
+                state="out",
+                legacy=1,
+            ),
+            [],
+        )
+        self.assertIsNone(store.home_snapshot()["confirmed_occupant"])
         self.assertEqual(
             store.handle_report(
-                candidate(
-                    MAC_B,
-                    2.0,
-                    bid="bbbbbbbb",
-                    cid=7,
-                    state="in",
-                    location="LIVING",
+                report(
+                    MAC_A,
+                    2.3,
+                    src="INOUT",
+                    event="SEQUENCE",
+                    result="EXIT_SYNC",
+                    event_id="D1",
+                    boot_id="aaaaaaaa",
+                    event_seq=2,
+                    event_ts_ms=2300,
                 )
             ),
             [],
         )
+        enter_commands = store.handle_legacy_debug_committed(
+            MAC_A,
+            "EXIT",
+            2.4,
+        )
+        self.assertEqual(
+            [command.command for command in enter_commands],
+            [
+                "inout_confirm,bid=bbbbbbbb,cid=7,"
+                "state=in,rid=22"
+            ],
+        )
+
+    def test_handoff_already_out_ack_skips_legacy_barrier(self) -> None:
+        store = self.make_store()
+        store.handle_report(
+            candidate(MAC_A, 1.0, bid="aaaaaaaa", cid=1, state="in")
+        )
+        confirmation(
+            store,
+            MAC_A,
+            1.1,
+            bid="aaaaaaaa",
+            cid=1,
+            rid=0x11,
+            state="in",
+        )
         exit_command = store.handle_report(
-            candidate(MAC_A, 2.1, bid="aaaaaaaa", cid=2, state="out")
+            candidate(
+                MAC_B,
+                2.0,
+                bid="bbbbbbbb",
+                cid=7,
+                state="in",
+                location="LIVING",
+            )
         )[0]
-        self.assertIn("cid=2,state=out,rid=22", exit_command.command)
+        store.handle_command_write_result(exit_command, True, None, 2.1)
 
         enter_commands = confirmation(
             store,
@@ -439,16 +505,60 @@ class DeanContractTests(unittest.TestCase):
             2.2,
             bid="aaaaaaaa",
             cid=2,
-            rid=0x22,
+            rid=0,
             state="out",
+            changed=0,
+            reason="already_applied",
+            legacy=1,
         )
+
+        self.assertEqual(len(enter_commands), 1)
+        self.assertIn("state=in,rid=22", enter_commands[0].command)
+        handoff = store.home_snapshot()["handoff"]
+        self.assertEqual(handoff["status"], "WAIT_B_ENTER_ACK")
+        self.assertFalse(handoff["exit_sync_seen"])
+        self.assertFalse(handoff["exit_legacy_committed"])
+
+    def test_handoff_exit_ack_timeout_preserves_a_and_pending_b(self) -> None:
+        store = self.make_store()
+        store.handle_report(
+            candidate(MAC_A, 1.0, bid="aaaaaaaa", cid=1, state="in")
+        )
+        confirmation(
+            store,
+            MAC_A,
+            1.1,
+            bid="aaaaaaaa",
+            cid=1,
+            rid=0x11,
+            state="in",
+        )
+        command = store.handle_report(
+            candidate(MAC_B, 2.0, bid="bbbbbbbb", cid=7, state="in")
+        )[0]
+        for attempt in range(3):
+            sent_at = 3.0 + attempt * 3.0
+            store.handle_command_write_result(command, True, None, sent_at)
+            retries = store.expire_confirmations(
+                sent_at + CONFIRM_ACK_TIMEOUT_SECONDS
+            )
+            if attempt < 2:
+                self.assertEqual(
+                    [(item.command, item.address) for item in retries],
+                    [("exit", MAC_A)],
+                )
+                command = retries[0]
+            else:
+                self.assertEqual(retries, [])
+
+        home = store.home_snapshot()
+        self.assertEqual(home["confirmed_occupant"], MAC_A)
+        self.assertEqual(home["queued_in"], MAC_B)
         self.assertEqual(
-            [command.command for command in enter_commands],
-            [
-                "inout_confirm,bid=bbbbbbbb,cid=7,"
-                "state=in,rid=33"
-            ],
+            home["handoff"]["status"],
+            "RECONCILIATION_REQUIRED",
         )
+        self.assertEqual(home["pending"], [])
 
     def test_failed_gatt_write_preserves_pending_identity_for_retry(self) -> None:
         store = self.make_store()

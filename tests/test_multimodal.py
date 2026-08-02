@@ -280,7 +280,7 @@ class MultimodalStoreTests(unittest.TestCase):
             )
         )
         store.handle_inout(
-            report(MAC_A, "INOUT", "SEQUENCE", result="EXIT_CONFIRMED", event_id="D1", event_seq=88, event_ts_ms=1300)
+            report(MAC_A, "INOUT", "SEQUENCE", result="EXIT_SYNC", event_id="D1", event_seq=88, event_ts_ms=1300)
         )
 
         session = store.snapshot()["sessions"][f"{MAC_A}/boot-a/7"]

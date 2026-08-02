@@ -8,6 +8,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from slimhub.config import AppPaths
 from slimhub.events import CommandEvent
@@ -398,6 +399,229 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
                 daemon.dean_contract.snapshot(address)["occupancy"],
                 "IN",
             )
+
+    async def test_authoritative_handoff_commits_a_exit_before_b_enter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mac_a = "AA:BB:CC:DD:EE:01"
+            mac_b = "AA:BB:CC:DD:EE:02"
+            paths = AppPaths.from_base(tmpdir)
+            daemon = SlimHubDaemon(paths=paths)
+            daemon.config_store.set_field(mac_a, "location", "TOILET")
+            daemon.config_store.set_field(mac_b, "location", "LIVING")
+            command_capture: list[tuple[str, str]] = []
+            session_a = FakeSession(mac_a, command_capture)
+            session_b = FakeSession(mac_b, command_capture)
+            await daemon.registry.add(session_a)
+            await daemon.registry.add(session_b)
+
+            async def send_fields(address: str, **fields: object) -> None:
+                values = {key: str(value) for key, value in fields.items()}
+                message = ",".join(
+                    f"{key}={value}" for key, value in values.items()
+                )
+                await daemon.handle_frame(
+                    address,
+                    report_frame(address, message, values),
+                )
+
+            await send_fields(
+                mac_a,
+                src="INOUT",
+                event="ENTER",
+                signal="enter",
+                code=10,
+                state=0,
+                boot_id="aaaaaaaa",
+                event_seq=1,
+                event_ts_ms=100,
+            )
+            rid_a = session_a.commands[-1].command.rsplit("=", 1)[1]
+            await send_fields(
+                mac_a,
+                src="INOUT",
+                event="CONFIRM_ACK",
+                schema=2,
+                bid="aaaaaaaa",
+                cid=1,
+                rid=rid_a,
+                state="in",
+                source="slimhub",
+                applied=1,
+                changed=1,
+                reason="applied",
+                legacy=0,
+                ts=101,
+            )
+            with patch("slimhub.daemon.time.time", return_value=1_800_000_000.0):
+                await daemon.handle_frame(
+                    mac_a,
+                    json_report_frame(
+                        mac_a,
+                        {
+                            "device": mac_a,
+                            "type": "DEBUG",
+                            "event": "ENTER",
+                            "value": 10,
+                        },
+                    ),
+                )
+
+            await send_fields(
+                mac_b,
+                src="INOUT",
+                event="ENTER",
+                signal="enter",
+                code=10,
+                state=0,
+                boot_id="bbbbbbbb",
+                event_seq=7,
+                event_ts_ms=200,
+            )
+            self.assertEqual(command_capture[-1], ("exit", mac_a))
+            self.assertEqual(len(session_b.commands), 0)
+            await daemon.handle_command_result(
+                session_a.commands[-1],
+                True,
+                None,
+                1_800_000_001.0,
+            )
+            await send_fields(
+                mac_a,
+                src="INOUT",
+                event="CONFIRM_ACK",
+                schema=2,
+                bid="aaaaaaaa",
+                cid=2,
+                rid="00000000",
+                state="out",
+                source="slimhub",
+                applied=1,
+                changed=1,
+                reason="applied",
+                legacy=1,
+                ts=201,
+            )
+            self.assertEqual(len(session_b.commands), 0)
+            await send_fields(
+                mac_a,
+                src="INOUT",
+                event="SEQUENCE",
+                schema=2,
+                result="EXIT_SYNC",
+                event_id="D1",
+                boot_id="aaaaaaaa",
+                event_seq=2,
+                event_ts_ms=202,
+            )
+            await daemon.flush_report_reorder_buffer()
+            self.assertEqual(len(session_b.commands), 0)
+            with patch("slimhub.daemon.time.time", return_value=1_800_000_002.0):
+                await daemon.handle_frame(
+                    mac_a,
+                    json_report_frame(
+                        mac_a,
+                        {
+                            "device": mac_a,
+                            "type": "DEBUG",
+                            "event": "EXIT",
+                            "value": 20,
+                        },
+                    ),
+                )
+
+            self.assertEqual(len(session_b.commands), 1)
+            self.assertTrue(
+                session_b.commands[0].command.startswith(
+                    "inout_confirm,bid=bbbbbbbb,cid=7,state=in,rid="
+                )
+            )
+            rid_b = session_b.commands[0].command.rsplit("=", 1)[1]
+            await send_fields(
+                mac_b,
+                src="INOUT",
+                event="CONFIRM_ACK",
+                schema=2,
+                bid="bbbbbbbb",
+                cid=7,
+                rid=rid_b,
+                state="in",
+                source="slimhub",
+                applied=1,
+                changed=1,
+                reason="applied",
+                legacy=0,
+                ts=203,
+            )
+            await send_fields(
+                mac_b,
+                src="INOUT",
+                event="SEQUENCE",
+                schema=2,
+                result="ENTER_CONFIRMED",
+                event_id="D0",
+                boot_id="bbbbbbbb",
+                event_seq=7,
+                event_ts_ms=204,
+            )
+            await daemon.flush_report_reorder_buffer()
+            with patch("slimhub.daemon.time.time", return_value=1_800_000_003.0):
+                await daemon.handle_frame(
+                    mac_b,
+                    json_report_frame(
+                        mac_b,
+                        {
+                            "device": mac_b,
+                            "type": "DEBUG",
+                            "event": "ENTER",
+                            "value": 10,
+                        },
+                    ),
+                )
+
+            self.assertEqual(
+                command_capture,
+                [
+                    (session_a.commands[0].command, mac_a),
+                    ("exit", mac_a),
+                    (session_b.commands[0].command, mac_b),
+                ],
+            )
+            self.assertEqual(
+                daemon.dean_contract.home_snapshot()["confirmed_occupant"],
+                mac_b,
+            )
+            display = paths.display_path.read_text(encoding="utf-8")
+            markers = [
+                "TOILET [EVENT] - ENTER value: 10",
+                "TOILET [EVENT] - EXIT value: 20",
+                "LIVING [EVENT] - ENTER value: 10",
+            ]
+            positions = [display.index(marker) for marker in markers]
+            self.assertEqual(positions, sorted(positions))
+            for marker in markers:
+                self.assertEqual(display.count(marker), 1)
+            debug_by_mac: dict[str, list[str]] = {}
+            for path in paths.data_dir.glob("*/*/*/inference/debugstr/*.txt"):
+                debug_by_mac[path.parents[2].name] = [
+                    json.loads(line)["event"]
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                ]
+            self.assertEqual(debug_by_mac[mac_a], ["ENTER", "EXIT"])
+            self.assertEqual(debug_by_mac[mac_b], ["ENTER"])
+            audit = "".join(
+                path.read_text(encoding="utf-8")
+                for path in (paths.programdata_dir / "reports").glob("*.jsonl")
+            )
+            for marker in (
+                "inout_handoff_exit_applied",
+                "inout_handoff_exit_sync",
+                "inout_handoff_exit_legacy_committed",
+                "inout_handoff_barrier_complete",
+                "inout_handoff_complete",
+                "EXIT_SYNC",
+                "ENTER_CONFIRMED",
+            ):
+                self.assertIn(marker, audit)
 
     async def test_node_config_dispatch_waits_for_applied_report(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

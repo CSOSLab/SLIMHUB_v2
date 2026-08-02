@@ -698,7 +698,18 @@ class SlimHubDaemon:
             timestamp=timestamp,
             location=config.location,
             device_type=config.type,
+            wait_for_commit=validated.kind == "DEBUG",
         )
+        if outcome in {"written", "deduplicated"} and validated.kind == "DEBUG":
+            commands = self.dean_contract.handle_legacy_debug_committed(
+                validated.mac,
+                str(validated.document.get("event") or ""),
+                timestamp,
+            )
+            if commands:
+                sent_commands = await self._send_unitspace_commands(commands)
+                self._log_commands(sent_commands)
+            await self._log_contract_records()
         if outcome in {"unknown_location", "queue_full", "write_error"}:
             self.logger.warning(
                 "Legacy REPORT not stored mac=%s location=%s reason=%s",

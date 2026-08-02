@@ -54,6 +54,26 @@ INFERENCE_DOCUMENT = {
 
 
 class LegacyReportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_wait_for_commit_returns_after_background_file_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = AppPaths.from_base(tmpdir)
+            writer = LegacyReportWriter(paths)
+            await writer.start()
+            try:
+                outcome = await writer.log(
+                    validate_legacy_report(MAC, DEBUG_DOCUMENT),
+                    timestamp=FIXED_TIMES[0],
+                    location="TOILET",
+                    wait_for_commit=True,
+                )
+                self.assertEqual(outcome, "written")
+                self.assertIn(
+                    "[EVENT] - ENTER value: 10",
+                    paths.display_path.read_text(encoding="utf-8"),
+                )
+            finally:
+                await writer.stop()
+
     async def test_golden_fixture_round_trip_is_byte_exact(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = AppPaths.from_base(tmpdir)

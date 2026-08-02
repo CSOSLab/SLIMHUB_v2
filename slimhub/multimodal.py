@@ -173,7 +173,7 @@ class MultimodalReportStore:
                 inout_event_seq=_integer(fields.get("event_seq")),
                 event_ts_ms=event_ts,
             )
-        elif result == "EXIT_CONFIRMED" and event_id == "D1":
+        elif result in {"EXIT_CONFIRMED", "EXIT_SYNC"} and event_id == "D1":
             key = self._open_session.pop((mac, boot_id), None)
             boundary = self._boundary(event, "D1")
             if key is not None:

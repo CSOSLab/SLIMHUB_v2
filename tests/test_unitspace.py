@@ -161,7 +161,7 @@ class UnitspaceTests(unittest.TestCase):
             inout_report(
                 "AA:BB:CC:DD:EE:01",
                 event="SEQUENCE",
-                result="EXIT_CONFIRMED",
+                result="EXIT_SYNC",
                 event_id="D1",
                 boot_id="boot-a",
             )
