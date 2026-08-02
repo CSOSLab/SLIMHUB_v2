@@ -40,8 +40,8 @@ slimhub-v2 node status --address AA:BB:CC:DD:EE:FF
 
 Every connection queues `time_sync`, `node_status`, then `config_get` after
 notification subscription. The demo uses SLIMHUB's single home-wide
-occupancy token and `inout_sync`; legacy `enter`, `exit`, and
-`inout_confirm` are not sent.
+occupancy token and candidate-correlated `inout_confirm`; legacy `enter`,
+`exit`, and `inout_sync` are not sent.
 
 Stop it after a deployment check with `slimhub-v2 --quit`.
 

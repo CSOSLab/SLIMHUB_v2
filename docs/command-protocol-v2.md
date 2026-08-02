@@ -18,6 +18,12 @@ contain a partial frame or multiple frames. Invalid type/length/CRLF, embedded
 NUL REPORT text, and malformed UTF-8 are rejected without clearing another
 Node's state.
 
+Node notifications may be fragmented, but the Node RX command parser does not
+accumulate separate GATT writes. Central therefore checks the negotiated
+write-without-response capacity and sends each complete `inout_confirm` frame
+as one GATT value. The 55-byte example payload produces a 73-byte frame and
+requires an ATT MTU of at least 76 bytes.
+
 ## Connection initialization
 
 After notification subscription succeeds, Central queues exactly this order
@@ -31,34 +37,35 @@ config_get
 
 Reconnect creates a new session and repeats this sequence. NODE/STATUS is
 cached by source MAC in `programdata/dean_node_state.json`. A new `bid`
-expires pending synchronization transactions for the previous boot.
+expires pending confirmation transactions for the previous boot.
 
 ## Occupancy authority
 
-PIR RAWDATA is a binary observation (`detected=0|1`) and never changes Node
-occupancy by itself. A presence observation at a new unit space makes Central
-move its single home-wide token. It synchronizes the previous Node OUT first,
-waits for its authoritative ACK, and then synchronizes the new Node IN:
+PIR RAWDATA (`detected=10|20`) is candidate evidence and never changes Node
+occupancy by itself. The typed ENTER/EXIT sidecar supplies the candidate
+identity used by Central:
 
 ```text
-inout_sync,bid=<hex>,state=out,rid=<new-nonzero-hex>
-inout_sync,bid=<hex>,state=in,rid=<new-nonzero-hex>
+REPORT boot_id -> COMMAND bid
+REPORT event_seq -> COMMAND cid
+REPORT signal=enter|exit -> COMMAND state=in|out
+inout_confirm,bid=<hex>,cid=<decimal>,state=in|out,rid=<nonzero-hex>
 ```
 
 Results use:
 
 ```text
-src=INOUT,event=SYNC_ACK|SYNC_ERROR,schema=2,bid=<hex>,
-rid=<hex>,state=in|out,source=slimhub,applied=0|1,changed=0|1,reason=...
+src=INOUT,event=CONFIRM_ACK|CONFIRM_ERROR,schema=2,bid=<hex>,cid=<decimal>,
+rid=<hex>,state=in|out,source=slimhub,applied=0|1,reason=...,legacy=0
 ```
 
-Transactions and result dedupe use `(source MAC,bid,rid,target state)`.
-Only exact `SYNC_ACK,source=slimhub,applied=1` is authoritative.
-`changed=0,reason=already_applied` is an idempotent success and does not create
-another legacy event. `stale_boot` triggers `node_status`, followed by at most
-one retry with a fresh request ID. Legacy `enter`, `exit`, and
-`inout_confirm` are rejected. Central expires an occupied token after one
-hour and synchronizes that Node OUT.
+Transactions and result dedupe use `(source MAC,bid,cid,rid,target state)`.
+Only exact `CONFIRM_ACK,source=slimhub,applied=1,reason=applied,legacy=0` is
+authoritative. The Node treats reuse of a rid as `duplicate_request`, so a
+failed write or `CONFIRM_ERROR` is terminal and is not automatically retried.
+Legacy `enter`, `exit`, and `inout_sync` are rejected. Because a confirmation
+requires a live Node candidate, Central records the one-hour timeout but does
+not invent an OUT command without a matching bid/cid.
 
 ## Node configuration
 

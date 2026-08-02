@@ -72,11 +72,13 @@ second legacy line.
 With two physical Nodes, verify:
 
 - command frame target MAC equals each Node's actual source MAC;
-- identical bid/rid values on two Nodes do not collide;
-- PIR `detected=0|1` never acts as a Node-local occupancy decision;
-- the previous Node ACKs `inout_sync state=out` before the new Node receives
-  `state=in`;
-- `SYNC_ACK changed=0` does not create a duplicate transition;
+- identical bid/cid/rid values on two Nodes do not collide;
+- PIR `detected=10|20` never acts as a Node-local occupancy decision;
+- each confirmation maps candidate `boot_id/event_seq/signal` to
+  `bid/cid/state`;
+- the previous Node's candidate-correlated OUT confirmation completes before
+  a queued new Node IN confirmation;
+- reused rid and `CONFIRM_ERROR` never trigger an automatic retry;
 - D0/D1 and EVENT/ADL reports arrive without feedback loops;
 - KITCHEN index 4 resolves to cooking while TOILET index 4 resolves to brushing;
 - automatic capture arms, segments, completes, and stops;

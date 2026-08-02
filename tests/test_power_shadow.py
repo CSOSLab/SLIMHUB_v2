@@ -138,12 +138,12 @@ class ShadowPowerStateTests(unittest.TestCase):
 
         enter = shadow.update_command_hint(
             ADDRESS,
-            "inout_sync,bid=a1,state=in,rid=1",
+            "inout_confirm,bid=a1,cid=1,state=in,rid=1",
             1.0,
         )
         exit_ = shadow.update_command_hint(
             ADDRESS,
-            "inout_sync,bid=a1,state=out,rid=2",
+            "inout_confirm,bid=a1,cid=2,state=out,rid=2",
             2.0,
         )
 
@@ -151,7 +151,7 @@ class ShadowPowerStateTests(unittest.TestCase):
         self.assertEqual(exit_.state, ABSENT_SLEEP)
         self.assertEqual(
             exit_.last_command_hint,
-            "inout_sync,bid=a1,state=out,rid=2",
+            "inout_confirm,bid=a1,cid=2,state=out,rid=2",
         )
 
     def test_disconnect_marks_disconnected_without_command_write(self) -> None:

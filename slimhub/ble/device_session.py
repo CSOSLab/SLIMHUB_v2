@@ -71,6 +71,8 @@ class DeviceSession:
         self._frame_handler_lock = asyncio.Lock()
         self._inflight_frame_tasks: set[asyncio.Task[None]] = set()
         self._peak_inflight_frames = 0
+        self._negotiated_mtu: int | None = None
+        self._max_write_without_response_size: int | None = None
         self._client: BleakClient | None = None
         self._task: asyncio.Task[None] | None = None
 
@@ -122,6 +124,8 @@ class DeviceSession:
             "queued_commands": len(self._pending_commands),
             "inflight_frames": len(self._inflight_frame_tasks),
             "peak_inflight_frames": self._peak_inflight_frames,
+            "negotiated_mtu": self._negotiated_mtu,
+            "max_write_without_response_size": self._max_write_without_response_size,
         }
 
     async def _run(self) -> None:
@@ -157,6 +161,7 @@ class DeviceSession:
                         ),
                         timeout=self.notify_timeout,
                     )
+                    self._remember_write_capacity(client)
 
                     self.last_error = None
                     self.last_seen = time.time()
@@ -220,6 +225,8 @@ class DeviceSession:
                     )
                 assembler.clear()
                 self.connected = False
+                self._negotiated_mtu = None
+                self._max_write_without_response_size = None
                 self._client = None
                 if reported_connected and self.on_connection_state is not None:
                     await self.on_connection_state(self.address, False, time.time())
@@ -313,6 +320,8 @@ class DeviceSession:
                 continue
             try:
                 frame = build_command_frame(command.address, command.command)
+                if command.command.startswith("inout_confirm,"):
+                    self._validate_confirmation_write(client, frame)
                 await client.write_gatt_char(NUS_RX_WRITE_UUID, frame, response=False)
                 await self._notify_command_result(command, True, None)
             except Exception as exc:
@@ -329,7 +338,10 @@ class DeviceSession:
                     # Preserve a newer desired state if one arrived while the
                     # write was in flight; otherwise retry this idempotent
                     # command after a short backoff.
-                    if key not in self._pending_commands:
+                    if (
+                        not command.command.startswith("inout_confirm,")
+                        and key not in self._pending_commands
+                    ):
                         self._pending_commands[key] = command
                         await self._command_queue.put(key)
                 if command_failure_event is not None:
@@ -340,6 +352,60 @@ class DeviceSession:
                     command_failure_event.set()
                     return
                 await asyncio.sleep(min(self.reconnect_delay, 1.0))
+
+    def _remember_write_capacity(self, client: BleakClient) -> None:
+        mtu = getattr(client, "mtu_size", None)
+        self._negotiated_mtu = (
+            int(mtu) if isinstance(mtu, int) and mtu > 0 else None
+        )
+        self._max_write_without_response_size = self._write_capacity(client)
+        self.logger.info(
+            "%s BLE MTU=%s max_write_without_response=%s",
+            self.address,
+            self._negotiated_mtu if self._negotiated_mtu is not None else "unknown",
+            (
+                self._max_write_without_response_size
+                if self._max_write_without_response_size is not None
+                else "unknown"
+            ),
+        )
+
+    def _write_capacity(self, client: BleakClient) -> int | None:
+        services = getattr(client, "services", None)
+        getter = getattr(services, "get_characteristic", None)
+        if callable(getter):
+            try:
+                characteristic = getter(NUS_RX_WRITE_UUID)
+            except (KeyError, RuntimeError):
+                characteristic = None
+            maximum = getattr(
+                characteristic,
+                "max_write_without_response_size",
+                None,
+            )
+            if isinstance(maximum, int) and maximum > 0:
+                return maximum
+        mtu = getattr(client, "mtu_size", None)
+        if isinstance(mtu, int) and mtu > 3:
+            return mtu - 3
+        return None
+
+    def _validate_confirmation_write(
+        self,
+        client: BleakClient,
+        frame: bytes,
+    ) -> None:
+        capacity = self._write_capacity(client)
+        self._max_write_without_response_size = capacity
+        if capacity is None:
+            raise RuntimeError(
+                "cannot verify negotiated ATT write capacity for inout_confirm"
+            )
+        if len(frame) > capacity:
+            raise RuntimeError(
+                "inout_confirm frame requires one GATT write of "
+                f"{len(frame)} bytes but negotiated capacity is {capacity}"
+            )
 
     async def _notify_command_result(
         self,

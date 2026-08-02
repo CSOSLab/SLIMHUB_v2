@@ -2,28 +2,31 @@
 
 ## Current repository state
 
-- Active branch: `event-sequence-integration`
+- Active branch: `integration/dean-node-v2-contract-20260728`
 - Working tree: clean at handover time
-- Latest commit: `a31f426 Add multimodal EVENT and ADL report ingestion`
+- Latest integration: candidate-correlated DEAN Node v2 `inout_confirm`
 - Baseline snapshot commit on `develop`: `3b49077 Integrate DEAN node sound recording support`
 
 Recent integration commits:
 
 1. `4cf26a5 Integrate INOUT event sequence reconciliation`
 2. `a31f426 Add multimodal EVENT and ADL report ingestion`
+3. DEAN Node v2 `inout_confirm` contract alignment
 
 ## Implemented Central behavior
 
 ### Home-wide IN/OUT token
-- PIR RAWDATA uses only `detected=0|1` and is an observation, never a
-  Node-local occupancy decision.
-- SLIMHUB owns one home-wide token. On a new-location observation it completes
-  `inout_sync state=out` for the previous Node before sending `state=in`.
-- Results correlate by `(source MAC,bid,rid,target state)` and only exact
-  `SYNC_ACK,source=slimhub,applied=1` is authoritative.
-- `changed=0,reason=already_applied` is idempotent and does not create a second
-  transition. `stale_boot` refreshes `node_status` before one fresh-rid retry.
-- Central enforces a one-hour maximum occupancy timeout.
+- PIR RAWDATA `detected=10|20` is evidence only; typed ENTER/EXIT owns the
+  candidate identity.
+- SLIMHUB maps `boot_id/event_seq/signal` to `bid/cid/state` and sends
+  `inout_confirm` in one GATT write.
+- Results correlate by `(source MAC,bid,cid,rid,target state)` and only exact
+  `CONFIRM_ACK,source=slimhub,applied=1,reason=applied,legacy=0` is
+  authoritative.
+- Reused rid is non-idempotent. Write failure and `CONFIRM_ERROR` are terminal
+  and never cause an automatic retry.
+- A one-hour timeout is recorded, but Central cannot invent an OUT
+  confirmation without a live Node candidate bid/cid.
 - D0/D1 sequence reports are never fed back into token assignment.
 - Node uptime is normalized per `(MAC, boot_id)` and INOUT/EVENT/ADL reports use a 1.5-second reorder buffer.
 
@@ -76,7 +79,7 @@ Replay fixtures:
 1. Test with at least two physical DEAN Node v2 devices and retain their JSONL deployment logs.
 2. Create `programdata/deployment_manifest.json` from the template for every deployed MAC, using the fixed location profile and the intended private 10-class model hash.
 3. Verify firmware emits `EVENT/BASELINE` after subscription/reconnect and `EVENT/SOUND` with `schema=1,class_count=10`.
-4. Verify the deployed demo firmware rejects legacy `enter`/`exit` and accepts
-   only `inout_sync` for occupancy changes.
+4. Verify the deployed demo firmware rejects `enter`/`exit`/`inout_sync` and
+   accepts only candidate-correlated `inout_confirm` for occupancy changes.
 
 No firmware source tree is present in this repository, so firmware-side changes and real BLE deployment capture were not performed here.

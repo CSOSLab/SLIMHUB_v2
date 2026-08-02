@@ -227,7 +227,7 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIn("epoch_ms=100000", session.commands[0].command)
 
-    async def test_pir_observation_uses_inout_sync_and_applied_ack(self) -> None:
+    async def test_typed_candidate_uses_inout_confirm_and_correlated_ack(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             address = "AA:BB:CC:DD:EE:01"
             daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
@@ -252,13 +252,31 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
                     },
                 ),
             )
-            await daemon.handle_frame(address, raw_frame(address, detected=1))
+            await daemon.handle_frame(address, raw_frame(address, detected=10))
+            await daemon.handle_frame(
+                address,
+                report_frame(
+                    address,
+                    "src=INOUT,event=ENTER,signal=enter,code=10,"
+                    "state=0,boot_id=a1b2c3d4,event_seq=41,event_ts_ms=100",
+                    {
+                        "src": "INOUT",
+                        "event": "ENTER",
+                        "signal": "enter",
+                        "code": "10",
+                        "state": "0",
+                        "boot_id": "a1b2c3d4",
+                        "event_seq": "41",
+                        "event_ts_ms": "100",
+                    },
+                ),
+            )
 
             self.assertEqual(len(session.commands), 1)
             command = session.commands[0].command
             self.assertTrue(
                 command.startswith(
-                    "inout_sync,bid=a1b2c3d4,state=in,rid="
+                    "inout_confirm,bid=a1b2c3d4,cid=41,state=in,rid="
                 )
             )
             rid = command.rsplit("=", 1)[1]
@@ -266,23 +284,25 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
                 address,
                 report_frame(
                     address,
-                    "src=INOUT,event=SYNC_ACK,schema=2,bid=a1b2c3d4,"
-                    f"rid={rid},state=in,source=slimhub,applied=1,changed=1,ts=101",
+                    "src=INOUT,event=CONFIRM_ACK,schema=2,bid=a1b2c3d4,"
+                    f"cid=41,rid={rid},state=in,source=slimhub,"
+                    "applied=1,reason=applied,legacy=0,ts=101",
                     {
                         "src": "INOUT",
-                        "event": "SYNC_ACK",
+                        "event": "CONFIRM_ACK",
                         "schema": "2",
                         "bid": "a1b2c3d4",
+                        "cid": "41",
                         "rid": rid,
                         "state": "in",
                         "source": "slimhub",
                         "applied": "1",
-                        "changed": "1",
+                        "reason": "applied",
+                        "legacy": "0",
                         "ts": "101",
                     },
                 ),
             )
-            await daemon.flush_report_reorder_buffer()
 
             self.assertEqual(
                 daemon.dean_contract.snapshot(address)["occupancy"],

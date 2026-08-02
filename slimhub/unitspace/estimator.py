@@ -39,12 +39,7 @@ class EstimatorRecord:
 
 
 class SimpleUnitspaceEstimator:
-    """Turn strong IN/OUT evidence into desired-state commands.
-
-    RAW10 and its ENTER sidecar deliberately share a candidate.  Reports that
-    acknowledge commands or replay a sequence never enter this method as a
-    movement candidate, which prevents the D0/D1 feedback loop.
-    """
+    """Retain IN/OUT diagnostics without owning Node confirmation state."""
 
     def __init__(self) -> None:
         self.status = UnitspaceStatus()
@@ -72,8 +67,8 @@ class SimpleUnitspaceEstimator:
                 occupancy_authority=False,
                 discard_reason=(
                     None
-                    if event.packet.detected in {0, 1}
-                    else "demo_pir_must_be_binary"
+                    if event.packet.detected in {0, 1, 10, 20}
+                    else "invalid_pir_candidate_code"
                 ),
             )
             return []
@@ -104,6 +99,35 @@ class SimpleUnitspaceEstimator:
         event_seq = _int_or_none(fields.get("event_seq"))
         event_id = _optional_text(fields.get("event_id") or fields.get("id"))
         node_timestamp = _int_or_none(fields.get("event_ts_ms"))
+
+        if event_name in {"ENTER", "EXIT"}:
+            self._record(
+                "candidate_evidence",
+                address,
+                timestamp,
+                action=event_name.lower(),
+                boot_id=boot_id,
+                event_seq=event_seq,
+                signal=fields.get("signal"),
+                code=fields.get("code"),
+                radar_state=fields.get("state"),
+            )
+            return []
+
+        if event_name in {"CONFIRM_ACK", "CONFIRM_ERROR"}:
+            self._record(
+                "confirmation_evidence",
+                address,
+                timestamp,
+                event=event_name,
+                bid=fields.get("bid"),
+                cid=fields.get("cid"),
+                rid=fields.get("rid"),
+                state=fields.get("state"),
+                applied=fields.get("applied"),
+                reason=fields.get("reason"),
+            )
+            return []
 
         if event_name == "EVENT":
             if self._is_primary_replay(address, boot_id, primary_seq):
@@ -149,23 +173,6 @@ class SimpleUnitspaceEstimator:
                 self._record("reconciliation", address, timestamp, occupied=occupied)
             return []
 
-        if _is_preliminary_enter_report(report):
-            self._record(
-                "discard",
-                address,
-                timestamp,
-                reason="legacy_enter_not_supported_by_demo",
-            )
-            return []
-
-        if inout_report_action(report) == EXIT_ACTION:
-            self._record(
-                "discard",
-                address,
-                timestamp,
-                reason="legacy_exit_not_supported_by_demo",
-            )
-            return []
         return []
 
     def drain_records(self) -> list[EstimatorRecord]:

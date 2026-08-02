@@ -257,27 +257,28 @@ BLE notification 경계는 NUS frame 경계가 아닙니다. Central은 connecti
 byte accumulator에서 16-byte header의 little-endian payload length와 뒤따르는
 CRLF를 모두 확인한 뒤에만 frame을 파싱합니다. 잘못된 length, packet type,
 CRLF는 bounded resynchronization으로 폐기하므로 작은 ATT notification에 걸친
-header/payload/CRLF 분할과 연결된 frame stream도 처리합니다. sound capture를 위한
-MTU 또는 connection-interval bulk-transfer tuning은 사용하지 않습니다.
+header/payload/CRLF 분할과 연결된 frame stream도 처리합니다. `inout_confirm`은
+분할 write를 지원하지 않는 Node RX 계약 때문에 negotiated write-without-response
+용량을 확인하고 완성된 frame 하나를 한 번의 GATT write로 전송합니다.
 
 ### DEAN_Node_v2 PIR 및 home-wide occupancy token
 
-PIR RAWDATA의 `detected=0|1`은 이진 관찰이며 Node 자체의 occupancy를 바꾸지
-않습니다. `detected=1`이 새 unit space에서 관찰되면 SLIMHUB가 이전 Node를 먼저
-OUT으로 동기화하고 ACK 뒤 새 Node를 IN으로 동기화합니다.
+PIR RAWDATA의 `detected=10|20`은 candidate 보조 증거이며 Node 자체의 occupancy를
+바꾸지 않습니다. 같은 candidate의 typed REPORT가 제공하는
+`boot_id/event_seq/signal`로만 confirmation을 만듭니다.
 
 ```text
-inout_sync,bid=12ab34cd,state=in,rid=<new-nonzero-hex>
-src=INOUT,event=SYNC_ACK,schema=2,bid=12ab34cd,rid=...,state=in,\
-source=slimhub,applied=1,changed=1
+src=INOUT,event=ENTER,signal=enter,code=10,boot_id=12ab34cd,event_seq=41,...
+inout_confirm,bid=12ab34cd,cid=41,state=in,rid=<new-nonzero-hex>
+src=INOUT,event=CONFIRM_ACK,schema=2,bid=12ab34cd,cid=41,rid=...,\
+state=in,source=slimhub,applied=1,reason=applied,legacy=0
 ```
 
-상관관계와 dedupe key는 `(source MAC,bid,rid,target state)`입니다. 정확히
-일치하는 `SYNC_ACK,source=slimhub,applied=1`만 authoritative입니다.
-`changed=0,reason=already_applied`는 중복 transition을 만들지 않는 성공입니다.
-`stale_boot`은 `node_status` 갱신 후 새 rid로 한 번만 재시도합니다. 점유는 최대
-1시간이며 timeout은 SLIMHUB가 OUT 동기화합니다. demo firmware에 legacy
-`enter/exit` 또는 `inout_confirm`은 보내지 않습니다.
+상관관계와 dedupe key는 `(source MAC,bid,cid,rid,target state)`입니다. 정확히
+일치하는 `CONFIRM_ACK,source=slimhub,applied=1,reason=applied,legacy=0`만
+authoritative입니다. 같은 rid의 retry는 Node가 `duplicate_request`로 거부하므로
+write 실패나 `CONFIRM_ERROR` 뒤 자동 재전송하지 않습니다. `inout_sync`와 legacy
+`enter/exit`는 보내지 않습니다.
 
 notification subscription 직후 연결 session마다 `time_sync`, `node_status`,
 `config_get`을 순서대로 전송합니다. 상태/config cache는 MAC별로

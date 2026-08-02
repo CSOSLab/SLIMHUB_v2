@@ -383,7 +383,7 @@ def _command_fields(command: str) -> tuple[str, dict[str, str]]:
     for part in parts[1:]:
         key, separator, value = part.partition("=")
         if not separator or not key or key in fields:
-            raise ValueError("sound command fields must be unique key=value pairs")
+            raise ValueError("command fields must be unique key=value pairs")
         fields[key] = value
     return name, fields
 
@@ -455,21 +455,32 @@ def validate_command_payload(command: str) -> str:
         return _validate_command_size(
             f"config_set,location={location},sound_profile={profile}"
         )
-    if normalized.startswith("inout_sync"):
+    if normalized.startswith("inout_confirm"):
         name, fields = _command_fields(normalized)
-        if name != "inout_sync" or set(fields) != {"bid", "state", "rid"}:
-            raise ValueError("inout_sync requires bid, state and rid")
+        if name != "inout_confirm" or set(fields) != {"bid", "cid", "state", "rid"}:
+            raise ValueError("inout_confirm requires bid, cid, state and rid")
         bid = fields["bid"].strip().lower()
-        if not re.fullmatch(r"[0-9a-f]{1,32}", bid):
-            raise ValueError("inout_sync bid must be hexadecimal")
+        if (
+            not re.fullmatch(r"[0-9a-f]{1,32}", bid)
+            or int(bid, 16) == 0
+        ):
+            raise ValueError("inout_confirm bid must be nonzero hexadecimal")
+        cid_text = fields["cid"].strip()
+        if (
+            not re.fullmatch(r"[0-9]{1,10}", cid_text)
+            or int(cid_text, 10) == 0
+            or int(cid_text, 10) > 0xFFFFFFFF
+        ):
+            raise ValueError("inout_confirm cid must be a nonzero 32-bit decimal value")
         state = fields["state"].strip().lower()
         rid_text = fields["rid"].strip().lower().removeprefix("0x")
         if state not in {"in", "out"}:
-            raise ValueError("invalid inout_sync state")
+            raise ValueError("invalid inout_confirm state")
         if not re.fullmatch(r"[0-9a-f]{1,8}", rid_text) or int(rid_text, 16) == 0:
-            raise ValueError("inout_sync rid must be a nonzero 32-bit hexadecimal value")
+            raise ValueError("inout_confirm rid must be a nonzero 32-bit hexadecimal value")
         return _validate_command_size(
-            f"inout_sync,bid={bid},state={state},rid={rid_text}"
+            f"inout_confirm,bid={bid},cid={int(cid_text, 10)},"
+            f"state={state},rid={rid_text}"
         )
     if normalized.startswith("sound_start"):
         name, fields = _command_fields(normalized)
@@ -526,7 +537,7 @@ def validate_command_payload(command: str) -> str:
     raise ValueError(
         "command must be one of: record, record:<seconds>, record_stop, "
         "sound_start, sound_bg, sound_auto, sound_stop, sound_status, node_status, "
-        "config_get, config_set, config_reload, time_sync, inout_sync"
+        "config_get, config_set, config_reload, time_sync, inout_confirm"
     )
 
 
@@ -584,7 +595,7 @@ def parse_rawdata(payload: bytes) -> RawDataPacket:
         and accuracy == 0
     )
     if flag_human_presence == 1 and (
-        detected not in {0, 1}
+        detected not in {0, 1, 10, 20}
         or not environment_values_are_zero
         or any(value != 0 for value in sound)
     ):

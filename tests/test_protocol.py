@@ -233,6 +233,32 @@ class ProtocolTests(unittest.TestCase):
                 build_frame("AA:BB:CC:DD:EE:FF", "RAWDATA", pir_with_sound)
             )
 
+    def test_rawdata_accepts_dean_inout_candidate_codes(self) -> None:
+        for detected in (10, 20):
+            with self.subTest(detected=detected):
+                payload = struct.pack(
+                    "<BB7HB16b",
+                    1,
+                    detected,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    *([0] * 16),
+                )
+                packet = parse_frame(
+                    build_frame(
+                        "AA:BB:CC:DD:EE:FF",
+                        "RAWDATA",
+                        payload,
+                    )
+                ).parsed
+                self.assertEqual(packet.detected, detected)
+
     def test_alert_frame_parses_text(self) -> None:
         frame = parse_frame(build_frame("AA:BB:CC:DD:EE:FF", "ALERT", b"ready"))
 
@@ -320,28 +346,44 @@ class ProtocolTests(unittest.TestCase):
     def test_command_frame_uses_target_mac_and_command_packet_type(self) -> None:
         frame = build_command_frame(
             "AA:BB:CC:DD:EE:FF",
-            "inout_sync,bid=a1b2c3d4,state=in,rid=1",
+            "inout_confirm,bid=a1b2c3d4,cid=41,state=in,rid=1",
         )
 
         self.assertEqual(frame[:6], bytes.fromhex("AABBCCDDEEFF"))
         self.assertEqual(frame[6:14], b"COMMAND\x00")
-        self.assertIn(b"inout_sync", frame)
+        self.assertIn(b"inout_confirm", frame)
 
-    def test_inout_sync_is_strict_and_legacy_feedback_is_rejected(self) -> None:
+    def test_inout_confirm_is_strict_and_old_sync_is_rejected(self) -> None:
         self.assertEqual(
-            self.command_payload("inout_sync,bid=A1B2,state=out,rid=0x2"),
-            b"inout_sync,bid=a1b2,state=out,rid=2",
+            self.command_payload(
+                "inout_confirm,bid=A1B2,cid=41,state=out,rid=0x2"
+            ),
+            b"inout_confirm,bid=a1b2,cid=41,state=out,rid=2",
         )
         for command in (
             "enter",
             "exit",
-            "inout_confirm,bid=a1,cid=1,state=in,rid=1",
-            "inout_sync,bid=a1,state=in,rid=0",
-            "inout_sync,bid=a1,state=in,rid=1,extra=1",
-            "inout_sync,bid=a1,bid=a2,state=in,rid=1",
+            "inout_sync,bid=a1,state=in,rid=1",
+            "inout_confirm,bid=0,cid=1,state=in,rid=1",
+            "inout_confirm,bid=a1,cid=0,state=in,rid=1",
+            "inout_confirm,bid=a1,cid=1,state=in,rid=0",
+            "inout_confirm,bid=a1,cid=1,state=in,rid=1,extra=1",
+            "inout_confirm,bid=a1,bid=a2,cid=1,state=in,rid=1",
         ):
             with self.subTest(command=command), self.assertRaises(ValueError):
                 build_command_frame("AA:BB:CC:DD:EE:FF", command)
+
+    def test_dean_confirm_example_is_one_73_byte_frame(self) -> None:
+        frame = build_command_frame(
+            "90:E5:B1:D1:22:6A",
+            "inout_confirm,bid=12ab34cd,cid=41,state=in,rid=deadbeef",
+        )
+
+        self.assertEqual(len(frame), 73)
+        self.assertEqual(frame[:6], bytes.fromhex("90E5B1D1226A"))
+        self.assertEqual(frame[6:14], b"COMMAND\x00")
+        self.assertEqual(frame[14:16], b"\x37\x00")
+        self.assertEqual(frame[-2:], b"\r\n")
 
     def test_record_command_frame_builds_record_payload(self) -> None:
         self.assertEqual(self.command_payload("record"), b"record")

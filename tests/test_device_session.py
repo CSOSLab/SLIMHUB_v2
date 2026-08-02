@@ -33,6 +33,8 @@ async def ignore_frame(_: str, __: object) -> None:
 
 
 class FlakyClient:
+    mtu_size = 517
+
     def __init__(self) -> None:
         self.attempts = 0
 
@@ -78,25 +80,114 @@ class DeviceSessionQueueTests(unittest.IsolatedAsyncioTestCase):
         logger.warning.assert_called_once()
         logger.exception.assert_not_called()
 
-    async def test_inout_sync_attempts_keep_distinct_request_ids(self) -> None:
+    async def test_inout_confirm_attempts_keep_distinct_request_ids(self) -> None:
         session = DeviceSession("AA:BB:CC:DD:EE:01", on_frame=ignore_frame)
 
         await session.send_command(
             CommandEvent(
                 session.address,
-                "inout_sync,bid=a1,state=in,rid=1",
+                "inout_confirm,bid=a1,cid=1,state=in,rid=1",
                 "TOILET",
             )
         )
         await session.send_command(
             CommandEvent(
                 session.address,
-                "inout_sync,bid=a1,state=out,rid=2",
+                "inout_confirm,bid=a1,cid=2,state=out,rid=2",
                 "TOILET",
             )
         )
 
         self.assertEqual(session.status()["queued_commands"], 2)
+
+    async def test_failed_inout_confirm_is_not_retried(self) -> None:
+        session = DeviceSession(
+            "AA:BB:CC:DD:EE:01",
+            on_frame=ignore_frame,
+            reconnect_delay=0.0,
+        )
+        await session.send_command(
+            CommandEvent(
+                session.address,
+                "inout_confirm,bid=a1,cid=1,state=in,rid=1",
+                "TOILET",
+            )
+        )
+        reconnect_requested = asyncio.Event()
+
+        await session._command_worker(FlakyClient(), reconnect_requested)
+
+        self.assertTrue(reconnect_requested.is_set())
+        self.assertEqual(session.status()["queued_commands"], 0)
+
+    async def test_inout_confirm_requires_single_write_capacity(self) -> None:
+        class SmallMtuClient:
+            mtu_size = 23
+
+            def __init__(self) -> None:
+                self.writes = 0
+
+            async def write_gatt_char(self, *_: object, **__: object) -> None:
+                self.writes += 1
+
+        session = DeviceSession(
+            "90:E5:B1:D1:22:6A",
+            on_frame=ignore_frame,
+        )
+        await session.send_command(
+            CommandEvent(
+                session.address,
+                "inout_confirm,bid=12ab34cd,cid=41,state=in,rid=deadbeef",
+                "TOILET",
+            )
+        )
+        reconnect_requested = asyncio.Event()
+        client = SmallMtuClient()
+
+        await session._command_worker(client, reconnect_requested)
+
+        self.assertEqual(client.writes, 0)
+        self.assertEqual(session.status()["queued_commands"], 0)
+
+    async def test_inout_confirm_is_sent_as_one_complete_gatt_value(self) -> None:
+        class LargeMtuClient:
+            mtu_size = 517
+
+            def __init__(self) -> None:
+                self.values: list[bytes] = []
+
+            async def write_gatt_char(
+                self,
+                _: object,
+                value: bytes,
+                **__: object,
+            ) -> None:
+                self.values.append(value)
+
+        session = DeviceSession(
+            "90:E5:B1:D1:22:6A",
+            on_frame=ignore_frame,
+        )
+        await session.send_command(
+            CommandEvent(
+                session.address,
+                "inout_confirm,bid=12ab34cd,cid=41,state=in,rid=deadbeef",
+                "TOILET",
+            )
+        )
+        client = LargeMtuClient()
+        worker = asyncio.create_task(session._command_worker(client))
+        for _ in range(20):
+            if client.values:
+                break
+            await asyncio.sleep(0)
+        session._stop_event.set()
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+        self.assertEqual(len(client.values), 1)
+        self.assertEqual(len(client.values[0]), 73)
+        self.assertEqual(client.values[0][-2:], b"\r\n")
 
     async def test_failed_write_is_retried_and_remains_ack_pending(self) -> None:
         results: list[tuple[bool, str | None]] = []

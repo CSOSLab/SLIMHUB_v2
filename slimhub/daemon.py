@@ -594,7 +594,19 @@ class SlimHubDaemon:
             # Reports are diagnostic evidence even when their source is new to
             # this Central build, so retain every well-formed REPORT packet.
             await self.raw_logger.log_report(report_event)
-            orderable = src in {"INOUT", "EVENT", "ADL"} or frame.parsed.format == "json"
+            report_name = frame.parsed.fields.get("event", "").upper()
+            immediate_confirmation = (
+                src == "INOUT"
+                and report_name
+                in {"ENTER", "EXIT", "CONFIRM_ACK", "CONFIRM_ERROR"}
+            )
+            orderable = (
+                not immediate_confirmation
+                and (
+                    src in {"INOUT", "EVENT", "ADL"}
+                    or frame.parsed.format == "json"
+                )
+            )
             if orderable and boot_id and event_ts_ms is not None:
                 for ordered_event in self.report_reorder_buffer.push(
                     report_event,
@@ -752,8 +764,16 @@ class SlimHubDaemon:
         error: str | None,
         timestamp: float,
     ) -> None:
-        # A successful GATT write is transport evidence only. Desired/actual
-        # state remains pending until C0/C1 or reconnect STATE reconciliation.
+        # A successful GATT write is transport evidence only. IN/OUT remains
+        # pending until the correlated CONFIRM_ACK arrives. A failed
+        # inout_confirm is deliberately not retried because Node v2 treats a
+        # repeated rid as duplicate_request.
+        self.dean_contract.handle_command_write_result(
+            command,
+            succeeded,
+            error,
+            timestamp,
+        )
         await self.raw_logger.log_structured(
             StructuredEvent(
                 timestamp=timestamp,

@@ -650,6 +650,12 @@ def _retain_contract_report(event: ReportEvent) -> bool:
         return (
             fields.get("schema") == "2"
             or bool(fields.get("bid") or fields.get("boot_id"))
-            or fields.get("event", "").upper() in {"SYNC_ACK", "SYNC_ERROR"}
+            or fields.get("event", "").upper()
+            in {
+                "ENTER",
+                "EXIT",
+                "CONFIRM_ACK",
+                "CONFIRM_ERROR",
+            }
         )
     return src in {"EVENT", "ADL"} and fields.get("schema") == "2"

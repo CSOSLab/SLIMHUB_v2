@@ -66,9 +66,18 @@ class TwoNodeReplayTests(unittest.TestCase):
         self.assertEqual(
             commands,
             [
-                ("inout_sync,bid=aaa1,state=in,rid=11", "AA:BB:CC:DD:EE:01"),
-                ("inout_sync,bid=aaa1,state=out,rid=22", "AA:BB:CC:DD:EE:01"),
-                ("inout_sync,bid=bbb2,state=in,rid=33", "AA:BB:CC:DD:EE:02"),
+                (
+                    "inout_confirm,bid=aaaa0001,cid=1,state=in,rid=11",
+                    "AA:BB:CC:DD:EE:01",
+                ),
+                (
+                    "inout_confirm,bid=aaaa0001,cid=2,state=out,rid=22",
+                    "AA:BB:CC:DD:EE:01",
+                ),
+                (
+                    "inout_confirm,bid=bbbb0002,cid=7,state=in,rid=33",
+                    "AA:BB:CC:DD:EE:02",
+                ),
             ],
         )
         self.assertEqual(
