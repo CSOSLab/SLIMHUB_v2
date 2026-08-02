@@ -20,11 +20,12 @@ Recent integration commits:
   candidate identity.
 - SLIMHUB maps `boot_id/event_seq/signal` to `bid/cid/state` and sends
   `inout_confirm` in one GATT write.
-- Results correlate by `(source MAC,bid,cid,rid,target state)` and only exact
-  `CONFIRM_ACK,source=slimhub,applied=1,reason=applied,legacy=0` is
+- Results correlate by `(source MAC,bid,cid,rid,target state)`. Both
+  `changed=1,reason=applied` and `changed=0,reason=already_applied` ACKs are
   authoritative.
-- Reused rid is non-idempotent. Write failure and `CONFIRM_ERROR` are terminal
-  and never cause an automatic retry.
+- ACK timeout after a successful write retries the exact same identity and
+  rid. Transport write retry also preserves it; `CONFIRM_ERROR` and
+  `request_id_conflict` are terminal.
 - A one-hour timeout is recorded, but Central cannot invent an OUT
   confirmation without a live Node candidate bid/cid.
 - D0/D1 sequence reports are never fed back into token assignment.

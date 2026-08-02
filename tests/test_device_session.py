@@ -100,7 +100,7 @@ class DeviceSessionQueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(session.status()["queued_commands"], 2)
 
-    async def test_failed_inout_confirm_is_not_retried(self) -> None:
+    async def test_failed_inout_confirm_preserves_same_command_for_retry(self) -> None:
         session = DeviceSession(
             "AA:BB:CC:DD:EE:01",
             on_frame=ignore_frame,
@@ -118,7 +118,10 @@ class DeviceSessionQueueTests(unittest.IsolatedAsyncioTestCase):
         await session._command_worker(FlakyClient(), reconnect_requested)
 
         self.assertTrue(reconnect_requested.is_set())
-        self.assertEqual(session.status()["queued_commands"], 0)
+        self.assertEqual(session.status()["queued_commands"], 1)
+        key = await session._command_queue.get()
+        retry = session._pending_commands[key]
+        self.assertEqual(retry.command, "inout_confirm,bid=a1,cid=1,state=in,rid=1")
 
     async def test_inout_confirm_requires_single_write_capacity(self) -> None:
         class SmallMtuClient:
@@ -147,7 +150,7 @@ class DeviceSessionQueueTests(unittest.IsolatedAsyncioTestCase):
         await session._command_worker(client, reconnect_requested)
 
         self.assertEqual(client.writes, 0)
-        self.assertEqual(session.status()["queued_commands"], 0)
+        self.assertEqual(session.status()["queued_commands"], 1)
 
     async def test_inout_confirm_is_sent_as_one_complete_gatt_value(self) -> None:
         class LargeMtuClient:

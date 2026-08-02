@@ -271,13 +271,16 @@ PIR RAWDATA의 `detected=10|20`은 candidate 보조 증거이며 Node 자체의 
 src=INOUT,event=ENTER,signal=enter,code=10,boot_id=12ab34cd,event_seq=41,...
 inout_confirm,bid=12ab34cd,cid=41,state=in,rid=<new-nonzero-hex>
 src=INOUT,event=CONFIRM_ACK,schema=2,bid=12ab34cd,cid=41,rid=...,\
-state=in,source=slimhub,applied=1,reason=applied,legacy=0
+state=in,source=slimhub,applied=1,changed=1,reason=applied,legacy=0
 ```
 
 상관관계와 dedupe key는 `(source MAC,bid,cid,rid,target state)`입니다. 정확히
-일치하는 `CONFIRM_ACK,source=slimhub,applied=1,reason=applied,legacy=0`만
-authoritative입니다. 같은 rid의 retry는 Node가 `duplicate_request`로 거부하므로
-write 실패나 `CONFIRM_ERROR` 뒤 자동 재전송하지 않습니다. `inout_sync`와 legacy
+일치하는 최초 `CONFIRM_ACK,applied=1,changed=1,reason=applied`와 ACK 유실 뒤
+동일 transaction 재전송에 대한
+`CONFIRM_ACK,applied=1,changed=0,reason=already_applied`를 모두 authoritative
+success로 처리합니다. GATT write 성공 뒤 ACK timeout이면 같은
+`bid/cid/rid/state`를 유지해 재전송하고 새 rid를 만들지 않습니다.
+`CONFIRM_ERROR`와 `request_id_conflict`는 terminal이며 `inout_sync`와 legacy
 `enter/exit`는 보내지 않습니다.
 
 notification subscription 직후 연결 session마다 `time_sync`, `node_status`,

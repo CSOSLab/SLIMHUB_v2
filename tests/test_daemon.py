@@ -286,7 +286,7 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
                     address,
                     "src=INOUT,event=CONFIRM_ACK,schema=2,bid=a1b2c3d4,"
                     f"cid=41,rid={rid},state=in,source=slimhub,"
-                    "applied=1,reason=applied,legacy=0,ts=101",
+                    "applied=1,changed=1,reason=applied,legacy=0,ts=101",
                     {
                         "src": "INOUT",
                         "event": "CONFIRM_ACK",
@@ -297,6 +297,7 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
                         "state": "in",
                         "source": "slimhub",
                         "applied": "1",
+                        "changed": "1",
                         "reason": "applied",
                         "legacy": "0",
                         "ts": "101",
@@ -311,6 +312,91 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 daemon.dean_contract.home_snapshot()["confirmed_occupant"],
                 address,
+            )
+
+    async def test_already_applied_ack_does_not_duplicate_legacy_timeline(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            address = "AA:BB:CC:DD:EE:01"
+            paths = AppPaths.from_base(tmpdir)
+            daemon = SlimHubDaemon(paths=paths)
+            daemon.config_store.set_field(address, "location", "TOILET")
+            session = FakeSession(address)
+            await daemon.registry.add(session)
+            await daemon.handle_frame(
+                address,
+                report_frame(
+                    address,
+                    "src=INOUT,event=ENTER,signal=enter,code=10,state=0,"
+                    "boot_id=a1b2c3d4,event_seq=41,event_ts_ms=100",
+                    {
+                        "src": "INOUT",
+                        "event": "ENTER",
+                        "signal": "enter",
+                        "code": "10",
+                        "state": "0",
+                        "boot_id": "a1b2c3d4",
+                        "event_seq": "41",
+                        "event_ts_ms": "100",
+                    },
+                ),
+            )
+            rid = session.commands[0].command.rsplit("=", 1)[1]
+            legacy = {
+                "device": address,
+                "type": "DEBUG",
+                "event": "ENTER",
+                "value": 10,
+            }
+            await daemon.handle_frame(
+                address,
+                parse_frame(
+                    build_frame(
+                        address,
+                        "REPORT",
+                        json.dumps(legacy, separators=(",", ":")).encode(),
+                    )
+                ),
+            )
+            ack = report_frame(
+                address,
+                "src=INOUT,event=CONFIRM_ACK,schema=2,bid=a1b2c3d4,"
+                f"cid=41,rid={rid},state=in,source=slimhub,applied=1,"
+                "changed=0,reason=already_applied,legacy=0,ts=101",
+                {
+                    "src": "INOUT",
+                    "event": "CONFIRM_ACK",
+                    "schema": "2",
+                    "bid": "a1b2c3d4",
+                    "cid": "41",
+                    "rid": rid,
+                    "state": "in",
+                    "source": "slimhub",
+                    "applied": "1",
+                    "changed": "0",
+                    "reason": "already_applied",
+                    "legacy": "0",
+                    "ts": "101",
+                },
+            )
+            await daemon.handle_frame(address, ack)
+            await daemon.handle_frame(address, ack)
+
+            debug_path = next(
+                paths.data_dir.glob("*/*/*/inference/debugstr/*.txt")
+            )
+            self.assertEqual(
+                len(debug_path.read_text(encoding="utf-8").splitlines()),
+                1,
+            )
+            self.assertEqual(
+                len(paths.display_path.read_text(encoding="utf-8").splitlines()),
+                1,
+            )
+            self.assertEqual(
+                daemon.dean_contract.snapshot(address)["occupancy"],
+                "IN",
             )
 
     async def test_node_config_dispatch_waits_for_applied_report(self) -> None:

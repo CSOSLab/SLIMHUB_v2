@@ -1,9 +1,9 @@
 {"kind":"raw","mac":"AA:BB:CC:DD:EE:01","location":"TOILET","receipt_ts":100.000,"detected":10}
 {"kind":"report","mac":"AA:BB:CC:DD:EE:01","location":"TOILET","receipt_ts":100.100,"src":"INOUT","event":"ENTER","signal":"enter","code":10,"state":0,"boot_id":"aaaa0001","event_seq":1,"event_ts_ms":100}
-{"kind":"report","mac":"AA:BB:CC:DD:EE:01","location":"TOILET","receipt_ts":100.120,"src":"INOUT","event":"CONFIRM_ACK","schema":2,"bid":"aaaa0001","cid":1,"rid":"11","state":"in","source":"slimhub","applied":1,"reason":"applied","legacy":0}
+{"kind":"report","mac":"AA:BB:CC:DD:EE:01","location":"TOILET","receipt_ts":100.120,"src":"INOUT","event":"CONFIRM_ACK","schema":2,"bid":"aaaa0001","cid":1,"rid":"11","state":"in","source":"slimhub","applied":1,"changed":1,"reason":"applied","legacy":0}
 {"kind":"raw","mac":"AA:BB:CC:DD:EE:02","location":"LIVING","receipt_ts":102.000,"detected":10}
 {"kind":"report","mac":"AA:BB:CC:DD:EE:02","location":"LIVING","receipt_ts":102.010,"src":"INOUT","event":"ENTER","signal":"enter","code":10,"state":0,"boot_id":"bbbb0002","event_seq":7,"event_ts_ms":200}
 {"kind":"raw","mac":"AA:BB:CC:DD:EE:01","location":"TOILET","receipt_ts":102.050,"detected":20}
 {"kind":"report","mac":"AA:BB:CC:DD:EE:01","location":"TOILET","receipt_ts":102.060,"src":"INOUT","event":"EXIT","signal":"exit","code":20,"state":0,"boot_id":"aaaa0001","event_seq":2,"event_ts_ms":210}
-{"kind":"report","mac":"AA:BB:CC:DD:EE:01","location":"TOILET","receipt_ts":102.100,"src":"INOUT","event":"CONFIRM_ACK","schema":2,"bid":"aaaa0001","cid":2,"rid":"22","state":"out","source":"slimhub","applied":1,"reason":"applied","legacy":0}
-{"kind":"report","mac":"AA:BB:CC:DD:EE:02","location":"LIVING","receipt_ts":102.150,"src":"INOUT","event":"CONFIRM_ACK","schema":2,"bid":"bbbb0002","cid":7,"rid":"33","state":"in","source":"slimhub","applied":1,"reason":"applied","legacy":0}
+{"kind":"report","mac":"AA:BB:CC:DD:EE:01","location":"TOILET","receipt_ts":102.100,"src":"INOUT","event":"CONFIRM_ACK","schema":2,"bid":"aaaa0001","cid":2,"rid":"22","state":"out","source":"slimhub","applied":1,"changed":1,"reason":"applied","legacy":0}
+{"kind":"report","mac":"AA:BB:CC:DD:EE:02","location":"LIVING","receipt_ts":102.150,"src":"INOUT","event":"CONFIRM_ACK","schema":2,"bid":"bbbb0002","cid":7,"rid":"33","state":"in","source":"slimhub","applied":1,"changed":1,"reason":"applied","legacy":0}

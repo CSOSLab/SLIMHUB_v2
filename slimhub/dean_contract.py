@@ -15,6 +15,8 @@ from slimhub.protocol.nus import normalize_mac
 
 SLIMHUB_CONFIRMED = "slimhub_confirmed"
 MAX_OCCUPANCY_SECONDS = 60 * 60
+CONFIRM_ACK_TIMEOUT_SECONDS = 2.0
+MAX_CONFIRM_ATTEMPTS = 3
 
 LOCATION_PROFILES: dict[str, tuple[str, int]] = {
     "TOILET": ("toilet_v1", 10),
@@ -64,7 +66,11 @@ class PendingConfirmation:
     cid: int
     rid: int
     state: str
+    location: str
     created_at: float
+    sent_at: float | None = None
+    attempts: int = 0
+    status: str = "CANDIDATE_RECEIVED"
 
 
 @dataclass(frozen=True)
@@ -88,7 +94,7 @@ class DeanContractStore:
         self._rid_factory = rid_factory or (lambda: secrets.randbits(32))
         self._nodes: dict[str, NodeState] = {}
         self._pending: dict[
-            tuple[str, str, int, int, str],
+            tuple[str, str, int, str],
             PendingConfirmation,
         ] = {}
         self._used_rids: dict[str, set[int]] = {}
@@ -168,6 +174,8 @@ class DeanContractStore:
                     "cid": pending.cid,
                     "rid": f"{pending.rid:x}",
                     "state": pending.state,
+                    "attempts": pending.attempts,
+                    "status": pending.status,
                 }
                 for pending in self._pending.values()
             ],
@@ -195,6 +203,48 @@ class DeanContractStore:
         self._last_entered_at = None
         self._save()
         return []
+
+    def expire_confirmations(self, timestamp: float) -> list[CommandEvent]:
+        """Retry ACK-lost transactions with the exact same confirmation identity."""
+        commands: list[CommandEvent] = []
+        for key, pending in list(self._pending.items()):
+            if (
+                pending.sent_at is None
+                or timestamp - pending.sent_at < CONFIRM_ACK_TIMEOUT_SECONDS
+            ):
+                continue
+            pending.status = "ACK_TIMEOUT"
+            if pending.attempts >= MAX_CONFIRM_ATTEMPTS:
+                self._record(
+                    "inout_confirm_timeout",
+                    pending.mac,
+                    timestamp,
+                    bid=pending.bid,
+                    cid=pending.cid,
+                    rid=f"{pending.rid:x}",
+                    state=pending.state,
+                    attempts=pending.attempts,
+                    terminal=True,
+                )
+                del self._pending[key]
+                continue
+            self._record(
+                "inout_confirm_retry",
+                pending.mac,
+                timestamp,
+                bid=pending.bid,
+                cid=pending.cid,
+                rid=f"{pending.rid:x}",
+                state=pending.state,
+                attempts=pending.attempts,
+                same_identity=True,
+            )
+            # Prevent the one-second maintenance loop from enqueueing another
+            # retry before this write attempt reports its transport result.
+            pending.sent_at = None
+            commands.append(self._command(pending, pending.location))
+        self._save()
+        return commands
 
     def node_state(self, address: str) -> NodeState:
         return self._node(address)
@@ -444,6 +494,7 @@ class DeanContractStore:
         state = _state(fields.get("state"))
         source = str(fields.get("source") or "").strip().lower()
         applied = str(fields.get("applied") or "").strip() == "1"
+        changed = _strict_int(fields.get("changed"))
         reason = _text(fields.get("reason"))
         legacy = str(fields.get("legacy") or "").strip()
         if bid is None or cid is None or rid is None or state is None:
@@ -455,8 +506,8 @@ class DeanContractStore:
                 fields=dict(fields),
             )
             return []
-        key = (mac, bid, cid, rid, state)
-        if key in self._seen_results:
+        identity = (mac, bid, cid, rid, state)
+        if identity in self._seen_results:
             self._record(
                 "inout_confirm_duplicate",
                 mac,
@@ -467,8 +518,37 @@ class DeanContractStore:
                 state=state,
             )
             return []
-        pending = self._pending.pop(key, None)
-        if pending is None:
+        pending_key = (mac, bid, cid, state)
+        pending = self._pending.get(pending_key)
+        if pending is None or pending.rid != rid:
+            if name == "CONFIRM_ERROR" and reason == "request_id_conflict":
+                conflicting = next(
+                    (
+                        (key, item)
+                        for key, item in self._pending.items()
+                        if item.mac == mac and item.rid == rid
+                    ),
+                    None,
+                )
+                if conflicting is not None:
+                    conflict_key, conflict = conflicting
+                    del self._pending[conflict_key]
+                    conflict.status = "CONFIRM_REJECTED"
+                    self._record(
+                        "inout_confirm_request_id_conflict",
+                        mac,
+                        event.timestamp,
+                        bid=bid,
+                        cid=cid,
+                        rid=f"{rid:x}",
+                        state=state,
+                        pending_bid=conflict.bid,
+                        pending_cid=conflict.cid,
+                        pending_state=conflict.state,
+                        terminal=True,
+                    )
+                    self._save()
+                    return []
             self._record(
                 "inout_confirm_unmatched",
                 mac,
@@ -480,16 +560,32 @@ class DeanContractStore:
                 state=state,
             )
             return []
-        self._seen_results.add(key)
+        del self._pending[pending_key]
+        self._seen_results.add(identity)
         node = self._node(mac)
-        authoritative = (
+        first_applied = (
             name == "CONFIRM_ACK"
             and applied
+            and changed == 1
             and source == "slimhub"
             and reason == "applied"
             and legacy == "0"
         )
+        already_applied = (
+            name == "CONFIRM_ACK"
+            and applied
+            and changed == 0
+            and source == "slimhub"
+            and reason == "already_applied"
+            and legacy == "0"
+        )
+        authoritative = first_applied or already_applied
         if authoritative:
+            pending.status = (
+                "CONFIRMED_CHANGED"
+                if first_applied
+                else "CONFIRMED_ALREADY_APPLIED"
+            )
             node.bid = bid
             node.occupancy = "IN" if state == "in" else "OUT"
             node.last_reason = None
@@ -505,7 +601,9 @@ class DeanContractStore:
                 cid=cid,
                 rid=f"{rid:x}",
                 state=state,
+                changed=changed,
                 reason=reason,
+                status=pending.status,
                 authoritative=True,
             )
             commands: list[CommandEvent] = []
@@ -517,6 +615,7 @@ class DeanContractStore:
             return commands
 
         node.last_reason = reason or name.lower()
+        pending.status = "CONFIRM_REJECTED"
         self._record(
             "inout_confirm_diagnostic",
             mac,
@@ -527,8 +626,11 @@ class DeanContractStore:
             state=state,
             reason=reason,
             applied=applied,
+            changed=changed,
             legacy=legacy,
+            status=pending.status,
             authoritative=False,
+            terminal=True,
         )
         self._save()
         return []
@@ -540,13 +642,30 @@ class DeanContractStore:
         error: str | None,
         timestamp: float,
     ) -> None:
-        if succeeded or not command.command.startswith("inout_confirm,"):
+        if not command.command.startswith("inout_confirm,"):
             return
         rid = _hex_int(command.cmd_id)
         mac = normalize_mac(command.address)
         for key, pending in list(self._pending.items()):
             if pending.mac == mac and pending.rid == rid:
-                del self._pending[key]
+                if succeeded:
+                    pending.sent_at = timestamp
+                    pending.attempts += 1
+                    pending.status = "CONFIRM_SENT"
+                    self._record(
+                        "inout_confirm_written",
+                        mac,
+                        timestamp,
+                        bid=pending.bid,
+                        cid=pending.cid,
+                        rid=f"{pending.rid:x}",
+                        state=pending.state,
+                        attempts=pending.attempts,
+                    )
+                    self._save()
+                    return
+                pending.sent_at = None
+                pending.status = "CANDIDATE_RECEIVED"
                 self._record(
                     "inout_confirm_write_failed",
                     mac,
@@ -556,7 +675,9 @@ class DeanContractStore:
                     rid=f"{pending.rid:x}",
                     state=pending.state,
                     error=error,
-                    retry=False,
+                    retry=True,
+                    same_identity=True,
+                    status=pending.status,
                 )
         self._save()
 
@@ -571,6 +692,7 @@ class DeanContractStore:
             cid=candidate.cid,
             rid=rid,
             state=candidate.state,
+            location=candidate.location,
             created_at=candidate.created_at,
         )
         self._pending[
@@ -578,7 +700,6 @@ class DeanContractStore:
                 candidate.mac,
                 candidate.bid,
                 candidate.cid,
-                rid,
                 candidate.state,
             )
         ] = pending
@@ -781,6 +902,13 @@ def _int(value: object, default: int | None = None) -> int | None:
         return int(str(value).strip(), 10)
     except (TypeError, ValueError):
         return default
+
+
+def _strict_int(value: object) -> int | None:
+    text = str(value or "").strip()
+    if re.fullmatch(r"-?[0-9]+", text) is None:
+        return None
+    return int(text, 10)
 
 
 def _hex_int(value: object) -> int | None:

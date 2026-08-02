@@ -765,9 +765,9 @@ class SlimHubDaemon:
         timestamp: float,
     ) -> None:
         # A successful GATT write is transport evidence only. IN/OUT remains
-        # pending until the correlated CONFIRM_ACK arrives. A failed
-        # inout_confirm is deliberately not retried because Node v2 treats a
-        # repeated rid as duplicate_request.
+        # pending until the correlated CONFIRM_ACK arrives. Transport retries
+        # preserve the exact confirmation identity; explicit CONFIRM_ERROR is
+        # terminal.
         self.dean_contract.handle_command_write_result(
             command,
             succeeded,
@@ -813,7 +813,11 @@ class SlimHubDaemon:
 
     async def _occupancy_timeout_loop(self) -> None:
         while not self.stop_event.is_set():
-            commands = self.dean_contract.expire_occupancy(time.time())
+            timestamp = time.time()
+            commands = self.dean_contract.expire_confirmations(timestamp)
+            commands.extend(
+                self.dean_contract.expire_occupancy(timestamp)
+            )
             sent = await self._send_unitspace_commands(commands)
             self._log_commands(sent)
             await self._log_contract_records()

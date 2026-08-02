@@ -56,13 +56,19 @@ Results use:
 
 ```text
 src=INOUT,event=CONFIRM_ACK|CONFIRM_ERROR,schema=2,bid=<hex>,cid=<decimal>,
-rid=<hex>,state=in|out,source=slimhub,applied=0|1,reason=...,legacy=0
+rid=<hex>,state=in|out,source=slimhub,applied=0|1,changed=0|1,
+reason=...,legacy=0
 ```
 
 Transactions and result dedupe use `(source MAC,bid,cid,rid,target state)`.
-Only exact `CONFIRM_ACK,source=slimhub,applied=1,reason=applied,legacy=0` is
-authoritative. The Node treats reuse of a rid as `duplicate_request`, so a
-failed write or `CONFIRM_ERROR` is terminal and is not automatically retried.
+Both exact `CONFIRM_ACK,applied=1,changed=1,reason=applied,legacy=0` and
+`CONFIRM_ACK,applied=1,changed=0,reason=already_applied,legacy=0` are
+authoritative. After a successful GATT write, an ACK timeout retries the exact
+same bid/cid/rid/state identity. It never allocates a new rid merely because
+the ACK was lost. A transport write retry also preserves that identity.
+`CONFIRM_ERROR` is terminal.
+Reusing a successful rid for a different bid/cid/state returns terminal
+`request_id_conflict`.
 Legacy `enter`, `exit`, and `inout_sync` are rejected. Because a confirmation
 requires a live Node candidate, Central records the one-hour timeout but does
 not invent an OUT command without a matching bid/cid.

@@ -141,6 +141,46 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(csv_packet.format, "csv")
         self.assertEqual(csv_packet.fields["src"], "EVENT")
 
+    def test_assembler_reassembles_changed_and_already_applied_confirm_acks(
+        self,
+    ) -> None:
+        payloads = (
+            (
+                b"src=INOUT,event=CONFIRM_ACK,schema=2,bid=12ab34cd,"
+                b"cid=41,rid=deadbeef,state=in,source=slimhub,applied=1,"
+                b"changed=1,reason=applied,legacy=0"
+            ),
+            (
+                b"src=INOUT,event=CONFIRM_ACK,schema=2,bid=12ab34cd,"
+                b"cid=41,rid=deadbeef,state=in,source=slimhub,applied=1,"
+                b"changed=0,reason=already_applied,legacy=0"
+            ),
+        )
+        for payload in payloads:
+            frame = build_frame(
+                "90:E5:B1:D1:22:6A",
+                "REPORT",
+                payload,
+            )
+            chunk_sets = (
+                [frame],
+                [frame[:23], frame[23:]],
+                [frame[index : index + 7] for index in range(0, len(frame), 7)],
+            )
+            for chunks in chunk_sets:
+                with self.subTest(
+                    reason=payload.split(b"reason=", 1)[1].split(b",", 1)[0],
+                    chunks=len(chunks),
+                ):
+                    assembler = FrameAssembler()
+                    frames: list[bytes] = []
+                    for chunk in chunks:
+                        frames.extend(assembler.push(chunk))
+                    self.assertEqual(frames, [frame])
+                    packet = parse_frame(frames[0]).parsed
+                    self.assertEqual(packet.fields["event"], "CONFIRM_ACK")
+                    self.assertIn(packet.fields["changed"], {"0", "1"})
+
     def test_recorded_notifications_restore_audio_report_and_rawdata_in_order(self) -> None:
         fixture_path = (
             Path(__file__).parent / "fixtures" / "sound_audio_notifications.json"

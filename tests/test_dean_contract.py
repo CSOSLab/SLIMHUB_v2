@@ -4,7 +4,11 @@ import tempfile
 import unittest
 
 from slimhub.config import AppPaths
-from slimhub.dean_contract import MAX_OCCUPANCY_SECONDS, DeanContractStore
+from slimhub.dean_contract import (
+    CONFIRM_ACK_TIMEOUT_SECONDS,
+    MAX_OCCUPANCY_SECONDS,
+    DeanContractStore,
+)
 from slimhub.events import CommandEvent, RawDataEvent, ReportEvent
 from slimhub.protocol.nus import RawDataPacket, ReportPacket
 
@@ -67,6 +71,7 @@ def confirmation(
     state: str,
     event: str = "CONFIRM_ACK",
     applied: int = 1,
+    changed: int = 1,
     reason: str = "applied",
     legacy: int = 0,
 ) -> list[CommandEvent]:
@@ -85,6 +90,7 @@ def confirmation(
             source="slimhub",
             ts=int(timestamp * 1000),
             applied=applied,
+            changed=changed,
             reason=reason,
             legacy=legacy,
         )
@@ -168,6 +174,91 @@ class DeanContractTests(unittest.TestCase):
         self.assertEqual(store.snapshot(MAC_A)["occupancy"], "IN")
         self.assertEqual(store.home_snapshot()["confirmed_occupant"], MAC_A)
 
+    def test_ack_timeout_retries_same_identity_and_already_applied_succeeds(
+        self,
+    ) -> None:
+        store = self.make_store()
+        command = store.handle_report(
+            candidate(MAC_A, 1.0, bid="12ab34cd", cid=41, state="in")
+        )[0]
+        store.handle_command_write_result(command, True, None, 1.1)
+
+        self.assertEqual(
+            store.expire_confirmations(
+                1.1 + CONFIRM_ACK_TIMEOUT_SECONDS - 0.01
+            ),
+            [],
+        )
+        retry = store.expire_confirmations(
+            1.1 + CONFIRM_ACK_TIMEOUT_SECONDS
+        )
+
+        self.assertEqual(len(retry), 1)
+        self.assertEqual(retry[0].command, command.command)
+        self.assertEqual(retry[0].cmd_id, command.cmd_id)
+        store.handle_command_write_result(retry[0], True, None, 3.2)
+        confirmation(
+            store,
+            MAC_A,
+            3.3,
+            bid="12ab34cd",
+            cid=41,
+            rid=0x11,
+            state="in",
+            changed=0,
+            reason="already_applied",
+        )
+
+        self.assertEqual(store.snapshot(MAC_A)["occupancy"], "IN")
+        applied = [
+            record
+            for record in store.drain_records()
+            if record.kind == "inout_confirm_applied"
+        ]
+        self.assertEqual(applied[-1].data["changed"], 0)
+        self.assertEqual(
+            applied[-1].data["status"],
+            "CONFIRMED_ALREADY_APPLIED",
+        )
+
+    def test_out_ack_timeout_retry_keeps_rid_and_confirms_out(self) -> None:
+        store = self.make_store()
+        store.handle_report(
+            candidate(MAC_A, 1.0, bid="12ab34cd", cid=41, state="in")
+        )
+        confirmation(
+            store,
+            MAC_A,
+            1.1,
+            bid="12ab34cd",
+            cid=41,
+            rid=0x11,
+            state="in",
+        )
+        command = store.handle_report(
+            candidate(MAC_A, 2.0, bid="12ab34cd", cid=42, state="out")
+        )[0]
+        store.handle_command_write_result(command, True, None, 2.1)
+
+        retry = store.expire_confirmations(
+            2.1 + CONFIRM_ACK_TIMEOUT_SECONDS + 0.001
+        )[0]
+        self.assertEqual(retry.command, command.command)
+        confirmation(
+            store,
+            MAC_A,
+            4.2,
+            bid="12ab34cd",
+            cid=42,
+            rid=0x22,
+            state="out",
+            changed=0,
+            reason="already_applied",
+        )
+
+        self.assertEqual(store.snapshot(MAC_A)["occupancy"], "OUT")
+        self.assertIsNone(store.home_snapshot()["confirmed_occupant"])
+
     def test_ack_requires_cid_reason_source_applied_and_legacy_zero(self) -> None:
         cases = (
             {"reason": "already_applied"},
@@ -214,11 +305,39 @@ class DeanContractTests(unittest.TestCase):
             state="in",
             event="CONFIRM_ERROR",
             applied=0,
-            reason="duplicate_request",
+            changed=0,
+            reason="stale_candidate",
         )
 
         self.assertEqual(commands, [])
         self.assertEqual(store.home_snapshot()["pending"], [])
+
+    def test_request_id_conflict_terminates_same_rid_transaction(self) -> None:
+        store = self.make_store()
+        store.handle_report(
+            candidate(MAC_A, 1.0, bid="12ab34cd", cid=41, state="in")
+        )
+
+        confirmation(
+            store,
+            MAC_A,
+            1.1,
+            bid="12ab34cd",
+            cid=42,
+            rid=0x11,
+            state="out",
+            event="CONFIRM_ERROR",
+            applied=0,
+            changed=0,
+            reason="request_id_conflict",
+        )
+
+        self.assertEqual(store.home_snapshot()["pending"], [])
+        self.assertIsNone(store.snapshot(MAC_A)["occupancy"])
+        self.assertIn(
+            "inout_confirm_request_id_conflict",
+            [record.kind for record in store.drain_records()],
+        )
 
     def test_stale_bid_or_cid_cannot_complete_another_candidate(self) -> None:
         store = self.make_store()
@@ -331,7 +450,7 @@ class DeanContractTests(unittest.TestCase):
             ],
         )
 
-    def test_failed_gatt_write_clears_pending_without_retry(self) -> None:
+    def test_failed_gatt_write_preserves_pending_identity_for_retry(self) -> None:
         store = self.make_store()
         command = store.handle_report(
             candidate(MAC_A, 1.0, bid="12ab34cd", cid=41, state="in")
@@ -344,7 +463,10 @@ class DeanContractTests(unittest.TestCase):
             1.1,
         )
 
-        self.assertEqual(store.home_snapshot()["pending"], [])
+        pending = store.home_snapshot()["pending"]
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["rid"], "11")
+        self.assertEqual(pending[0]["status"], "CANDIDATE_RECEIVED")
         self.assertIn(
             "inout_confirm_write_failed",
             [record.kind for record in store.drain_records()],

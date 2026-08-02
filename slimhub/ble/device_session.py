@@ -338,10 +338,7 @@ class DeviceSession:
                     # Preserve a newer desired state if one arrived while the
                     # write was in flight; otherwise retry this idempotent
                     # command after a short backoff.
-                    if (
-                        not command.command.startswith("inout_confirm,")
-                        and key not in self._pending_commands
-                    ):
+                    if key not in self._pending_commands:
                         self._pending_commands[key] = command
                         await self._command_queue.put(key)
                 if command_failure_event is not None:
