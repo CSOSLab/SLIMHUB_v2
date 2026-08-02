@@ -5,6 +5,7 @@ import csv
 import json
 import logging
 import os
+import tempfile
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -24,7 +25,6 @@ from slimhub.events import (
     ReportEvent,
     StructuredEvent,
 )
-from slimhub.logging.sound_schema import resolve_sound_schema
 from slimhub.protocol.nus import normalize_mac
 
 
@@ -43,6 +43,8 @@ CANONICAL_SOUND_LABELS = (
     "microwave",
     "appliances",
     "snoring",
+    "gas_oven",
+    "reserved",
 )
 BASE_CSV_FIELDS = [
     "time",
@@ -59,19 +61,6 @@ BASE_CSV_FIELDS = [
 CSV_FIELDS = [*BASE_CSV_FIELDS, *CANONICAL_SOUND_LABELS]
 LEGACY_CSV_FIELDS = CSV_FIELDS
 SEOUL = ZoneInfo("Asia/Seoul")
-LOCATION_SOUND_PROFILES = {
-    "ENTRY": "living_v1",
-    "LIVING": "living_v1",
-    "BEDROOM": "living_v1",
-    "KITCHEN": "kitchen_v1",
-    "TOILET": "toilet_v1",
-}
-GAS_OVEN_CONTRACT_WARNING = (
-    "gas_oven is absent from the deployed DEAN catalog and ELSE model; "
-    "a model manifest and explicit schema migration are required before adding it"
-)
-_GAS_OVEN_WARNING_EMITTED = False
-
 USD_STATUS_FIELDS = (
     "batt_mv",
     "batt_v",
@@ -109,11 +98,7 @@ class RawDataLogger:
         audit_mode: str | None = None,
         queue_size: int = 4096,
     ) -> None:
-        global _GAS_OVEN_WARNING_EMITTED
         self.paths = paths
-        if not _GAS_OVEN_WARNING_EMITTED:
-            logging.getLogger(__name__).warning(GAS_OVEN_CONTRACT_WARNING)
-            _GAS_OVEN_WARNING_EMITTED = True
         selected_audit_mode = (
             audit_mode
             if audit_mode is not None
@@ -271,7 +256,7 @@ class RawDataLogger:
                     location,
                     producer,
                 )
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             self.health["write_errors"] += 1
             logging.exception(
                 "RAWDATA write failed mac=%s location=%s", event.mac, location
@@ -420,7 +405,7 @@ class RawDataLogger:
         lock = self._lock_for(path)
         with lock:
             path.parent.mkdir(parents=True, exist_ok=True)
-            self._rotate_incompatible_header(path, CSV_FIELDS)
+            self._migrate_incompatible_header(path, CSV_FIELDS)
             needs_header = not path.exists() or path.stat().st_size == 0
             row = self._row_for(event, location=location, producer=producer)
             if set(row) != set(CSV_FIELDS):
@@ -445,6 +430,8 @@ class RawDataLogger:
     @staticmethod
     def _producer_for(event: RawDataEvent) -> str | None:
         packet = event.packet
+        if packet.flag_human_presence == 1 and packet.detected not in {10, 20}:
+            return None
         enabled = [
             name
             for name, flag in (
@@ -494,7 +481,7 @@ class RawDataLogger:
             )
         elif producer == "SOUND":
             row["SOUND"] = 1
-            for label, score in self._sound_scores(event, location):
+            for label, score in self._sound_scores(event):
                 row[label] = (score + 128) / 256
         else:
             raise ValueError(f"unknown RAWDATA producer: {producer}")
@@ -503,32 +490,8 @@ class RawDataLogger:
     def _sound_scores(
         self,
         event: RawDataEvent,
-        location: str,
     ) -> list[tuple[str, int]]:
-        packet = event.packet
-        if event.sound_semantic_ready is False:
-            return []
-        if event.sound_raw_schema == 2:
-            return list(
-                zip(CANONICAL_SOUND_LABELS, packet.sound[: len(CANONICAL_SOUND_LABELS)])
-            )
-
-        selector = (
-            event.sound_profile
-            or event.sound_schema_version
-            or LOCATION_SOUND_PROFILES[location]
-        )
-        try:
-            schema = resolve_sound_schema(selector, event.sound_class_count)
-        except ValueError as exc:
-            logging.warning(
-                "SOUND scores zero-filled mac=%s location=%s reason=%s",
-                event.mac,
-                location,
-                exc,
-            )
-            return []
-        return list(zip(schema.labels, packet.sound[: schema.class_count]))
+        return list(zip(CANONICAL_SOUND_LABELS, event.packet.sound))
 
     async def _append_text(self, path: Path, text: str) -> None:
         try:
@@ -553,16 +516,68 @@ class RawDataLogger:
             return self._path_locks.setdefault(path, threading.Lock())
 
     @staticmethod
-    def _rotate_incompatible_header(path: Path, fieldnames: list[str]) -> None:
+    def _migrate_incompatible_header(path: Path, fieldnames: list[str]) -> None:
         if not path.exists() or path.stat().st_size == 0:
             return
-        with path.open("r", encoding="utf-8", newline="") as f:
-            existing_header = f.readline().rstrip("\r\n")
-        if existing_header == ",".join(fieldnames):
+        with path.open("r", encoding="utf-8", newline="") as stream:
+            rows = list(csv.reader(stream))
+        if not rows:
             return
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
-        rotated = path.with_name(f"{path.stem}.legacy-{timestamp}{path.suffix}")
-        path.replace(rotated)
+        if rows[0] == fieldnames:
+            return
+
+        source_fields = [
+            "flushing_end" if name == "flush_end" else name
+            for name in rows[0]
+        ]
+        if len(source_fields) != len(set(source_fields)):
+            raise ValueError("legacy RAWDATA header contains duplicate columns")
+        if "time" not in source_fields:
+            raise ValueError("legacy RAWDATA header is missing time")
+
+        sound_fields = set(CANONICAL_SOUND_LABELS)
+        migrated_rows: list[list[object]] = []
+        for values in rows[1:]:
+            source = {
+                name: values[index]
+                for index, name in enumerate(source_fields)
+                if index < len(values)
+            }
+            migrated_rows.append(
+                [
+                    source.get(
+                        name,
+                        0.0 if name in sound_fields else 0,
+                    )
+                    for name in fieldnames
+                ]
+            )
+
+        temporary_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                newline="",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as stream:
+                temporary_name = stream.name
+                writer = csv.writer(stream, lineterminator="\n")
+                writer.writerow(fieldnames)
+                writer.writerows(migrated_rows)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_name, path)
+        except Exception:
+            if temporary_name is not None:
+                try:
+                    Path(temporary_name).unlink()
+                except FileNotFoundError:
+                    pass
+            raise
 
     def _alert_line_for(self, event: AlertEvent) -> str:
         timestamp = datetime.fromtimestamp(event.timestamp, SEOUL)

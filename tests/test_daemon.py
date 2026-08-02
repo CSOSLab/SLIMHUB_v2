@@ -794,7 +794,7 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(invalid["reason"], "invalid_debug_value")
             self.assertEqual(invalid["declared_length"], invalid["actual_length"])
 
-    async def test_legacy_detected_10_does_not_assign_demo_token(self) -> None:
+    async def test_raw10_handoff_sends_exit_only_to_previous_node(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
             entry = FakeSession("AA:BB:CC:DD:EE:01")
@@ -807,8 +807,15 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             await daemon.handle_frame(entry.address, raw_frame(entry.address, detected=10))
             await daemon.handle_frame(living.address, raw_frame(living.address, detected=10))
 
-            self.assertEqual(entry.commands, [])
+            self.assertEqual(
+                [(command.address, command.command) for command in entry.commands],
+                [(entry.address, "exit")],
+            )
             self.assertEqual(living.commands, [])
+            self.assertEqual(
+                daemon.estimator.snapshot()["active_address"],
+                living.address,
+            )
 
     async def test_legacy_detected_20_does_not_assign_demo_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1240,7 +1247,10 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
 
             await daemon.flush_report_reorder_buffer()
 
-            self.assertEqual(a.commands, [])
+            self.assertEqual(
+                [(command.address, command.command) for command in a.commands],
+                [(a.address, "exit")],
+            )
             self.assertEqual(b.commands, [])
             self.assertEqual(
                 daemon.estimator.snapshot()["confirmed_occupants"],

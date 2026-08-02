@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from slimhub.events import RawDataEvent, ReportEvent, UnitspaceSignalEvent
 from slimhub.protocol.nus import RawDataPacket, ReportPacket
@@ -65,14 +68,16 @@ def inout_report(
 
 
 class UnitspaceTests(unittest.TestCase):
-    def test_raw10_and_legacy_sidecar_never_assign_demo_occupancy(self) -> None:
+    def test_first_raw10_assigns_active_without_echo_command(self) -> None:
         estimator = SimpleUnitspaceEstimator()
+        address = "AA:BB:CC:DD:EE:01"
 
-        first = estimator.handle(make_event("AA:BB:CC:DD:EE:01", "ENTRY", 10.0))
-        sidecar = estimator.handle_report(inout_report("AA:BB:CC:DD:EE:01"))
+        first = estimator.handle(make_event(address, "ENTRY", 10.0))
+        sidecar = estimator.handle_report(inout_report(address))
 
         self.assertEqual(first, [])
         self.assertEqual(sidecar, [])
+        self.assertEqual(estimator.snapshot()["active_address"], address)
 
     def test_lost_sidecar_raw10_falls_back_once_and_late_sidecar_is_not_movement(self) -> None:
         estimator = SimpleUnitspaceEstimator()
@@ -92,7 +97,10 @@ class UnitspaceTests(unittest.TestCase):
         commands = estimator.handle(make_event("AA:BB:CC:DD:EE:01", "ENTRY", 10.2))
 
         self.assertEqual(commands, [])
-        self.assertIsNone(estimator.snapshot()["desired_address"])
+        self.assertEqual(
+            estimator.snapshot()["desired_address"],
+            "AA:BB:CC:DD:EE:01",
+        )
 
     def test_new_candidate_enters_new_node_then_exits_previous(self) -> None:
         estimator = SimpleUnitspaceEstimator()
@@ -108,8 +116,14 @@ class UnitspaceTests(unittest.TestCase):
 
         commands = estimator.handle(make_event("AA:BB:CC:DD:EE:02", "LIVING", 12.0))
 
-        self.assertEqual(commands, [])
-        self.assertIsNone(estimator.snapshot()["desired_address"])
+        self.assertEqual(
+            [(command.address, command.command) for command in commands],
+            [("AA:BB:CC:DD:EE:01", "exit")],
+        )
+        self.assertEqual(
+            estimator.snapshot()["desired_address"],
+            "AA:BB:CC:DD:EE:02",
+        )
 
     def test_raw20_exits_only_the_current_desired_node(self) -> None:
         estimator = SimpleUnitspaceEstimator()
@@ -140,8 +154,102 @@ class UnitspaceTests(unittest.TestCase):
         )
 
         self.assertEqual(commands, [])
-        self.assertIsNone(estimator.snapshot()["desired_address"])
-        self.assertIsNone(estimator.snapshot()["last_location"])
+        self.assertEqual(estimator.snapshot()["desired_address"], b)
+        self.assertEqual(estimator.snapshot()["last_location"], "LIVING")
+
+    def test_one_hour_expiry_and_early_raw20_cancellation(self) -> None:
+        estimator = SimpleUnitspaceEstimator()
+        address = "AA:BB:CC:DD:EE:01"
+        estimator.handle(make_event(address, "ENTRY", 100.0))
+
+        self.assertEqual(estimator.expire(3699.0), [])
+        commands = estimator.expire(3700.0)
+
+        self.assertEqual(
+            [(command.address, command.command) for command in commands],
+            [(address, "exit")],
+        )
+        self.assertEqual(estimator.expire(3700.0), [])
+
+        cancelled = SimpleUnitspaceEstimator()
+        cancelled.handle(make_event(address, "ENTRY", 100.0))
+        cancelled.handle(make_event(address, "ENTRY", 200.0, detected=20))
+        self.assertEqual(cancelled.expire(3700.0), [])
+
+    def test_changed_zero_legacy_exit_ack_is_authoritative(self) -> None:
+        estimator = SimpleUnitspaceEstimator()
+        a = "AA:BB:CC:DD:EE:01"
+        b = "AA:BB:CC:DD:EE:02"
+        estimator.handle(make_event(a, "ENTRY", 10.0))
+        estimator.handle(make_event(b, "LIVING", 11.0))
+        message = (
+            "src=INOUT,event=CONFIRM_ACK,state=out,source=slimhub,"
+            "applied=1,changed=0,"
+            "reason=already_applied,legacy=1"
+        )
+        ack = ReportEvent(
+            timestamp=12.0,
+            mac=a,
+            source_address=a,
+            location="ENTRY",
+            packet=ReportPacket(
+                message,
+                dict(field.split("=", 1) for field in message.split(",")),
+            ),
+            payload=message.encode(),
+        )
+
+        self.assertEqual(estimator.handle_report(ack), [])
+        self.assertIsNone(estimator.snapshot()["pending_exit"])
+        self.assertEqual(estimator.snapshot()["active_address"], b)
+
+    def test_restart_restores_active_node_and_remaining_deadline(self) -> None:
+        address = "AA:BB:CC:DD:EE:01"
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "occupancy.json"
+            first = SimpleUnitspaceEstimator(
+                state_path,
+                monotonic_clock=lambda: 100.0,
+                wall_clock=lambda: 1_000.0,
+            )
+            first.handle(
+                replace(
+                    make_event(address, "ENTRY", 1_000.0),
+                    receipt_timestamp=1_000.0,
+                    monotonic_timestamp=100.0,
+                )
+            )
+
+            restored = SimpleUnitspaceEstimator(
+                state_path,
+                monotonic_clock=lambda: 200.0,
+                wall_clock=lambda: 1_100.0,
+            )
+
+            self.assertEqual(restored.snapshot()["active_address"], address)
+            self.assertEqual(restored.expire(3_699.0), [])
+            self.assertEqual(
+                [(item.address, item.command) for item in restored.expire(3_700.0)],
+                [(address, "exit")],
+            )
+
+    def test_rapid_three_node_handoff_keeps_exit_transactions_per_mac(self) -> None:
+        estimator = SimpleUnitspaceEstimator()
+        a = "AA:BB:CC:DD:EE:01"
+        b = "AA:BB:CC:DD:EE:02"
+        c = "AA:BB:CC:DD:EE:03"
+        estimator.handle(make_event(a, "ENTRY", 10.0))
+
+        first = estimator.handle(make_event(b, "LIVING", 11.0))
+        second = estimator.handle(make_event(c, "BEDROOM", 12.0))
+
+        self.assertEqual([(item.address, item.command) for item in first], [(a, "exit")])
+        self.assertEqual([(item.address, item.command) for item in second], [(b, "exit")])
+        self.assertEqual(
+            set(estimator.snapshot()["pending_exits"]),
+            {a, b},
+        )
+        self.assertEqual(estimator.snapshot()["active_address"], c)
 
     def test_d0_d1_transitions_set_confirmed_shadow_without_feedback_commands(self) -> None:
         estimator = SimpleUnitspaceEstimator()

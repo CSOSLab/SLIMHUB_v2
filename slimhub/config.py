@@ -86,6 +86,11 @@ class AppPaths:
         return self.programdata_dir / "dean_node_state.json"
 
     @property
+    def pir_occupancy_state_path(self) -> Path:
+        """Restart-safe PIR-only active Node and expiry metadata."""
+        return self.programdata_dir / "pir_occupancy_state.json"
+
+    @property
     def sound_inference_db_path(self) -> Path:
         """Versioned DEAN Node sound inference and catalog database."""
         return self.programdata_dir / "sound_inference.sqlite3"
@@ -97,8 +102,8 @@ class AppPaths:
 
     @property
     def display_dir(self) -> Path:
-        """Daily display archives, compatible with the legacy data/display layout."""
-        return self.data_dir / "display"
+        """Daily operator-facing display archives."""
+        return self.programdata_dir / "display"
 
     @property
     def db_sync_dir(self) -> Path:

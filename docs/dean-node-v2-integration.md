@@ -54,13 +54,12 @@ CAPTURE_COMPLETE. `sound status` and `sound stop` remain available.
 | 8 | watering_low | appliances | — |
 | 9 | watering_high | — | — |
 
-Never interpret an index without the same Node's profile/location,
-class_count, semantic flag, and model identifier. Every accepted room writes
-the same 24-column home-wide union CSV. Firmware-confirmed `raw=2` uses the
-common `home_semantic_v1` slots directly; profile tensors are mapped by label
-into that union and unavailable labels are written as `0.0`. The deployed
-catalog has no `gas_oven`; adding it requires a model manifest and an explicit
-schema migration.
+The table above applies to typed model inference metadata. The 33-byte
+RAWDATA packet has a separate fixed 16-slot wire mapping that never changes by
+location/model: `background,hitting,speech_tv,air_appliances,brushing,peeing,`
+`flushing,flushing_end,watering_low,watering_high,cooking,microwave,appliances,`
+`snoring,gas_oven,reserved`. Every accepted room writes the same 26-column raw
+CSV and maps all 16 slots directly.
 
 Strict legacy JSON `REPORT` objects use `type=DEBUG` or `type=INFERENCE` and
 are the only source for `display/YYYY-MM-DD.txt` and per-node `debugstr`.
@@ -73,7 +72,9 @@ With two physical Nodes, verify:
 
 - command frame target MAC equals each Node's actual source MAC;
 - identical bid/cid/rid values on two Nodes do not collide;
-- PIR `detected=10|20` never acts as a Node-local occupancy decision;
+- PIR-only `detected=10` makes its source active without an ENTER echo;
+- a later Node's `detected=10` sends only `exit` to the previous active Node;
+- PIR-only `detected=20` clears its Node without an EXIT echo;
 - each confirmation maps candidate `boot_id/event_seq/signal` to
   `bid/cid/state`;
 - a new Node ENTER candidate sends `exit` to the previous occupied Node;

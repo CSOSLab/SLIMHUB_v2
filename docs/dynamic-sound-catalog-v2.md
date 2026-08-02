@@ -39,12 +39,11 @@ ineligible.
 ## Legacy coexistence
 
 The 33-byte RAWDATA packet remains telemetry and never creates a v2 inference.
-Slots from `raw=2` use the common `home_semantic_v1` order; declared
-toilet/kitchen/living profile tensors are mapped by semantic label. Both paths
-write the same 24-column union header for every accepted room, with unavailable
-labels as `0.0`; reserved raw slots are ignored. A 17–20 class REPORT remains
-complete without an adjacent RAWDATA packet. `gas_oven` is not in the deployed
-catalog and must not be inferred by renaming `cooking`.
+Its 16 signed-int8 slots use the fixed Node wire order and write the same
+26-column raw header for every accepted room, including `gas_oven` and
+`reserved` as slots 14 and 15. This direct raw mapping is independent of the
+typed toilet/kitchen/living model tensor catalog. A 17–20 class REPORT remains
+complete without an adjacent RAWDATA packet.
 
 `EVENT/SOUND` is a Node-extracted semantic run and stays on the multimodal path.
 It is not merged with, or counted as, the window-level `SOUND/INFERENCE`.

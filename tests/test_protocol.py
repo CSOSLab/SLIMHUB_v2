@@ -299,6 +299,25 @@ class ProtocolTests(unittest.TestCase):
                 ).parsed
                 self.assertEqual(packet.detected, detected)
 
+    def test_rawdata_rejects_legacy_detected_one(self) -> None:
+        payload = struct.pack(
+            "<BB7HB16b",
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            *([0] * 16),
+        )
+
+        with self.assertRaisesRegex(PacketParseError, "invalid observation"):
+            parse_frame(build_frame("AA:BB:CC:DD:EE:FF", "RAWDATA", payload))
+
     def test_alert_frame_parses_text(self) -> None:
         frame = parse_frame(build_frame("AA:BB:CC:DD:EE:FF", "ALERT", b"ready"))
 

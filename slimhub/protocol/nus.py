@@ -595,7 +595,7 @@ def parse_rawdata(payload: bytes) -> RawDataPacket:
         and accuracy == 0
     )
     if flag_human_presence == 1 and (
-        detected not in {0, 1, 10, 20}
+        detected not in {10, 20}
         or not environment_values_are_zero
         or any(value != 0 for value in sound)
     ):

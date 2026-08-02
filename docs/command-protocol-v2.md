@@ -1,7 +1,7 @@
 # DEAN Node v2 command protocol
 
-This integration follows the DEAN Node v2 home-wide token demo contract.
-SLIMHUB is the only occupancy authority.
+This integration supports both the current PIR-only DEAN Node v2 behavior and
+the candidate-correlated PIR+RADAR compatibility path.
 
 ## NUS framing
 
@@ -41,9 +41,16 @@ expires pending confirmation transactions for the previous boot.
 
 ## Occupancy authority
 
-PIR RAWDATA (`detected=10|20`) is candidate evidence and never changes Node
-occupancy by itself. The typed ENTER/EXIT sidecar supplies the candidate
-identity used by Central:
+For PIR-only firmware, RAWDATA `detected=10` immediately makes that source the
+active Node in SLIMHUB. Central sends neither `enter` nor `inout_confirm` back
+to the source. If A was active and B sends `detected=10`, Central moves active
+state to B and sends only `exit` to A. `detected=20` clears that Node without
+an EXIT echo. A monotonic one-hour deadline sends one `exit` to the still
+active Node; restart restores the active Node and remaining deadline when
+possible.
+
+The typed ENTER/EXIT sidecar remains a separate PIR+RADAR compatibility path.
+It supplies the candidate identity used by Central:
 
 ```text
 REPORT boot_id -> COMMAND bid
@@ -69,10 +76,11 @@ the ACK was lost. A transport write retry also preserves that identity.
 `CONFIRM_ERROR` is terminal.
 Reusing a successful rid for a different bid/cid/state returns terminal
 `request_id_conflict`.
-`enter` and `inout_sync` are rejected. `exit` is reserved for authoritative
-multi-node handoff: when A owns the home token and B supplies a typed ENTER
-candidate, Central sends `exit` to A without inventing a candidate-correlated
-OUT transaction. A responds with `rid=00000000,state=out,legacy=1`.
+`enter` and `inout_sync` are rejected. `exit` is used for PIR-only cross-node
+handoff/expiry and for authoritative typed multi-node handoff. A responds with
+`rid=00000000,state=out,legacy=1`. Both
+`changed=1,reason=applied` and
+`changed=0,reason=already_applied` are authoritative successes.
 
 For `changed=1,reason=applied`, Central waits for both A's typed
 `EXIT_SYNC/D1` boundary and the durable strict DEBUG EXIT display/debugstr

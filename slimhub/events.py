@@ -23,6 +23,7 @@ class RawDataEvent:
     sound_profile: str | None = None
     sound_model: str | None = None
     sound_raw_schema: int | None = None
+    monotonic_timestamp: float | None = None
 
 
 @dataclass(frozen=True)

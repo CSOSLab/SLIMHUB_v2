@@ -403,7 +403,7 @@ class LegacyReportTests(unittest.IsolatedAsyncioTestCase):
     async def test_toilet_and_else_tensors_map_to_union_columns(self) -> None:
         cases = (
             ("TOILET", "toilet_v1", 10, 4, "brushing"),
-            ("KITCHEN", "kitchen_v1", 9, 4, "cooking"),
+            ("KITCHEN", "kitchen_v1", 9, 10, "cooking"),
         )
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = AppPaths.from_base(tmpdir)
@@ -433,7 +433,7 @@ class LegacyReportTests(unittest.IsolatedAsyncioTestCase):
                     reader = csv.DictReader(stream)
                     row = next(reader)
                 self.assertEqual(reader.fieldnames, CSV_FIELDS)
-                self.assertEqual(len(row), 24)
+                self.assertEqual(len(row), 26)
                 self.assertGreater(float(row[label]), 0.9)
                 if location == "TOILET":
                     self.assertEqual(float(row["cooking"]), 0)

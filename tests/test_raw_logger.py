@@ -86,7 +86,7 @@ class RawLoggerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("watering_high", header)
             self.assertIn("microwave", header)
             self.assertIn("cooking", header)
-            self.assertEqual(len(header.split(",")), 24)
+            self.assertEqual(len(header.split(",")), 26)
             # An int8 zero is valid inside a declared 10-class tensor.
             self.assertIn(",0.5,", f",{row},")
 
@@ -124,6 +124,8 @@ class RawLoggerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(float(row["flushing"]), (96 + 128) / 256)
             self.assertEqual(float(row["cooking"]), 0.0)
             self.assertEqual(float(row["snoring"]), 0.0)
+            self.assertEqual(float(row["gas_oven"]), (127 + 128) / 256)
+            self.assertEqual(float(row["reserved"]), (127 + 128) / 256)
 
     async def test_raw_schema2_kitchen_tensor_results_are_in_slots_10_and_11(
         self,
@@ -162,7 +164,7 @@ class RawLoggerTests(unittest.IsolatedAsyncioTestCase):
                 row = next(reader)
             self.assertEqual(float(row["cooking"]), (32 + 128) / 256)
             self.assertEqual(float(row["microwave"]), (96 + 128) / 256)
-            self.assertNotIn("reserved", ",".join(reader.fieldnames or []))
+            self.assertIn("reserved", ",".join(reader.fieldnames or []))
             self.assertEqual(len(reader.fieldnames or []), len(CSV_FIELDS))
             self.assertEqual(set(CANONICAL_SOUND_LABELS), set(CSV_FIELDS[10:]))
 
@@ -213,7 +215,7 @@ class RawLoggerTests(unittest.IsolatedAsyncioTestCase):
                     all(float(value) == 0.0 for value in lines[1][10:])
                 )
 
-    async def test_incompatible_flush_end_header_is_rotated_before_append(
+    async def test_24_column_flush_end_header_is_atomically_migrated_before_append(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -228,10 +230,23 @@ class RawLoggerTests(unittest.IsolatedAsyncioTestCase):
                 / "1970-01-01.txt"
             )
             target.parent.mkdir(parents=True)
-            legacy_header = [*CSV_FIELDS]
+            legacy_header = [*CSV_FIELDS[:-2]]
             legacy_header[legacy_header.index("flushing_end")] = "flush_end"
+            legacy_values = [
+                "1970-01-01 00:00:00",
+                "0",
+                "0",
+                "0",
+                "0",
+                "0",
+                "0",
+                "0",
+                "0",
+                "1",
+                *[str(index / 10) for index in range(14)],
+            ]
             target.write_text(
-                ",".join(legacy_header) + "\nlegacy,row\n",
+                ",".join(legacy_header) + "\n" + ",".join(legacy_values) + "\n",
                 encoding="utf-8",
             )
             event = RawDataEvent(
@@ -258,13 +273,14 @@ class RawLoggerTests(unittest.IsolatedAsyncioTestCase):
 
             await RawDataLogger(paths).write_event(event)
 
-            rotated = list(target.parent.glob("1970-01-01.legacy-*.txt"))
-            self.assertEqual(len(rotated), 1)
-            self.assertIn("legacy,row", rotated[0].read_text(encoding="utf-8"))
-            self.assertEqual(
-                target.read_text(encoding="utf-8").splitlines()[0],
-                ",".join(CSV_FIELDS),
-            )
+            self.assertFalse(list(target.parent.glob("1970-01-01.legacy-*.txt")))
+            with target.open(encoding="utf-8", newline="") as stream:
+                rows = list(csv.reader(stream))
+            self.assertEqual(rows[0], CSV_FIELDS)
+            self.assertEqual(len(rows), 3)
+            self.assertTrue(all(len(row) == 26 for row in rows))
+            self.assertEqual(rows[1][CSV_FIELDS.index("flushing_end")], "0.7")
+            self.assertEqual(rows[1][-2:], ["0.0", "0.0"])
 
     async def test_profile_tensor_writes_union_without_raw_schema2(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -432,7 +448,7 @@ class RawLoggerTests(unittest.IsolatedAsyncioTestCase):
             logger = RawDataLogger(paths, audit_mode="minimal")
             packet = RawDataPacket(
                 flag_human_presence=1,
-                detected=1,
+                detected=10,
                 flag_env=0,
                 temperature_c=0.0,
                 humidity=0,

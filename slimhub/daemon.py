@@ -118,7 +118,7 @@ class SlimHubDaemon:
         self.raw_logger = RawDataLogger(paths)
         self.display_writer = DisplayWriter(paths)
         self.legacy_report_writer = LegacyReportWriter(paths)
-        self.estimator = SimpleUnitspaceEstimator()
+        self.estimator = SimpleUnitspaceEstimator(paths.pir_occupancy_state_path)
         self.multimodal = MultimodalReportStore(
             DeploymentManifestStore(paths.deployment_manifest_path)
         )
@@ -453,6 +453,7 @@ class SlimHubDaemon:
             config = self.config_store.load(frame.mac)
             self.config_store.save(config)
             timestamp = time.time()
+            monotonic_timestamp = time.monotonic()
             sound_schema_version, sound_class_count = self._sound_schemas.get(
                 normalize_mac(frame.mac), (None, None)
             )
@@ -486,24 +487,19 @@ class SlimHubDaemon:
                 sound_profile=node_state.profile,
                 sound_model=node_state.model,
                 sound_raw_schema=node_state.raw_schema,
+                monotonic_timestamp=monotonic_timestamp,
             )
             self.power_shadow.update_rawdata(frame.mac, frame.parsed, timestamp)
             contract_commands = self.dean_contract.handle_raw(raw_event)
             await self.raw_logger.log(raw_event)
-            self.estimator.handle(raw_event)
-            sent_commands = await self._send_unitspace_commands(contract_commands)
+            estimator_commands = self.estimator.handle(raw_event)
+            sent_commands = await self._send_unitspace_commands(
+                [*contract_commands, *estimator_commands]
+            )
             if frame.parsed.flag_sound == 1:
                 node = self.dean_contract.node_state(frame.mac)
                 class_count = node.class_count
-                scores = (
-                    list(frame.parsed.sound[:14])
-                    if node.raw_schema == 2
-                    else (
-                        list(frame.parsed.sound[:class_count])
-                        if class_count is not None and 1 <= class_count <= 16
-                        else []
-                    )
-                )
+                scores = list(frame.parsed.sound)
                 await self.raw_logger.log_structured(
                     StructuredEvent(
                         timestamp=timestamp,
@@ -524,22 +520,6 @@ class SlimHubDaemon:
                         },
                     )
                 )
-                if node.raw_schema != 2:
-                    await self.raw_logger.log_structured(
-                        StructuredEvent(
-                            timestamp=timestamp,
-                            kind="sound_raw_schema_unconfirmed",
-                            mac=frame.mac,
-                            data={
-                                "reason": (
-                                    "profile tensor mapped into the 24-column "
-                                    "home union; unknown semantics are zero-filled"
-                                ),
-                                "raw_schema": node.raw_schema,
-                                "location": event_location,
-                            },
-                        )
-                    )
             await self._log_estimator_records()
             await self._log_contract_records()
             self._log_commands(sent_commands)
@@ -785,6 +765,12 @@ class SlimHubDaemon:
             error,
             timestamp,
         )
+        self.estimator.handle_command_write_result(
+            command,
+            succeeded,
+            error,
+            time.monotonic(),
+        )
         await self.raw_logger.log_structured(
             StructuredEvent(
                 timestamp=timestamp,
@@ -829,8 +815,10 @@ class SlimHubDaemon:
             commands.extend(
                 self.dean_contract.expire_occupancy(timestamp)
             )
+            commands.extend(self.estimator.expire(time.monotonic()))
             sent = await self._send_unitspace_commands(commands)
             self._log_commands(sent)
+            await self._log_estimator_records()
             await self._log_contract_records()
             await self._wait_or_stop(1.0)
 

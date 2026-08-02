@@ -85,7 +85,7 @@ tail -F data/*/*/*/inference/debugstr/$(date +%F).txt
 ```
 
 The daily, legacy-compatible display archive is
-`data/display/YYYY-MM-DD.txt`.
+`programdata/display/YYYY-MM-DD.txt`.
 
 ### Optional: capture labeled sound PCM
 

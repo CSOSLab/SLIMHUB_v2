@@ -163,7 +163,7 @@ RMS-gated start ETA는 firmware ARM timeout을 포함한 상한값입니다. 명
 ACK, timeout, baseline은 display와 기본 audit JSONL에 표시하지 않습니다.
 동일한 IN/OUT 및 inference 원문 JSON은 node별
 `inference/debugstr/YYYY-MM-DD.txt`에 저장되며, 날짜별 평문 archive는
-`data/display/YYYY-MM-DD.txt`에도 같은 내용으로 남습니다. daemon 시작 시 기존
+`programdata/display/YYYY-MM-DD.txt`에도 같은 내용으로 남습니다. daemon 시작 시 기존
 `programdata/display.txt`와 당일 archive의 ENV/SOUND 줄도 제거합니다.
 
 현재 배포된 Node v2처럼 `src=ADL` final report를 보내지 않는 image에서는 과거
@@ -263,9 +263,18 @@ header/payload/CRLF 분할과 연결된 frame stream도 처리합니다. `inout_
 
 ### DEAN_Node_v2 PIR 및 home-wide occupancy token
 
-PIR RAWDATA의 `detected=10|20`은 candidate 보조 증거이며 Node 자체의 occupancy를
-바꾸지 않습니다. 같은 candidate의 typed REPORT가 제공하는
-`boot_id/event_seq/signal`로만 confirmation을 만듭니다.
+PIR-only firmware의 RAWDATA `detected=10`은 SLIMHUB가 해당 Node를 현재
+active Node로 즉시 기록하는 authoritative ENTER입니다. 첫 ENTER에는 source
+Node로 `enter`나 `inout_confirm`을 보내지 않습니다. A가 active인 동안 B의
+`detected=10`을 받으면 active를 B로 옮기고 A에만 `exit`을 보냅니다.
+`detected=20`은 해당 Node의 active/timer를 해제하며 source에 `exit`을 echo하지
+않습니다. accepted ENTER의 monotonic 수신 시각부터 1시간이 지나도 같은 Node가
+active이면 그 Node에 `exit`을 보내며, 상태와 남은 deadline은
+`programdata/pir_occupancy_state.json`에서 재시작 후 복구합니다.
+
+PIR+RADAR firmware가 보내는 typed candidate 경로는 별도 호환 경로로 유지합니다.
+typed REPORT의 `boot_id/event_seq/signal`이 있을 때만 아래 correlated
+`inout_confirm`을 만듭니다. PIR-only RAWDATA만으로는 이 명령을 만들지 않습니다.
 
 ```text
 src=INOUT,event=ENTER,signal=enter,code=10,boot_id=12ab34cd,event_seq=41,...
@@ -379,11 +388,12 @@ slimhub-v2 sound catalog --location TOILET
 
 `semantic=unknown`, semantic disabled, config not READY, 또는 Node metadata
 mismatch는 원문 label과 함께 저장하지만 ADL semantic으로 재해석하지 않습니다.
-`raw=2`가 확인된 RAWDATA의 16개 int8 slot은 `home_semantic_v1` 순서이며
-slot 0–13을 모든 room에서 같은 24열 union CSV header로 기록합니다. profile별
-10/9/5-class tensor도 label 기준으로 같은 union에 매핑하며 없는 semantic은 `0.0`,
-reserved slot은 저장하지 않습니다. `gas_oven`은 현재 catalog/model에 없으므로
-`cooking`을 rename하지 않습니다. 상세 계약과 SQLite
+RAWDATA의 16개 int8 slot은 location/model metadata와 무관한 고정 wire
+순서이며 모든 room에서 같은 26열 CSV header로 기록합니다. slot 0–15는
+`background`부터 `reserved`까지 직접 대응하고, slot 14는 `gas_oven`, slot
+15는 `reserved`입니다. typed SOUND inference의 profile별 tensor 의미는 이
+raw wire mapping과 별도로 계속 `(MAC,bid,model,location)` 기준으로 처리합니다.
+상세 계약과 SQLite
 migration은 [dynamic sound catalog v2](docs/dynamic-sound-catalog-v2.md)를
 참고합니다.
 
