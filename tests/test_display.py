@@ -18,6 +18,11 @@ class DisplayWriterTests(unittest.TestCase):
 
             DisplayWriter(paths).ensure()
 
+            self.assertEqual(
+                paths.display_path,
+                paths.programdata_dir / "display.txt",
+            )
+            self.assertEqual(paths.display_dir, paths.data_dir / "display")
             self.assertTrue(paths.display_path.is_file())
             self.assertTrue(paths.display_dir.is_dir())
 

@@ -163,7 +163,7 @@ RMS-gated start ETA는 firmware ARM timeout을 포함한 상한값입니다. 명
 ACK, timeout, baseline은 display와 기본 audit JSONL에 표시하지 않습니다.
 동일한 IN/OUT 및 inference 원문 JSON은 node별
 `inference/debugstr/YYYY-MM-DD.txt`에 저장되며, 날짜별 평문 archive는
-`programdata/display/YYYY-MM-DD.txt`에도 같은 내용으로 남습니다. daemon 시작 시 기존
+`data/display/YYYY-MM-DD.txt`에도 같은 내용으로 남습니다. daemon 시작 시 기존
 `programdata/display.txt`와 당일 archive의 ENV/SOUND 줄도 제거합니다.
 
 현재 배포된 Node v2처럼 `src=ADL` final report를 보내지 않는 image에서는 과거

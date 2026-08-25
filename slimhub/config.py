@@ -103,7 +103,7 @@ class AppPaths:
     @property
     def display_dir(self) -> Path:
         """Daily operator-facing display archives."""
-        return self.programdata_dir / "display"
+        return self.data_dir / "display"
 
     @property
     def db_sync_dir(self) -> Path:
