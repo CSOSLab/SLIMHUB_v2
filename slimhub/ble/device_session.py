@@ -320,7 +320,7 @@ class DeviceSession:
                 continue
             try:
                 frame = build_command_frame(command.address, command.command)
-                if command.command.startswith("inout_confirm,"):
+                if command.command.startswith(("inout_confirm,", "validation_ack,")):
                     self._validate_confirmation_write(client, frame)
                 await client.write_gatt_char(NUS_RX_WRITE_UUID, frame, response=False)
                 await self._notify_command_result(command, True, None)

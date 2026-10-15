@@ -7,6 +7,12 @@ import string
 import struct
 from dataclasses import dataclass
 
+from slimhub.protocol.validation_log import (
+    MAX_LOGDATA_PAYLOAD_LEN,
+    VALIDATION_ACK_PATTERN,
+    decode_payload as decode_logdata_payload,
+)
+
 
 NUS_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 NUS_RX_WRITE_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -39,7 +45,7 @@ MIN_COMMAND_PAYLOAD_LEN = 1
 MAX_COMMAND_PAYLOAD_LEN = 128
 MAX_REPORT_PAYLOAD_LEN = 256
 MAX_FRAME_LEN = 4096
-KNOWN_PACKET_TYPES = {"RAWDATA", "ALERT", "REPORT", "AUDIO", "WAVFILE"}
+KNOWN_PACKET_TYPES = {"RAWDATA", "ALERT", "REPORT", "AUDIO", "WAVFILE", "LOGDATA"}
 NODE_SIMPLE_COMMANDS = {"node_status", "config_get", "config_reload"}
 
 
@@ -87,13 +93,24 @@ class IgnoredPacket:
 
 
 @dataclass(frozen=True)
+class LogDataPacket:
+    """DEAN Node validation LOGDATA (VLE1/VLR1/VLM1/VLG1/VLB1/VLS1)."""
+
+    format: str
+    stream_id: int
+    bundle_id: int
+    value: dict | None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class ParsedFrame:
     mac: str
     mac_bytes: bytes
     packet_type: str
     packet_length: int
     payload: bytes
-    parsed: RawDataPacket | AlertPacket | ReportPacket | IgnoredPacket
+    parsed: RawDataPacket | AlertPacket | ReportPacket | IgnoredPacket | LogDataPacket
 
 
 class FrameAssembler:
@@ -136,6 +153,7 @@ class FrameAssembler:
             if (
                 (packet_type == "RAWDATA" and packet_length != RAWDATA_PAYLOAD_LEN)
                 or (packet_type == "REPORT" and packet_length > MAX_REPORT_PAYLOAD_LEN)
+                or (packet_type == "LOGDATA" and packet_length > MAX_LOGDATA_PAYLOAD_LEN)
             ):
                 mac = ":".join(f"{byte:02X}" for byte in self._buffer[:MAC_LEN])
                 bad_byte = self._buffer.pop(0)
@@ -418,6 +436,8 @@ def validate_command_payload(command: str) -> str:
         return _validate_command_size(normalized)
     if normalized in NODE_SIMPLE_COMMANDS:
         return _validate_command_size(normalized)
+    if VALIDATION_ACK_PATTERN.fullmatch(normalized):
+        return _validate_command_size(normalized)
     if normalized.startswith("time_sync"):
         name, fields = _command_fields(normalized)
         if name != "time_sync" or set(fields) != {"epoch_ms", "tz_min"}:
@@ -638,6 +658,22 @@ def parse_rawdata(payload: bytes) -> RawDataPacket:
     )
 
 
+def parse_logdata(payload: bytes) -> LogDataPacket:
+    """Decode a Node LOGDATA payload. Invalid payloads are returned, not raised,
+    so the frame is logged as evidence and never ACKed."""
+    fmt = payload[:4].decode("ascii", errors="replace")
+    try:
+        value = decode_logdata_payload(payload)
+    except (ValueError, struct.error) as exc:
+        return LogDataPacket(format=fmt, stream_id=0, bundle_id=0, value=None, error=str(exc))
+    return LogDataPacket(
+        format=value.get("format", fmt),
+        stream_id=int(value["stream_id"]),
+        bundle_id=int(value["bundle_id"]),
+        value=value,
+    )
+
+
 def parse_alert(payload: bytes) -> AlertPacket:
     return AlertPacket(message=payload.decode("utf-8", errors="replace"))
 
@@ -765,6 +801,8 @@ def parse_frame(data: bytes) -> ParsedFrame:
         parsed = parse_alert(payload)
     elif packet_type == "REPORT":
         parsed = parse_report(payload)
+    elif packet_type == "LOGDATA":
+        parsed = parse_logdata(payload)
     elif packet_type in {"AUDIO", "WAVFILE"}:
         parsed = IgnoredPacket(packet_type=packet_type, payload_bytes=len(payload))
     else:
@@ -797,6 +835,13 @@ def describe_frame(frame: ParsedFrame) -> str:
         return (
             f"REPORT mac={frame.mac} length={frame.packet_length} "
             f"message={parsed.message!r}"
+        )
+
+    if isinstance(parsed, LogDataPacket):
+        return (
+            f"LOGDATA mac={frame.mac} length={frame.packet_length} format={parsed.format} "
+            f"stream={parsed.stream_id:016x} bundle={parsed.bundle_id}"
+            + (f" error={parsed.error}" if parsed.error else "")
         )
 
     if isinstance(parsed, IgnoredPacket):

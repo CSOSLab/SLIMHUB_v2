@@ -48,6 +48,7 @@ from slimhub.protocol.nus import (
     DEFAULT_DEVICE_NAME,
     AlertPacket,
     IgnoredPacket,
+    LogDataPacket,
     ParsedFrame,
     RawDataPacket,
     ReportPacket,
@@ -55,7 +56,9 @@ from slimhub.protocol.nus import (
     normalize_mac,
     validate_command_payload,
 )
+from slimhub.logging.validation_store import ValidationStore
 from slimhub.power_shadow import ShadowPowerState
+from slimhub.protocol.validation_log import ack_target, build_validation_ack_command
 from slimhub.sound_capture import SoundCaptureStore
 from slimhub.sound_inference import SoundInferenceStore
 from slimhub.singleton import DaemonInstanceLock
@@ -116,6 +119,7 @@ class SlimHubDaemon:
         self.config_store = DeviceConfigStore(paths)
         self.hub_config_store = HubConfigStore(paths)
         self.raw_logger = RawDataLogger(paths)
+        self.validation_store = ValidationStore(paths)
         self.display_writer = DisplayWriter(paths)
         self.legacy_report_writer = LegacyReportWriter(paths)
         self.estimator = SimpleUnitspaceEstimator(paths.pir_occupancy_state_path)
@@ -442,7 +446,9 @@ class SlimHubDaemon:
             await self._handle_legacy_json_frame(source_address, frame)
             return
         await self.registry.register_alias(frame.mac, source_address)
-        if isinstance(frame.parsed, IgnoredPacket):
+        if isinstance(frame.parsed, LogDataPacket):
+            await self._handle_logdata(source_address, frame)
+        elif isinstance(frame.parsed, IgnoredPacket):
             self.logger.debug(
                 "Ignoring migration packet type=%s mac=%s bytes=%d",
                 frame.parsed.packet_type,
@@ -863,6 +869,72 @@ class SlimHubDaemon:
                 )
             )
         return sent_commands
+
+    async def _handle_logdata(self, source_address: str, frame: ParsedFrame) -> None:
+        """Store Node validation LOGDATA durably, then ACK it (Node-defined protocol)."""
+        packet = frame.parsed
+        assert isinstance(packet, LogDataPacket)
+        timestamp = time.time()
+        if packet.error is not None or packet.value is None:
+            self.logger.warning(
+                "LOGDATA rejected mac=%s format=%s error=%s",
+                frame.mac, packet.format, packet.error,
+            )
+            await self.raw_logger.log_structured(
+                StructuredEvent(
+                    timestamp=timestamp,
+                    kind="validation_logdata_rejected",
+                    mac=frame.mac,
+                    data={"format": packet.format, "error": packet.error},
+                )
+            )
+            return
+        try:
+            stored = await asyncio.to_thread(
+                self.validation_store.store, frame.mac, packet, frame.payload, timestamp
+            )
+        except OSError as exc:
+            # No ACK without durable bytes: the Node keeps the data and reports loss.
+            self.logger.error("LOGDATA store failed mac=%s format=%s error=%s",
+                              frame.mac, packet.format, exc)
+            return
+        if packet.format == "VLS1":
+            self.logger.info(
+                "Node %s validation transfer state=%s close=%s pending=%s remaining_s=%s",
+                frame.mac,
+                packet.value.get("state"),
+                packet.value.get("close_reason"),
+                packet.value.get("pending_bundles"),
+                packet.value.get("window_remaining_s"),
+            )
+            await self.raw_logger.log_structured(
+                StructuredEvent(
+                    timestamp=timestamp,
+                    kind="validation_status",
+                    mac=frame.mac,
+                    data={k: v for k, v in packet.value.items() if k != "format"},
+                )
+            )
+        target = ack_target(packet.value)
+        if target is None:
+            return
+        kind, bundle, through = target
+        command = build_validation_ack_command(kind, packet.stream_id, bundle, through)
+        config = self.config_store.load(frame.mac)
+        sent = await self.registry.send_command(
+            CommandEvent(
+                address=normalize_mac(source_address),
+                command=command,
+                location=config.location,
+                canonical_node_id=normalize_mac(frame.mac),
+                created_at=timestamp,
+            )
+        )
+        self.logger.debug(
+            "LOGDATA %s mac=%s stream=%016x bundle=%d stored=%s ack=%s queued=%s",
+            packet.format, frame.mac, packet.stream_id, packet.bundle_id,
+            stored, command, sent,
+        )
 
     async def _initialize_node_session(self, address: str, timestamp: float) -> None:
         """Queue the once-per-link DEAN initialization sequence after notify setup."""

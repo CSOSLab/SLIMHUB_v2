@@ -79,6 +79,14 @@ Replay fixtures:
 - `tests/fixtures/two_node_inout_replay.jsonl`
 - `tests/fixtures/multimodal_adl_replay.jsonl`
 
+## DEAN Node validation LOGDATA (2026-10-15)
+
+- `LOGDATA`를 known packet type으로 추가하고 VLE1/VLR1/VLM1/VLG1/VLB1/VLS1을 해석한다.
+- durable store(`slimhub/logging/validation_store.py`) fsync 뒤 `validation_ack`를 보낸다.
+- 검증: unittest 252개 PASS(신규 7). 연구실 RPI5 daemon으로 실제 Node(90:E5:B1:D1:23:36)
+  연결·REPORT 수신 확인. 재실 이벤트가 없어(빈방 calibration 미완료) 실전 LOGDATA 수신은 미확인.
+- 관찰: 처음 두 연결이 2.0 s 뒤 Node/링크 쪽에서 끊기고 세 번째부터 유지됨(원인 미확정, btmon 필요).
+
 ## Remaining field work
 
 1. Test with at least two physical DEAN Node v2 devices and retain their JSONL deployment logs.

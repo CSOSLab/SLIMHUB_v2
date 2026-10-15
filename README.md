@@ -324,6 +324,27 @@ Node 설정을 덮어쓰지 않습니다.
 [docs/command-protocol-v2.md](docs/command-protocol-v2.md), 운영 절차는
 [docs/dean-node-v2-integration.md](docs/dean-node-v2-integration.md)에 있습니다.
 
+## DEAN Node validation LOGDATA
+
+DEAN Node v2 실증 profile(dean_node_v2 `feature/low-power-esa-battery-validation`)은
+이벤트마다 최대 30분 전송창을 열고 `LOGDATA` frame을 보낸다. 형식은 Node가 정의하며
+해석기는 `slimhub/protocol/validation_log.py`(Node `tools/slimhub_validation.py` 이식)다.
+
+| payload | 내용 | Central ACK |
+|---|---|---|
+| `VLE1` | critical event(IN/OUT/최종 ESA) text | `kind=event,through=<bundle>` |
+| `VLR1` | Node ring의 이용 가능 범위, 손실/drop 수 | 없음 |
+| `VLM1` | immutable metadata chunk | 없음 |
+| `VLG1` | 상세 64 B record 1~3개 | `kind=log,through=<마지막 seq>` |
+| `VLB1` | durable battery record | `kind=battery,bundle=0,through=<마지막 seq>` |
+| `VLS1` | 전송 상태(active/done/aborted, close reason, link 통계) | 없음 |
+
+- daemon은 frame을 `data/validation/<MAC>/<stream>.jsonl`에 append하고 fsync한 **뒤에만**
+  `validation_ack,kind=...,stream=<16hex>,bundle=<n>,through=<n>`를 한 번의 GATT write로 보낸다.
+- 같은 frame 재전송은 key로 중복 저장하지 않는다. 해석 실패 frame은 ACK하지 않고
+  `validation_logdata_rejected`로 남긴다. VLS1은 `validation_status` structured event로 남긴다.
+- Node는 같은 frame에 ACK가 5번 없으면 창을 닫고, advertising은 이벤트당 5분까지만 한다.
+
 ## Multimodal EVENT / ADL reports
 
 `src=EVENT`의 `BASELINE`, `ENV`, `SOUND`와 `src=ADL`의 `PREDETECT`, `POP`,
