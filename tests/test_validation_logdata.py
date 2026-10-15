@@ -101,6 +101,21 @@ class ValidationStoreTest(unittest.TestCase):
             self.assertFalse(reloaded.store(MAC, event, vle1(), 5.0))
 
 
+class RecordKeyTest(unittest.TestCase):
+    """Every ACKed or stored LOGDATA format must produce a stable key."""
+
+    def test_keys_for_all_formats(self):
+        from slimhub.logging.validation_store import record_key
+
+        vlr1 = b"VLR1" + struct.pack("<QIQQQQ", 7, 1, 1, 9, 0, 0)
+        vlm1 = b"VLM1" + struct.pack("<QIIBHH", 7, 1, 3, 1, 4, 0) + b"abcd"
+        keys = [
+            record_key(parse_frame(build_frame(MAC, "LOGDATA", payload)).parsed)
+            for payload in (vle1(), vlr1, vlm1, vlg1(), vls1())
+        ]
+        self.assertEqual(keys, ["event:1", "range:1:1:9:0:0", "meta:3:1:0", "log:1-1", None])
+
+
 class DaemonLogDataTest(unittest.TestCase):
     def _daemon(self, store):
         from slimhub.daemon import SlimHubDaemon

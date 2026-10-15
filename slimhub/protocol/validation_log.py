@@ -156,7 +156,7 @@ def decode_runtime_payload(payload):
         raise ValueError("zero stream")
     result = dict(stream_id=stream, bundle_id=bundle, format=magic.decode("ascii"))
     if magic == b"VLE1":
-        if len(payload) < 30 or not bundle or payload[16] not in (1, 2, 4):
+        if len(payload) < 30 or not bundle or payload[16] not in (1, 2, 4, 8):
             raise ValueError("invalid critical event")
         length = payload[29]
         if length > 220 or len(payload) != 30 + length:

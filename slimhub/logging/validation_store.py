@@ -32,10 +32,10 @@ def record_key(packet: LogDataPacket) -> str | None:
     if fmt == "VLE1":
         return f"event:{packet.bundle_id}"
     if fmt == "VLR1":
-        return (f"range:{packet.bundle_id}:{value[first_seq]}:{value[last_seq]}:"
-                f"{value[unavailable]}:{value[dropped]}")
+        return (f"range:{packet.bundle_id}:{value['first_seq']}:{value['last_seq']}:"
+                f"{value['unavailable']}:{value['dropped']}")
     if fmt == "VLM1":
-        return f"meta:{value[metadata_id]}:{value[kind]}:{value[offset]}"
+        return f"meta:{value['metadata_id']}:{value['kind']}:{value['offset']}"
     if fmt == "VLB1":
         seqs = [r["seq"] for r in value["records"]]
         return f"battery:{seqs[0]}-{seqs[-1]}"
