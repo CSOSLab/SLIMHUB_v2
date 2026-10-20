@@ -468,6 +468,7 @@ def validate_command_payload(command: str) -> str:
             ("KITCHEN", "kitchen_v1"),
             ("LIVING", "living_v1"),
             ("BEDROOM", "living_v1"),
+            ("ENTRY", "living_v1"),
         }
         location = fields["location"].strip().upper()
         if "sound_profile" not in fields:

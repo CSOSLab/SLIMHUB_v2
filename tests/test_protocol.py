@@ -36,6 +36,19 @@ class ProtocolTests(unittest.TestCase):
             b"config_set,location=TOILET",
         )
 
+    def test_entry_config_set_uses_living_profile(self) -> None:
+        # Node firmware accepts ENTRY (living_v1 catalog, no Node ADL candidates).
+        self.assertEqual(
+            self.command_payload("config_set,location=ENTRY"),
+            b"config_set,location=ENTRY",
+        )
+        self.assertEqual(
+            self.command_payload("config_set,location=ENTRY,sound_profile=living_v1"),
+            b"config_set,location=ENTRY,sound_profile=living_v1",
+        )
+        with self.assertRaises(ValueError):
+            self.command_payload("config_set,location=ENTRY,sound_profile=kitchen_v1")
+
     def command_payload(self, command: str) -> bytes:
         frame = build_command_frame("AA:BB:CC:DD:EE:FF", command)
         payload_len = int.from_bytes(frame[14:16], byteorder="little")

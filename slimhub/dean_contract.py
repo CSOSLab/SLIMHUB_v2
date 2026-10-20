@@ -23,6 +23,8 @@ LOCATION_PROFILES: dict[str, tuple[str, int]] = {
     "KITCHEN": ("kitchen_v1", 9),
     "LIVING": ("living_v1", 5),
     "BEDROOM": ("living_v1", 5),
+    # ENTRY (Node firmware 2026-10-20): living_v1 catalog, no Node ADL candidates.
+    "ENTRY": ("living_v1", 5),
 }
 
 
