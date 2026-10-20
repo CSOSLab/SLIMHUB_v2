@@ -46,7 +46,12 @@ MAX_COMMAND_PAYLOAD_LEN = 128
 MAX_REPORT_PAYLOAD_LEN = 256
 MAX_FRAME_LEN = 4096
 KNOWN_PACKET_TYPES = {"RAWDATA", "ALERT", "REPORT", "AUDIO", "WAVFILE", "LOGDATA"}
-NODE_SIMPLE_COMMANDS = {"node_status", "config_get", "config_reload"}
+NODE_SIMPLE_COMMANDS = {
+    "node_status",
+    "config_get",
+    "config_reload",
+    "radar_calibrate",
+}
 
 
 class PacketParseError(ValueError):
@@ -557,7 +562,8 @@ def validate_command_payload(command: str) -> str:
     raise ValueError(
         "command must be one of: record, record:<seconds>, record_stop, "
         "sound_start, sound_bg, sound_auto, sound_stop, sound_status, node_status, "
-        "config_get, config_set, config_reload, time_sync, inout_confirm"
+        "config_get, config_set, config_reload, radar_calibrate, time_sync, "
+        "inout_confirm"
     )
 
 

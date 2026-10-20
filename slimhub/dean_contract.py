@@ -47,6 +47,11 @@ class NodeState:
     last_reason: str | None = None
     connected: bool = False
     fields: dict[str, str] = field(default_factory=dict)
+    # NODE/STATUS setup phase (unconfigured|waiting|calibrating|ready|retry);
+    # None for firmware that does not report it.
+    setup: str | None = None
+    # Latest RADAR/CAL_* REPORT, including the CAL_REQUEST answer.
+    radar_calibration: dict[str, object] | None = None
 
 
 @dataclass
@@ -154,6 +159,22 @@ class DeanContractStore:
             return self._handle_node_status(event)
         if src == "CONFIG" and name in {"STATUS", "APPLIED", "REJECTED"}:
             self._handle_config(event, name)
+            return []
+        if src == "RADAR" and name.startswith("CAL_"):
+            self._handle_radar_calibration(event, name)
+            return []
+        if src == "SETUP":
+            self._record(
+                "node_setup",
+                event.mac,
+                event.timestamp,
+                event=name,
+                fields={
+                    key: value
+                    for key, value in fields.items()
+                    if key not in {"src", "event"}
+                },
+            )
             return []
         if src == "SOUND" and name == "INFERENCE":
             node = self._node(event.mac)
@@ -413,6 +434,8 @@ class DeanContractStore:
         node.source = _text(fields.get("source")) or node.source
         node.timestamp = _text(fields.get("ts")) or node.timestamp
         node.commands = _text(fields.get("commands")) or node.commands
+        setup = _text(fields.get("setup"))
+        node.setup = setup.lower() if setup else None
         node.fields = fields
         occupancy = str(node.occupancy or "").strip().upper()
         if node.authority == SLIMHUB_CONFIRMED:
@@ -433,6 +456,27 @@ class DeanContractStore:
         )
         self._save()
         return []
+
+    def _handle_radar_calibration(self, event: ReportEvent, name: str) -> None:
+        mac = normalize_mac(event.mac)
+        fields = {
+            key: value
+            for key, value in event.packet.fields.items()
+            if key not in {"src", "event"}
+        }
+        self._node(mac).radar_calibration = {
+            "event": name,
+            "fields": fields,
+            "received_at": event.timestamp,
+        }
+        self._record(
+            "node_radar_calibration",
+            mac,
+            event.timestamp,
+            event=name,
+            fields=fields,
+        )
+        self._save()
 
     def _handle_config(self, event: ReportEvent, name: str) -> None:
         mac = normalize_mac(event.mac)

@@ -483,6 +483,36 @@ class RawLoggerTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(next(paths.data_dir.glob("*/*/*/inference/rawdata/*.txt")))
             self.assertFalse((paths.programdata_dir / "reports").exists())
 
+    async def test_minimal_audit_keeps_radar_calibration_and_setup_reports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = AppPaths.from_base(tmpdir)
+            logger = RawDataLogger(paths, audit_mode="minimal")
+            address = "AA:BB:CC:DD:EE:FF"
+            for src, event in (
+                ("RADAR", "CAL_REQUEST"),
+                ("RADAR", "CAL_FAIL"),
+                ("RADAR", "PROBE"),
+                ("SETUP", "CONFIGURED"),
+            ):
+                message = f"src={src},event={event}"
+                await logger.write_report(
+                    ReportEvent(
+                        timestamp=0.0,
+                        mac=address,
+                        source_address=address,
+                        location="undefined",
+                        packet=ReportPacket(message, {"src": src, "event": event}),
+                        payload=message.encode(),
+                    )
+                )
+
+            lines = next((paths.programdata_dir / "reports").glob("*.jsonl")).read_text(
+                encoding="utf-8"
+            )
+            for kept in ("CAL_REQUEST", "CAL_FAIL", "CONFIGURED"):
+                self.assertIn(kept, lines)
+            self.assertNotIn("PROBE", lines)
+
 
 if __name__ == "__main__":
     unittest.main()

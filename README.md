@@ -310,6 +310,7 @@ slimhub-v2 node config get --address AA:BB:CC:DD:EE:FF
 slimhub-v2 node config set --address AA:BB:CC:DD:EE:FF \
   --node-location KITCHEN
 slimhub-v2 node config reload --address AA:BB:CC:DD:EE:FF
+slimhub-v2 node radar-calibrate --address AA:BB:CC:DD:EE:FF
 slimhub-v2 raw tail --address AA:BB:CC:DD:EE:FF --lines 20
 slimhub-v2 unitspace status
 ```
@@ -319,7 +320,14 @@ slimhub-v2 unitspace status
 연결 시에도 Central의 MAC별 JSON location이 다섯 production location 중 하나이면
 NODE/CONFIG status를 비교해 `config_set,location=<LOCATION>`을 한 번만
 전송합니다. IN/capture 중에는 다음 OUT+IDLE까지 미루며 Unknown/undefined는
-Node 설정을 덮어쓰지 않습니다.
+Node 설정을 덮어쓰지 않습니다. Node가 NODE/STATUS `setup=unconfigured`(부팅마다
+SLIMHUB config_set을 받아야 configured가 됨)를 보고하면 location이 같아도
+같은 조건에서 `config_set`을 보냅니다. Central에 location이 없으면 보내지 않고
+`location_sync_awaiting_registration`을 기록하며, Node 연결 중에
+`config set ... location`/`config apply`로 등록하면 `node_status`·`config_get`을
+다시 요청해 재연결 없이 전송합니다. `node radar-calibrate`는 `radar_calibrate`를
+보내고, Node의 RADAR `CAL_REQUEST` 응답은 로그와 `node status`의
+`radar_calibration`에 남습니다.
 전체 wire/correlation 계약은
 [docs/command-protocol-v2.md](docs/command-protocol-v2.md), 운영 절차는
 [docs/dean-node-v2-integration.md](docs/dean-node-v2-integration.md)에 있습니다.

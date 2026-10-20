@@ -14,6 +14,7 @@ from slimhub.protocol.nus import normalize_mac
 
 INVALID_CONFIG_STATES = frozenset({"FILE_NOT_FOUND", "CONFIG_INVALID"})
 SEMANTIC_DISABLED = frozenset({"0", "FALSE", "DISABLED", "NOT_READY"})
+SETUP_UNCONFIGURED = "unconfigured"
 
 
 @dataclass
@@ -25,6 +26,7 @@ class LocationSyncState:
     config_seen: bool = False
     command_sent: bool = False
     deferred: bool = False
+    awaiting_registration: bool = False
     synchronized: bool = False
     terminal_error: bool = False
 
@@ -93,6 +95,7 @@ class LocationSyncCoordinator:
             state.desired_location = desired
             state.command_sent = False
             state.deferred = False
+            state.awaiting_registration = False
             state.synchronized = False
             state.terminal_error = False
 
@@ -163,9 +166,27 @@ class LocationSyncCoordinator:
         event: ReportEvent,
     ) -> CommandEvent | None:
         desired = state.desired_location
+        node_setup = str(node.setup or "").strip().lower()
+        if desired is None:
+            # The Node waits for a SLIMHUB config_set but Central has no
+            # Node-configurable location for it; make that visible once.
+            if (
+                node_setup == SETUP_UNCONFIGURED
+                and state.status_seen
+                and not state.awaiting_registration
+            ):
+                state.awaiting_registration = True
+                self._record(
+                    "location_sync_awaiting_registration",
+                    state.mac,
+                    event.timestamp,
+                    reason="central_location_not_configurable",
+                    node_setup=node.setup,
+                    node_location=node.location,
+                )
+            return None
         if (
-            desired is None
-            or state.command_sent
+            state.command_sent
             or state.synchronized
             or state.terminal_error
             or not state.status_seen
@@ -180,6 +201,7 @@ class LocationSyncCoordinator:
             node_location != desired
             or semantic in SEMANTIC_DISABLED
             or config in INVALID_CONFIG_STATES
+            or node_setup == SETUP_UNCONFIGURED
         )
         if not needs_apply:
             state.synchronized = True

@@ -43,7 +43,9 @@ class LocationSyncTests(unittest.TestCase):
         location: str = "LIVING",
         config: str = "file_not_found",
         semantic: str = "0",
+        setup: str | None = None,
     ) -> ReportEvent:
+        extra = {"setup": setup} if setup is not None else {}
         return report(
             self.mac,
             src="NODE",
@@ -54,6 +56,7 @@ class LocationSyncTests(unittest.TestCase):
             location=location,
             config=config,
             semantic=semantic,
+            **extra,
         )
 
     def config_status(
@@ -291,6 +294,97 @@ class LocationSyncTests(unittest.TestCase):
         for mac in macs[1:]:
             self.assertTrue(sync.snapshot(mac)["command_sent"])
             self.assertFalse(sync.snapshot(mac)["synchronized"])
+
+    def ready_node_status(self, setup: str | None) -> ReportEvent:
+        return self.node_status(
+            location="KITCHEN", config="READY", semantic="1", setup=setup
+        )
+
+    def ready_config_status(self) -> ReportEvent:
+        return self.config_status(location="KITCHEN", config="READY", semantic="1")
+
+    def test_unconfigured_node_gets_config_set_even_when_location_matches(self) -> None:
+        self.sync.handle_connection(self.mac, True, "KITCHEN", 1.0)
+
+        self.assertEqual(self.handle(self.ready_node_status("unconfigured"), "KITCHEN"), [])
+        commands = self.handle(self.ready_config_status(), "KITCHEN")
+
+        self.assertEqual(
+            [command.command for command in commands],
+            ["config_set,location=KITCHEN"],
+        )
+        # Once per connection: later status reports do not repeat it.
+        self.assertEqual(self.handle(self.ready_node_status("unconfigured"), "KITCHEN"), [])
+        self.assertEqual(self.handle(self.ready_config_status(), "KITCHEN"), [])
+
+    def test_unconfigured_config_set_still_waits_for_out_idle(self) -> None:
+        self.sync.handle_connection(self.mac, True, "KITCHEN", 1.0)
+        busy = self.node_status(
+            occupancy="IN",
+            capture="ACTIVE",
+            location="KITCHEN",
+            config="READY",
+            semantic="1",
+            setup="unconfigured",
+        )
+        self.handle(busy, "KITCHEN")
+        self.assertEqual(self.handle(self.ready_config_status(), "KITCHEN"), [])
+        self.assertTrue(self.sync.snapshot(self.mac)["deferred"])
+
+        commands = self.handle(self.ready_node_status("unconfigured"), "KITCHEN")
+
+        self.assertEqual(len(commands), 1)
+
+    def test_configured_or_legacy_setup_values_do_not_force_config_set(self) -> None:
+        for setup in (None, "waiting", "calibrating", "ready", "retry"):
+            with self.subTest(setup=setup):
+                sync = LocationSyncCoordinator()
+                contract = DeanContractStore()
+                sync.handle_connection(self.mac, True, "KITCHEN", 1.0)
+                for event in (self.ready_node_status(setup), self.ready_config_status()):
+                    contract.handle_report(event)
+                    self.assertEqual(
+                        sync.handle_report(
+                            event, contract.node_state(self.mac), "KITCHEN"
+                        ),
+                        [],
+                    )
+                self.assertTrue(sync.snapshot(self.mac)["synchronized"])
+
+    def test_unregistered_central_location_records_node_waiting_once(self) -> None:
+        self.sync.handle_connection(self.mac, True, "undefined", 1.0)
+        self.sync.drain_records()
+
+        for _ in range(2):
+            self.assertEqual(
+                self.handle(self.ready_node_status("unconfigured"), "undefined"), []
+            )
+            self.assertEqual(self.handle(self.ready_config_status(), "undefined"), [])
+
+        waiting = [
+            record
+            for record in self.sync.drain_records()
+            if record.kind == "location_sync_awaiting_registration"
+        ]
+        self.assertEqual(len(waiting), 1)
+        self.assertEqual(waiting[0].data["node_setup"], "unconfigured")
+        self.assertEqual(waiting[0].data["reason"], "central_location_not_configurable")
+
+        # Registering the location later releases the held config_set.
+        commands = self.handle(self.ready_node_status("unconfigured"), "KITCHEN")
+        self.assertEqual(
+            [command.command for command in commands],
+            ["config_set,location=KITCHEN"],
+        )
+
+    def test_unregistered_location_with_configured_node_records_nothing(self) -> None:
+        self.sync.handle_connection(self.mac, True, "undefined", 1.0)
+        self.sync.drain_records()
+
+        self.handle(self.ready_node_status("waiting"), "undefined")
+        self.handle(self.ready_config_status(), "undefined")
+
+        self.assertEqual(self.sync.drain_records(), [])
 
 
 if __name__ == "__main__":

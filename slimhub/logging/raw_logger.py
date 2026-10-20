@@ -659,8 +659,11 @@ class RawDataLogger:
 def _retain_contract_report(event: ReportEvent) -> bool:
     fields = event.packet.fields
     src = fields.get("src", "").strip().upper()
-    if src in {"NODE", "CONFIG", "SOUND"}:
+    if src in {"NODE", "CONFIG", "SOUND", "SETUP"}:
         return True
+    if src == "RADAR":
+        # Calibration lifecycle only; routine RADAR probe/UART debug stays out.
+        return fields.get("event", "").strip().upper().startswith("CAL_")
     if src == "INOUT":
         return (
             fields.get("schema") == "2"

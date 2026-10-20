@@ -306,7 +306,45 @@ class SlimHubDaemon:
             session = await self.registry.get(config.address)
             if session is not None:
                 session.name = config.name or session.name
+                await self.resync_unconfigured_node(config.address)
         return "Config data applied"
+
+    async def resync_unconfigured_node(self, address: object) -> bool:
+        """Re-run location sync for a connected Node still waiting for config_set.
+
+        location_sync only evaluates on NODE/CONFIG STATUS reports and sends at
+        most one config_set per connection, so a location registered after the
+        connection would otherwise wait for the next reconnect. Requesting fresh
+        status lets the unchanged OUT+IDLE gate decide on current Node data.
+        """
+        mac = normalize_mac(str(address))
+        node = self.dean_contract.snapshot(mac)
+        if (
+            not node.get("connected")
+            or str(node.get("setup") or "").strip().lower() != "unconfigured"
+        ):
+            return False
+        config = self.config_store.load(mac)
+        if normalize_node_location(config.location) is None:
+            return False
+        for payload in ("node_status", "config_get"):
+            sent = await self.registry.send_command(
+                CommandEvent(
+                    address=mac,
+                    command=payload,
+                    location=config.location,
+                    canonical_node_id=mac,
+                    created_at=time.time(),
+                )
+            )
+            if not sent:
+                return False
+        self.logger.info(
+            "Requested status to resync unconfigured Node address=%s location=%s",
+            mac,
+            config.location,
+        )
+        return True
 
     async def node_status(
         self,
@@ -375,6 +413,22 @@ class SlimHubDaemon:
                 ),
                 "applies_on": "CONFIG/APPLIED",
             },
+        }
+
+    async def node_radar_calibrate(
+        self,
+        address: object,
+        *,
+        location: object | None = None,
+    ) -> dict[str, object]:
+        # No Central-side occupancy gate: the Node answers with RADAR/CAL_REQUEST
+        # result=accepted or result=rejected,reason=<...>.
+        normalized = self.resolve_device_target(address, location)
+        request = await self.send_command(normalized, "radar_calibrate")
+        return {
+            "request": request,
+            "cached": self.dean_contract.snapshot(normalized),
+            "pending": {"reply": "RADAR/CAL_REQUEST"},
         }
 
     async def node_config_reload(
@@ -1410,6 +1464,13 @@ class SlimHubDaemon:
                     target_location=args.get("location"),
                 )
             )
+        if command == "node.radar.calibrate":
+            return self._ok(
+                await self.node_radar_calibrate(
+                    args.get("address"),
+                    location=args.get("location"),
+                )
+            )
         if command == "node.config.reload":
             return self._ok(
                 await self.node_config_reload(
@@ -1418,14 +1479,15 @@ class SlimHubDaemon:
                 )
             )
         if command == "config.set":
-            return self._ok(
-                self.set_device_config(
-                    args.get("address"),
-                    args.get("location"),
-                    args.get("field"),
-                    args.get("value"),
-                )
+            result = self.set_device_config(
+                args.get("address"),
+                args.get("location"),
+                args.get("field"),
+                args.get("value"),
             )
+            if args.get("field") == "location":
+                await self.resync_unconfigured_node(result["address"])
+            return self._ok(result)
         if command == "config.apply":
             return self._ok(await self.apply_config())
         if command == "hub.config.set":

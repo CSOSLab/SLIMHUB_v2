@@ -121,6 +121,11 @@ def report_frame(address: str, message: str, fields: dict[str, str]) -> ParsedFr
     )
 
 
+def typed_report_frame(address: str, **fields: str) -> ParsedFrame:
+    message = ",".join(f"{key}={value}" for key, value in fields.items())
+    return report_frame(address, message, dict(fields))
+
+
 def json_report_frame(address: str, document: dict[str, object]) -> ParsedFrame:
     return parse_frame(
         build_frame(address, "REPORT", json.dumps(document).encode("utf-8"))
@@ -1301,6 +1306,241 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             session_state = response["data"]["sessions"][f"{address}/boot-a/7"]
             self.assertEqual(session_state["records"][0]["canonical_name"], "humidity")
             self.assertFalse((Path(tmpdir) / "programdata" / "reports").exists())
+
+
+    async def test_node_radar_calibrate_sends_command_without_occupancy_gate(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            address = "AA:BB:CC:DD:EE:01"
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            session = FakeSession(address)
+            await daemon.registry.add(session)
+            daemon.config_store.set_field(address, "location", "KITCHEN")
+            await daemon.handle_frame(
+                address,
+                typed_report_frame(
+                    address,
+                    src="NODE",
+                    event="STATUS",
+                    bid="a1b2c3d4",
+                    occupancy="IN",
+                    capture="ACTIVE",
+                    setup="calibrating",
+                ),
+            )
+
+            by_address = await daemon.dispatch(
+                {"command": "node.radar.calibrate", "args": {"address": address}}
+            )
+            by_location = await daemon.dispatch(
+                {"command": "node.radar.calibrate", "args": {"location": "kitchen"}}
+            )
+
+            self.assertEqual(
+                [command.command for command in session.commands],
+                ["radar_calibrate", "radar_calibrate"],
+            )
+            self.assertTrue(by_address["ok"] and by_location["ok"])
+            data = by_address["data"]
+            self.assertEqual(data["request"]["command"], "radar_calibrate")
+            self.assertEqual(data["cached"]["setup"], "calibrating")
+            self.assertEqual(data["pending"], {"reply": "RADAR/CAL_REQUEST"})
+
+    async def test_node_radar_calibrate_without_session_keeps_existing_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+
+            with self.assertRaisesRegex(ValueError, "no active device session"):
+                await daemon.dispatch(
+                    {
+                        "command": "node.radar.calibrate",
+                        "args": {"address": "AA:BB:CC:DD:EE:09"},
+                    }
+                )
+
+    async def test_setup_and_radar_reports_are_logged_without_registered_location(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            address = "AA:BB:CC:DD:EE:01"
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            session = FakeSession(address)
+            await daemon.registry.add(session)
+
+            for fields in (
+                {"src": "NODE", "event": "STATUS", "bid": "a1b2c3d4", "setup": "waiting"},
+                {
+                    "src": "RADAR",
+                    "event": "CAL_REQUEST",
+                    "result": "rejected",
+                    "reason": "unconfigured",
+                },
+                {"src": "RADAR", "event": "CAL_START", "trigger": "manual"},
+                {
+                    "src": "SETUP",
+                    "event": "CONFIGURED",
+                    "location": "KITCHEN",
+                    "auto_cal_ms": "900000",
+                },
+            ):
+                await daemon.handle_frame(address, typed_report_frame(address, **fields))
+
+            self.assertEqual(session.commands, [])
+            status = (
+                await daemon.dispatch(
+                    {
+                        "command": "node.status",
+                        "args": {"address": address, "refresh": False},
+                    }
+                )
+            )["data"]["cached"]
+            self.assertEqual(status["setup"], "waiting")
+            self.assertEqual(status["radar_calibration"]["event"], "CAL_START")
+            self.assertEqual(
+                status["radar_calibration"]["fields"], {"trigger": "manual"}
+            )
+            audit = "".join(
+                path.read_text(encoding="utf-8")
+                for path in (Path(tmpdir) / "programdata" / "reports").glob("*.jsonl")
+            )
+            for expected in (
+                '"event": "CAL_REQUEST"',
+                '"reason": "unconfigured"',
+                '"event": "CONFIGURED"',
+                '"kind": "node_radar_calibration"',
+                '"kind": "node_setup"',
+            ):
+                self.assertIn(expected, audit)
+
+    async def test_registering_location_resyncs_connected_unconfigured_node(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            address = "AA:BB:CC:DD:EE:01"
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            session = FakeSession(address)
+            await daemon.registry.add(session)
+            await daemon.handle_connection_state(address, True, 100.0)
+            init_count = len(session.commands)
+            node_status = {
+                "src": "NODE",
+                "event": "STATUS",
+                "bid": "1a2b3c4d",
+                "occupancy": "OUT",
+                "capture": "IDLE",
+                "location": "KITCHEN",
+                "config": "READY",
+                "semantic": "1",
+                "setup": "unconfigured",
+            }
+            config_status = {
+                "src": "CONFIG",
+                "event": "STATUS",
+                "bid": "1a2b3c4d",
+                "location": "KITCHEN",
+                "profile": "kitchen_v1",
+                "config": "READY",
+                "semantic": "1",
+                "class_count": "9",
+                "model": "11223344",
+                "raw": "2",
+            }
+
+            # Location not registered yet: nothing is sent, the wait is recorded.
+            for fields in (node_status, config_status):
+                await daemon.handle_frame(address, typed_report_frame(address, **fields))
+            self.assertEqual(len(session.commands), init_count)
+            audit = "".join(
+                path.read_text(encoding="utf-8")
+                for path in (Path(tmpdir) / "programdata" / "reports").glob("*.jsonl")
+            )
+            self.assertIn("location_sync_awaiting_registration", audit)
+
+            # Non-location fields never trigger a resync.
+            await daemon.dispatch(
+                {
+                    "command": "config.set",
+                    "args": {"address": address, "field": "name", "value": "kitchen-node"},
+                }
+            )
+            self.assertEqual(len(session.commands), init_count)
+
+            await daemon.dispatch(
+                {
+                    "command": "config.set",
+                    "args": {"address": address, "field": "location", "value": "KITCHEN"},
+                }
+            )
+            self.assertEqual(
+                [command.command for command in session.commands[init_count:]],
+                ["node_status", "config_get"],
+            )
+
+            # The refreshed status releases exactly one config_set.
+            for fields in (node_status, config_status, node_status):
+                await daemon.handle_frame(address, typed_report_frame(address, **fields))
+            self.assertEqual(
+                [command.command for command in session.commands[init_count + 2 :]],
+                ["config_set,location=KITCHEN"],
+            )
+
+    async def test_config_apply_resyncs_connected_unconfigured_node(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            address = "AA:BB:CC:DD:EE:01"
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            session = FakeSession(address)
+            await daemon.registry.add(session)
+            await daemon.handle_connection_state(address, True, 100.0)
+            await daemon.handle_frame(
+                address,
+                typed_report_frame(
+                    address, src="NODE", event="STATUS", bid="1a2b3c4d", setup="unconfigured"
+                ),
+            )
+            init_count = len(session.commands)
+            daemon.config_store.set_field(address, "location", "TOILET")
+
+            await daemon.dispatch({"command": "config.apply"})
+
+            self.assertEqual(
+                [command.command for command in session.commands[init_count:]],
+                ["node_status", "config_get"],
+            )
+
+    async def test_resync_skips_configured_disconnected_or_unsupported_location(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            address = "AA:BB:CC:DD:EE:01"
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            session = FakeSession(address)
+            await daemon.registry.add(session)
+            await daemon.handle_connection_state(address, True, 100.0)
+            init_count = len(session.commands)
+
+            async def report_setup(setup: str) -> None:
+                await daemon.handle_frame(
+                    address,
+                    typed_report_frame(
+                        address, src="NODE", event="STATUS", bid="1a2b3c4d", setup=setup
+                    ),
+                )
+
+            daemon.config_store.set_field(address, "location", "TOILET")
+            await report_setup("waiting")
+            self.assertFalse(await daemon.resync_unconfigured_node(address))
+
+            await report_setup("unconfigured")
+            daemon.config_store.set_field(address, "location", "undefined")
+            self.assertFalse(await daemon.resync_unconfigured_node(address))
+
+            daemon.config_store.set_field(address, "location", "TOILET")
+            await daemon.handle_connection_state(address, False, 200.0)
+            self.assertFalse(await daemon.resync_unconfigured_node(address))
+            self.assertEqual(len(session.commands), init_count)
 
 
 if __name__ == "__main__":

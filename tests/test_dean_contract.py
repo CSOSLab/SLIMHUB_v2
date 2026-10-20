@@ -624,6 +624,71 @@ class DeanContractTests(unittest.TestCase):
             self.assertEqual(restored.home_snapshot()["confirmed_occupant"], MAC_A)
             self.assertEqual(restored.snapshot(MAC_A)["bid"], "12ab34cd")
 
+    def test_node_status_setup_phase_is_cached_and_absent_means_none(self) -> None:
+        store = DeanContractStore()
+        status = {"src": "NODE", "event": "STATUS", "bid": "12ab34cd"}
+
+        store.handle_report(report(MAC_A, 1.0, **status))
+        self.assertIsNone(store.snapshot(MAC_A)["setup"])
+        store.handle_report(report(MAC_A, 2.0, **status, setup="Unconfigured"))
+        self.assertEqual(store.snapshot(MAC_A)["setup"], "unconfigured")
+        store.handle_report(report(MAC_A, 3.0, **status, setup="waiting"))
+        self.assertEqual(store.snapshot(MAC_A)["setup"], "waiting")
+        store.handle_report(report(MAC_A, 4.0, **status))
+        self.assertIsNone(store.snapshot(MAC_A)["setup"])
+
+    def test_setup_and_radar_calibration_are_recorded_and_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = AppPaths.from_base(tmpdir)
+            store = DeanContractStore(paths.node_state_path)
+            store.handle_report(
+                report(MAC_A, 1.0, src="NODE", event="STATUS", setup="calibrating")
+            )
+            self.assertEqual(
+                store.handle_report(
+                    report(
+                        MAC_A,
+                        2.0,
+                        src="RADAR",
+                        event="CAL_REQUEST",
+                        result="rejected",
+                        reason="occupied",
+                    )
+                ),
+                [],
+            )
+            store.handle_report(
+                report(MAC_A, 3.0, src="RADAR", event="CAL_START", trigger="manual")
+            )
+            store.handle_report(report(MAC_A, 3.5, src="RADAR", event="PROBE", n=1))
+            store.handle_report(
+                report(
+                    MAC_A,
+                    4.0,
+                    src="SETUP",
+                    event="CONFIGURED",
+                    location="KITCHEN",
+                    auto_cal_ms=900000,
+                )
+            )
+
+            records = store.drain_records()
+            kinds = [record.kind for record in records]
+            self.assertEqual(kinds.count("node_radar_calibration"), 2)
+            setup_record = next(r for r in records if r.kind == "node_setup")
+            self.assertEqual(setup_record.data["event"], "CONFIGURED")
+            self.assertEqual(
+                setup_record.data["fields"],
+                {"location": "KITCHEN", "auto_cal_ms": "900000"},
+            )
+
+            restored = DeanContractStore(paths.node_state_path).snapshot(MAC_A)
+            self.assertEqual(restored["setup"], "calibrating")
+            self.assertEqual(restored["radar_calibration"]["event"], "CAL_START")
+            self.assertEqual(
+                restored["radar_calibration"]["fields"], {"trigger": "manual"}
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -503,6 +503,17 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "record seconds"):
             build_record_command(0)
 
+    def test_radar_calibrate_is_an_argument_free_node_command(self) -> None:
+        self.assertEqual(self.command_payload("radar_calibrate"), b"radar_calibrate")
+        for command in (
+            "radar_calibrate,force=1",
+            "radar_calibrate ",
+            "RADAR_CALIBRATE",
+            "radar_calibrate\n",
+        ):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                build_command_frame("AA:BB:CC:DD:EE:FF", command)
+
     def test_command_frame_rejects_unknown_command(self) -> None:
         with self.assertRaisesRegex(ValueError, "command must be one of"):
             build_command_frame("AA:BB:CC:DD:EE:FF", "stay")

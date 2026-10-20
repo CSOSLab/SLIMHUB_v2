@@ -475,6 +475,17 @@ def build_parser() -> argparse.ArgumentParser:
     node_subparsers = node_parser.add_subparsers(dest="node_action", required=True)
     node_status = node_subparsers.add_parser("status", help="Request NODE/STATUS.")
     _add_target_options(node_status, required=True)
+    node_radar_calibrate = node_subparsers.add_parser(
+        "radar-calibrate",
+        help="Ask the Node to start RADAR calibration now.",
+        description=(
+            "Send radar_calibrate. The Node answers with REPORT RADAR/CAL_REQUEST\n"
+            "(result=accepted,source=manual or result=rejected,reason=<...>); it is\n"
+            "logged and shown as 'radar_calibration' in 'node status'."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    _add_target_options(node_radar_calibrate, required=True)
     node_config = node_subparsers.add_parser("config", help="Manage Node configuration.")
     node_config_subparsers = node_config.add_subparsers(
         dest="node_config_action",
@@ -1011,6 +1022,8 @@ def _send(paths: AppPaths, args: argparse.Namespace) -> object:
             "node.status",
             {**_target_payload(args), "refresh": True},
         )
+    if args.subcommand == "node" and args.node_action == "radar-calibrate":
+        return send_request_sync(paths, "node.radar.calibrate", _target_payload(args))
     if (
         args.subcommand == "node"
         and args.node_action == "config"

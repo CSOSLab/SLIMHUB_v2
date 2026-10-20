@@ -99,6 +99,7 @@ config_get
 config_set,location=<LOCATION>
 config_set,location=<LOCATION>,sound_profile=<PROFILE>
 config_reload
+radar_calibrate
 ```
 
 Allowed pairs are TOILET/toilet_v1 (10 classes), KITCHEN/kitchen_v1 (9),
@@ -110,6 +111,39 @@ CONFIG/APPLIED; CONFIG/REJECTED preserves the old values and reason.
 
 If `semantic=0` or config is not READY, status, IN/OUT, and sound capture
 remain available, but Central does not invent semantic sound labels.
+
+### Node setup phase and RADAR calibration
+
+A Node must receive a SLIMHUB `config_set` on every boot before it is
+configured; a stored configuration alone is not enough. NODE/STATUS ends with
+`setup=<phase>` where phase is `unconfigured`, `waiting`, `calibrating`,
+`ready` or `retry`. Firmware that omits the field leaves the cached `setup`
+empty and keeps the previous behavior.
+
+Location sync (once per connection, after NODE and CONFIG status, Node OUT and
+capture IDLE) sends `config_set,location=<LOCATION>` when the Node location
+differs, semantic/config is invalid, **or the Node reports
+`setup=unconfigured`** even if the location already matches. If the Node is
+unconfigured but Central has no Node-configurable location for it, nothing is
+sent and a `location_sync_awaiting_registration` record is written. Registering
+a location with `config set ... location` (or `config apply`) while the Node is
+connected and cached `setup=unconfigured` queues `node_status` and `config_get`
+so the same sync is re-evaluated without reconnecting.
+
+`slimhub-v2 node radar-calibrate (--address MAC | --location NAME)` sends the
+argument-free `radar_calibrate` COMMAND and returns once it is queued; Central
+does not pre-check occupancy. The Node answers with REPORT `src=RADAR`:
+
+```text
+event=CAL_REQUEST,result=accepted,source=manual
+event=CAL_REQUEST,result=rejected,reason=unconfigured|occupied|busy|unavailable
+```
+
+followed by the usual `CAL_START` (`trigger=auto|manual`), `CAL_STEP`,
+`CAL_DONE`/`CAL_FAIL`. RADAR `CAL_*` and `SETUP` (for example
+`CONFIGURED,location=KITCHEN,auto_cal_ms=900000`) REPORTs are kept in the
+minimal audit log, and the latest `CAL_*` event is shown as
+`radar_calibration` in `node status` output next to `setup`.
 
 ## Sound capture
 

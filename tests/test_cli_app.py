@@ -448,6 +448,35 @@ class CliAppTests(unittest.TestCase):
         )
         self.assertEqual(reload_call.args[1], "node.config.reload")
 
+    def test_node_radar_calibrate_targets_by_address_or_location(self) -> None:
+        status, by_address, _ = self.run_command_cli(
+            ["node", "radar-calibrate", "--address", ADDRESS],
+            {"cached": {}},
+        )
+        location_status, by_location, _ = self.run_command_cli(
+            ["node", "radar-calibrate", "--location", "KITCHEN"],
+            {"cached": {}},
+        )
+
+        self.assertEqual((status, location_status), (0, 0))
+        self.assertEqual(by_address.args[1], "node.radar.calibrate")
+        self.assertEqual(by_address.args[2], {"address": ADDRESS})
+        self.assertEqual(by_location.args[1], "node.radar.calibrate")
+        self.assertEqual(by_location.args[2], {"location": "KITCHEN"})
+
+    def test_node_radar_calibrate_requires_exactly_one_target(self) -> None:
+        parser = build_parser()
+        parsed = parser.parse_args(["node", "radar-calibrate", "--address", ADDRESS])
+        self.assertEqual(parsed.node_action, "radar-calibrate")
+        for arguments in (
+            ["node", "radar-calibrate"],
+            ["node", "radar-calibrate", "--address", ADDRESS, "--location", "KITCHEN"],
+        ):
+            with self.subTest(arguments=arguments), patch(
+                "sys.stderr", new_callable=io.StringIO
+            ), self.assertRaises(SystemExit):
+                parser.parse_args(arguments)
+
     def test_node_config_set_defaults_to_node_derived_profile(self) -> None:
         status, call, _ = self.run_command_cli(
             [
