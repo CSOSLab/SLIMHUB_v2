@@ -67,6 +67,8 @@ from slimhub.unitspace.estimator import SimpleUnitspaceEstimator
 
 # Seconds the adapter stays reserved after a link is set up (see DeviceSession).
 CONNECT_SETTLE_SECONDS = 6.0
+# Consecutive scan failures before sessions fall back to timed reconnects.
+SCAN_FAILURES_BEFORE_TIMED_RECONNECT = 2
 
 
 USD_STATUS_FIELDS = (
@@ -868,16 +870,30 @@ class SlimHubDaemon:
         )
 
     async def _scan_loop(self) -> None:
+        failures = 0
         while not self.stop_event.is_set():
             try:
                 async with self.adapter_lock:
                     devices = await discover_named_devices(self.device_name, self.scan_timeout)
+                if failures >= SCAN_FAILURES_BEFORE_TIMED_RECONNECT:
+                    self.logger.warning("BLE scan recovered; reconnect on advertisements again")
+                failures = 0
+                await self.central.set_advertisement_driven(True)
                 for device in devices:
                     await self._start_or_update_session(device)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger.exception("BLE scan failed")
+                failures += 1
+                if failures == SCAN_FAILURES_BEFORE_TIMED_RECONNECT:
+                    # Advertisement-driven sessions would never reconnect
+                    # while the scanner is broken (e.g. BlueZ InProgress).
+                    self.logger.warning(
+                        "BLE scan failed %d times; falling back to timed reconnects",
+                        failures,
+                    )
+                    await self.central.set_advertisement_driven(False)
             await self._wait_or_stop(self.scan_interval)
 
     async def _occupancy_timeout_loop(self) -> None:

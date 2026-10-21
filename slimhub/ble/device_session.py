@@ -94,6 +94,12 @@ class DeviceSession:
         self.waiting_for_advertisement = False
         self._target_updated_event.set()
 
+    def set_advertisement_driven(self, enabled: bool) -> None:
+        self.advertisement_driven = enabled
+        if not enabled:
+            # Resume timed reconnects now instead of waiting for a sighting.
+            self._target_updated_event.set()
+
     def start(self) -> None:
         if self._task is None or self._task.done():
             self._stop_event.clear()

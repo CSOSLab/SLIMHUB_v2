@@ -41,6 +41,13 @@ class BleCentral:
         self.advertisement_driven = advertisement_driven
         self.connect_settle = connect_settle
 
+    async def set_advertisement_driven(self, enabled: bool) -> None:
+        if self.advertisement_driven == enabled:
+            return
+        self.advertisement_driven = enabled
+        for session in await self.registry.sessions():
+            session.set_advertisement_driven(enabled)
+
     async def ensure_address(self, address: str) -> DeviceSession:
         return await self.ensure_target(normalize_mac(address))
 

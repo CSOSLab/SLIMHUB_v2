@@ -264,6 +264,19 @@ class DeviceSessionQueueTests(unittest.IsolatedAsyncioTestCase):
         session.update_target("AA:BB:CC:DD:EE:01")
         await asyncio.wait_for(waiter, timeout=0.1)
 
+    async def test_disabling_advertisement_driven_wakes_reconnect_wait(self) -> None:
+        session = DeviceSession(
+            "AA:BB:CC:DD:EE:01",
+            on_frame=ignore_frame,
+            reconnect_delay=10.0,
+            advertisement_driven=True,
+        )
+        session._target_updated_event.clear()
+        waiter = asyncio.create_task(session._wait_for_reconnect())
+        await asyncio.sleep(0)
+        session.set_advertisement_driven(False)
+        await asyncio.wait_for(waiter, timeout=0.1)
+
     async def test_sound_commands_remain_ordered_in_serial_writer_queue(self) -> None:
         session = DeviceSession("AA:BB:CC:DD:EE:01", on_frame=ignore_frame)
 

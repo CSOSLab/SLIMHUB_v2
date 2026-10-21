@@ -16,6 +16,10 @@ class DeviceRegistry:
         async with self._lock:
             self._sessions[normalize_mac(session.address)] = session
 
+    async def sessions(self) -> list:
+        async with self._lock:
+            return list(self._sessions.values())
+
     async def get(self, address: str):
         normalized = normalize_mac(address)
         async with self._lock:
