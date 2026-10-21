@@ -42,6 +42,8 @@ class DeviceSession:
         notify_timeout: float = 5.0,
         adapter_lock: asyncio.Lock | None = None,
         logger: logging.Logger | None = None,
+        advertisement_driven: bool = False,
+        connect_settle: float = 0.0,
     ) -> None:
         self.target = target
         self.address = normalize_mac(str(getattr(target, "address", target)))
@@ -54,6 +56,14 @@ class DeviceSession:
         self.notify_timeout = notify_timeout
         self.adapter_lock = adapter_lock or asyncio.Lock()
         self.logger = logger or logging.getLogger(__name__)
+        # Low-power DEAN Nodes keep BLE off between events. With a scanner,
+        # connect only after a fresh advertisement instead of retrying blind
+        # 10 s connects to absent Nodes, which kept the shared adapter busy.
+        self.advertisement_driven = advertisement_driven
+        # Hold the adapter for the first seconds of a fresh link: a scan or a
+        # second LE connection right after connect dropped fresh DEAN links
+        # within ~3 s on the home RPi5 (2026-10-21).
+        self.connect_settle = connect_settle
 
         self.connected = False
         self.last_seen = 0.0
@@ -134,6 +144,7 @@ class DeviceSession:
             disconnected_event = asyncio.Event()
             command_failure_event = asyncio.Event()
             reported_connected = False
+            command_task: asyncio.Task[None] | None = None
             loop = asyncio.get_running_loop()
             assembler = FrameAssembler()
 
@@ -169,11 +180,19 @@ class DeviceSession:
                         await self.on_connection_state(self.address, True, self.last_seen)
                         reported_connected = True
                     self._unavailable_logged = False
+                    # Commands (validation_ack) must flow during the settle
+                    # window: Nodes resend unacknowledged frames for only ~5 s.
+                    command_task = asyncio.create_task(
+                        self._command_worker(client, command_failure_event),
+                        name=f"ble-command:{self.address}",
+                    )
+                    if self.connect_settle > 0:
+                        with suppress(asyncio.TimeoutError):
+                            await asyncio.wait_for(
+                                disconnected_event.wait(),
+                                timeout=self.connect_settle,
+                            )
 
-                command_task = asyncio.create_task(
-                    self._command_worker(client, command_failure_event),
-                    name=f"ble-command:{self.address}",
-                )
                 wait_tasks = {
                     asyncio.create_task(self._stop_event.wait()),
                     asyncio.create_task(disconnected_event.wait()),
@@ -213,6 +232,9 @@ class DeviceSession:
                 else:
                     self.logger.exception("%s BLE session failed", self.address)
             finally:
+                if command_task is not None and not command_task.done():
+                    command_task.cancel()
+                    await asyncio.gather(command_task, return_exceptions=True)
                 client = self._client
                 if client is not None:
                     with suppress(BleakError, RuntimeError, AttributeError):
@@ -228,6 +250,10 @@ class DeviceSession:
                 self._negotiated_mtu = None
                 self._max_write_without_response_size = None
                 self._client = None
+                if self.advertisement_driven:
+                    # Sightings seen while connected are stale once the Node
+                    # turned its radio off; wait for a new advertisement.
+                    self._target_updated_event.clear()
                 if reported_connected and self.on_connection_state is not None:
                     await self.on_connection_state(self.address, False, time.time())
 
@@ -438,9 +464,11 @@ class DeviceSession:
             return
         stop_task = asyncio.create_task(self._stop_event.wait())
         update_task = asyncio.create_task(self._target_updated_event.wait())
-        delay_task = asyncio.create_task(asyncio.sleep(self.reconnect_delay))
+        tasks = {stop_task, update_task}
+        if not self.advertisement_driven:
+            tasks.add(asyncio.create_task(asyncio.sleep(self.reconnect_delay)))
         done, pending = await asyncio.wait(
-            {stop_task, update_task, delay_task},
+            tasks,
             return_when=asyncio.FIRST_COMPLETED,
         )
         for task in pending:

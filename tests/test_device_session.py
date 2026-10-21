@@ -248,6 +248,22 @@ class DeviceSessionQueueTests(unittest.IsolatedAsyncioTestCase):
 
         await asyncio.wait_for(session._wait_for_reconnect(), timeout=0.1)
 
+    async def test_advertisement_driven_reconnect_waits_for_fresh_sighting(self) -> None:
+        session = DeviceSession(
+            "AA:BB:CC:DD:EE:01",
+            on_frame=ignore_frame,
+            reconnect_delay=0.001,
+            advertisement_driven=True,
+        )
+        session._target_updated_event.clear()
+
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(session._wait_for_reconnect(), timeout=0.05)
+        waiter = asyncio.create_task(session._wait_for_reconnect())
+        await asyncio.sleep(0)
+        session.update_target("AA:BB:CC:DD:EE:01")
+        await asyncio.wait_for(waiter, timeout=0.1)
+
     async def test_sound_commands_remain_ordered_in_serial_writer_queue(self) -> None:
         session = DeviceSession("AA:BB:CC:DD:EE:01", on_frame=ignore_frame)
 

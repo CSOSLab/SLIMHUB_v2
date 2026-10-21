@@ -65,6 +65,9 @@ from slimhub.singleton import DaemonInstanceLock
 from slimhub.unitspace.clock import EventReorderBuffer, NodeClockNormalizer
 from slimhub.unitspace.estimator import SimpleUnitspaceEstimator
 
+# Seconds the adapter stays reserved after a link is set up (see DeviceSession).
+CONNECT_SETTLE_SECONDS = 6.0
+
 
 USD_STATUS_FIELDS = (
     "batt_mv",
@@ -150,6 +153,7 @@ class SlimHubDaemon:
             notify_timeout=self.notify_timeout,
             adapter_lock=self.adapter_lock,
             logger=self.logger,
+            connect_settle=CONNECT_SETTLE_SECONDS,
         )
         self.stop_event = asyncio.Event()
         self._server: asyncio.AbstractServer | None = None
@@ -190,6 +194,14 @@ class SlimHubDaemon:
                 loop.add_signal_handler(sig, self.request_stop)
 
         tasks: list[asyncio.Task[None]] = []
+        # With the scanner running, sessions reconnect on fresh advertisements
+        # only; --no-scan keeps the timed reconnect fallback.
+        self.central.advertisement_driven = scan
+        self.logger.info(
+            "BLE connect policy advertisement_driven=%s connect_settle=%.1fs",
+            scan,
+            CONNECT_SETTLE_SECONDS,
+        )
         if address:
             await self.connect_address(address)
         if scan:

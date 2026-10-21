@@ -26,6 +26,8 @@ class BleCentral:
         on_command_result: CommandResultHandler | None = None,
         connect_timeout: float = 10.0,
         notify_timeout: float = 5.0,
+        advertisement_driven: bool = False,
+        connect_settle: float = 0.0,
     ) -> None:
         self.registry = registry
         self.on_frame = on_frame
@@ -36,6 +38,8 @@ class BleCentral:
         self.notify_timeout = notify_timeout
         self.adapter_lock = adapter_lock
         self.logger = logger
+        self.advertisement_driven = advertisement_driven
+        self.connect_settle = connect_settle
 
     async def ensure_address(self, address: str) -> DeviceSession:
         return await self.ensure_target(normalize_mac(address))
@@ -54,6 +58,8 @@ class BleCentral:
                 notify_timeout=self.notify_timeout,
                 adapter_lock=self.adapter_lock,
                 logger=self.logger,
+                advertisement_driven=self.advertisement_driven,
+                connect_settle=self.connect_settle,
             )
             await self.registry.add(session)
             session.start()
