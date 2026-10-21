@@ -29,6 +29,10 @@ ConnectionStateHandler = Callable[[str, bool, float], Awaitable[None]]
 CommandResultHandler = Callable[[CommandEvent, bool, str | None, float], Awaitable[None]]
 
 
+# Longest wait for BlueZ to report the negotiated ATT write capacity.
+WRITE_CAPACITY_WAIT_SECONDS = 2.0
+
+
 class DeviceSession:
     def __init__(
         self,
@@ -353,6 +357,7 @@ class DeviceSession:
             try:
                 frame = build_command_frame(command.address, command.command)
                 if command.command.startswith(("inout_confirm,", "validation_ack,")):
+                    await self._await_write_capacity(client, len(frame))
                     self._validate_confirmation_write(client, frame)
                 await client.write_gatt_char(NUS_RX_WRITE_UUID, frame, response=False)
                 await self._notify_command_result(command, True, None)
@@ -418,6 +423,20 @@ class DeviceSession:
         if isinstance(mtu, int) and mtu > 3:
             return mtu - 3
         return None
+
+    async def _await_write_capacity(self, client: BleakClient, needed: int) -> None:
+        # BlueZ may report the default ATT payload (20 bytes) until the MTU
+        # exchange of a fresh link finishes; DEAN Nodes ask for an ACK within
+        # milliseconds of connecting (home log 2026-10-22: 20 vs 514 on the
+        # same Node). Wait briefly instead of failing and dropping the link.
+        deadline = time.monotonic() + WRITE_CAPACITY_WAIT_SECONDS
+        while True:
+            capacity = self._write_capacity(client)
+            if capacity is not None and capacity >= needed:
+                return
+            if time.monotonic() >= deadline or not getattr(client, "is_connected", True):
+                return
+            await asyncio.sleep(0.2)
 
     def _validate_confirmation_write(
         self,

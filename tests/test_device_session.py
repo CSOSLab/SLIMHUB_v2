@@ -277,6 +277,12 @@ class DeviceSessionQueueTests(unittest.IsolatedAsyncioTestCase):
         session.set_advertisement_driven(False)
         await asyncio.wait_for(waiter, timeout=0.1)
 
+    async def test_write_capacity_wait_returns_once_mtu_grows(self) -> None:
+        session = DeviceSession("AA:BB:CC:DD:EE:01", on_frame=ignore_frame)
+        capacities = iter([20, 20, 514])
+        session._write_capacity = lambda client: next(capacities)
+        await asyncio.wait_for(session._await_write_capacity(object(), 80), timeout=1.0)
+
     async def test_sound_commands_remain_ordered_in_serial_writer_queue(self) -> None:
         session = DeviceSession("AA:BB:CC:DD:EE:01", on_frame=ignore_frame)
 
