@@ -822,6 +822,46 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
                 living.address,
             )
 
+    async def test_stuck_bluez_scan_power_cycles_the_adapter_once_per_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            daemon.scan_interval = 0
+            scans = 0
+
+            async def stuck_scan(*_: object) -> list[object]:
+                nonlocal scans
+                scans += 1
+                if scans >= 20:
+                    daemon.stop_event.set()
+                raise FakeBleakError("[org.bluez.Error.InProgress] Operation already in progress")
+
+            with patch("slimhub.daemon.discover_named_devices", side_effect=stuck_scan), \
+                    patch("slimhub.daemon.power_cycle_adapter") as power_cycle:
+                await daemon._scan_loop()
+
+            # 8 InProgress scans trigger one cycle; the 10 min cooldown blocks
+            # a second one within these 20 scans.
+            power_cycle.assert_awaited_once()
+
+    async def test_other_scan_errors_do_not_power_cycle_the_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            daemon.scan_interval = 0
+            scans = 0
+
+            async def powered_off(*_: object) -> list[object]:
+                nonlocal scans
+                scans += 1
+                if scans >= 12:
+                    daemon.stop_event.set()
+                raise FakeBleakError("No powered Bluetooth adapters found.")
+
+            with patch("slimhub.daemon.discover_named_devices", side_effect=powered_off), \
+                    patch("slimhub.daemon.power_cycle_adapter") as power_cycle:
+                await daemon._scan_loop()
+
+            power_cycle.assert_not_awaited()
+
     async def test_legacy_detected_20_does_not_assign_demo_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))

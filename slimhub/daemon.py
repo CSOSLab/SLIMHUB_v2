@@ -11,7 +11,7 @@ from pathlib import Path
 
 from slimhub.ble.central import BleCentral
 from slimhub.ble.registry import DeviceRegistry
-from slimhub.ble.scanner import discover_named_devices
+from slimhub.ble.scanner import discover_named_devices, power_cycle_adapter
 from slimhub.config import (
     DEFAULT_DEVICE_TYPE,
     DEFAULT_LOCATION,
@@ -69,6 +69,11 @@ from slimhub.unitspace.estimator import SimpleUnitspaceEstimator
 CONNECT_SETTLE_SECONDS = 6.0
 # Consecutive scan failures before sessions fall back to timed reconnects.
 SCAN_FAILURES_BEFORE_TIMED_RECONNECT = 2
+# BlueZ discovery stuck in org.bluez.Error.InProgress (2026-10-12/16/21/27):
+# a daemon restart does not clear it, an adapter power cycle does. Cycle after
+# this many consecutive InProgress scans (~2 min), at most once per cooldown.
+SCAN_IN_PROGRESS_BEFORE_ADAPTER_RESET = 8
+ADAPTER_RESET_COOLDOWN_SECONDS = 600.0
 
 
 USD_STATUS_FIELDS = (
@@ -871,6 +876,8 @@ class SlimHubDaemon:
 
     async def _scan_loop(self) -> None:
         failures = 0
+        in_progress = 0
+        last_reset = None
         while not self.stop_event.is_set():
             try:
                 async with self.adapter_lock:
@@ -878,14 +885,23 @@ class SlimHubDaemon:
                 if failures >= SCAN_FAILURES_BEFORE_TIMED_RECONNECT:
                     self.logger.warning("BLE scan recovered; reconnect on advertisements again")
                 failures = 0
+                in_progress = 0
                 await self.central.set_advertisement_driven(True)
                 for device in devices:
                     await self._start_or_update_session(device)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 self.logger.exception("BLE scan failed")
                 failures += 1
+                in_progress = in_progress + 1 if "org.bluez.Error.InProgress" in str(exc) else 0
+                now = time.monotonic()
+                if in_progress >= SCAN_IN_PROGRESS_BEFORE_ADAPTER_RESET and (
+                    last_reset is None or now - last_reset >= ADAPTER_RESET_COOLDOWN_SECONDS
+                ):
+                    last_reset = now
+                    in_progress = 0
+                    await self._reset_adapter()
                 if failures == SCAN_FAILURES_BEFORE_TIMED_RECONNECT:
                     # Advertisement-driven sessions would never reconnect
                     # while the scanner is broken (e.g. BlueZ InProgress).
@@ -895,6 +911,18 @@ class SlimHubDaemon:
                     )
                     await self.central.set_advertisement_driven(False)
             await self._wait_or_stop(self.scan_interval)
+
+    async def _reset_adapter(self) -> None:
+        self.logger.warning("BLE scan stuck (BlueZ InProgress); power-cycling the adapter")
+        try:
+            async with self.adapter_lock:
+                await power_cycle_adapter()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger.exception("BLE adapter power cycle failed")
+        else:
+            self.logger.warning("BLE adapter power-cycled")
 
     async def _occupancy_timeout_loop(self) -> None:
         while not self.stop_event.is_set():

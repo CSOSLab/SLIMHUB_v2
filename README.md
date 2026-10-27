@@ -32,6 +32,12 @@ slimhub-v2 run
 slimhub-v2 --debug run --scan-timeout 8 --scan-interval 5
 ```
 
+BlueZ scan이 `org.bluez.Error.InProgress`로 멈추면(`bluetoothctl show`에 `Discovering: yes`
+고정, 2026-10-12/16/21/27) daemon을 다시 시작해도 풀리지 않습니다. daemon은 이 오류가
+연속 8번(약 2분) 나오면 D-Bus로 어댑터를 껐다 켭니다(sudo 불필요, 10분에 한 번까지,
+로그 `power-cycling the adapter`). 그래도 남으면 `bluetoothctl power off` → `on` 뒤 daemon을
+다시 시작합니다.
+
 터미널을 닫아도 daemon을 계속 실행하려면 background mode를 사용합니다.
 
 ```bash
