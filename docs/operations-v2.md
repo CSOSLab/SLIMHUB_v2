@@ -124,9 +124,9 @@ and set mode 600. Do not put secrets in the repository or directly in the
 crontab. Required local variables are
 `SLIMHUB_LOCAL_DB_HOST`, `SLIMHUB_LOCAL_DB_USER`, and
 `SLIMHUB_LOCAL_DB_NAME`; `SLIMHUB_LOCAL_DB_PASS` is supported. Configure the
-corresponding `SLIMHUB_REMOTE_DB_*` variables only after remote upload is
-re-enabled in source. The current local-only branch deliberately returns
-`skipped` without opening a remote connection.
+corresponding `SLIMHUB_REMOTE_DB_*` variables to enable remote upload; without
+`SLIMHUB_REMOTE_DB_HOST` the upload stage returns `skipped` without opening a
+remote connection.
 `house_mac` defaults to the Hub address in `programdata/config.json`; set
 `SLIMHUB_HOUSE_MAC` only when the deployment uses a separate house identifier.
 
@@ -153,14 +153,13 @@ slimhub-v2 db status
 
 The command reports the safe database configuration state, source data-file
 offsets, local upload offsets, and the last ingest/upload results. It never
-prints passwords. By default the first run starts with today's data files, matching
-the legacy cron. Set `SLIMHUB_DB_BACKFILL=1` only for an intentional historical
-import.
+prints passwords. Every dated file under the five room folders is scanned; byte
+offsets skip what was already read, and rows already present in the local table
+are not inserted again. The first run therefore imports the whole history.
 
-## 6. Confirm remote upload (after re-enabling it)
+## 6. Confirm remote upload
 
-The current local-only build records a skipped upload and does not connect to the
-remote database. After the guarded remote upload implementation is re-enabled,
+Without remote settings the upload stage records `skipped`. With them,
 `last_upload.result.adl` and
 `last_upload.result.inout` show `uploaded` row counts and the local `last_id`.
 Each stream offset advances immediately after its own remote transaction
@@ -172,8 +171,8 @@ operator account.
 
 - Node is connected and its location configuration is correct.
 - `display.txt` shows only expected IN/OUT and inference state records.
-- `db status` has a successful recent ingest; upload is either explicitly
-  `skipped` in local-only mode or successful after re-enablement.
+- `db status` has a successful recent ingest; upload is either `skipped`
+  (no remote settings) or successful.
 - Remote table rows have been independently checked when remote upload is enabled.
 - Preserve `data/`, `programdata/db_sync/last_ingest.json`,
   `programdata/db_sync/last_upload.json`, and the DB cron logs as release evidence.

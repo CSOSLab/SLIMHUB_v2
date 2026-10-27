@@ -34,9 +34,9 @@ class DataDirectoryDatabaseUpdater:
 
     Collection and DB synchronization are deliberately separate: the daemon
     writes legacy-compatible rawdata CSV and debugstr JSONL files. This class
-    incrementally consumes confirmed EVENT and INFERENCE records from debugstr;
-    rawdata remains collection evidence only. Credentials are read only from
-    environment variables.
+    incrementally consumes every INFERENCE (ESA result) record from debugstr and
+    GridEye ENTER/EXIT rows from rawdata, skipping rows the local DB already
+    holds. Credentials are read only from environment variables.
     """
 
     def __init__(self, paths: AppPaths, environ: dict[str, str] | None = None) -> None:
@@ -125,9 +125,23 @@ class DataDirectoryDatabaseUpdater:
         batch = reader.read(house_mac=self.house_mac)
         adl_rows = batch.adl_rows
         inout_rows = batch.inout_rows
+        skipped = 0
         if adl_rows or inout_rows:
             local = self._settings("LOCAL", required=True)
             with self._connect(local) as connection:
+                # 같은 행이 이미 있으면 넣지 않습니다(commit 뒤 offset 저장 전 중단, 재적재).
+                before = len(adl_rows) + len(inout_rows)
+                adl_rows = self._new_rows(
+                    connection, self.adl_table,
+                    ("house_mac", "location", "created_time", "event_sequence", "adl"),
+                    adl_rows, key_size=5,
+                )
+                inout_rows = self._new_rows(
+                    connection, self.inout_table,
+                    ("house_mac", "location", "created_time", "direction"),
+                    inout_rows, key_size=4,
+                )
+                skipped = before - len(adl_rows) - len(inout_rows)
                 with connection.cursor() as cursor:
                     if adl_rows:
                         cursor.executemany(
@@ -150,7 +164,37 @@ class DataDirectoryDatabaseUpdater:
             "lines": batch.lines,
             "adl_inserted": len(adl_rows),
             "inout_inserted": len(inout_rows),
+            "duplicates_skipped": skipped,
         }
+
+    @staticmethod
+    def _new_rows(
+        connection: Any,
+        table: str,
+        key_columns: tuple[str, ...],
+        rows: list[tuple[object, ...]],
+        *,
+        key_size: int,
+    ) -> list[tuple[object, ...]]:
+        """Drop rows whose key already exists in table or earlier in rows."""
+        if not rows:
+            return rows
+        times = [str(row[2]) for row in rows]
+        column_list = ", ".join(f"`{column}`" for column in key_columns)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT {column_list} FROM `{table}` "
+                "WHERE created_time BETWEEN %s AND %s",
+                (min(times), max(times)),
+            )
+            seen = {_row_key(row) for row in cursor.fetchall()}
+        fresh: list[tuple[object, ...]] = []
+        for row in rows:
+            key = _row_key(row[:key_size])
+            if key not in seen:
+                seen.add(key)
+                fresh.append(row)
+        return fresh
 
     # ========================================================================
     # 신규 코드: 다음 DB 입력 대상만 TXT로 미리 봅니다.
@@ -234,81 +278,72 @@ class DataDirectoryDatabaseUpdater:
         return result
 
     def _upload(self) -> dict[str, object]:
-        # ====================================================================
-        # REMOTE DB 전송 임시 비활성화: local DB 단독 테스트 기간에 사용합니다.
-        # 아래 return을 유지하는 동안 remote DB 연결/조회/INSERT는 실행되지 않습니다.
-        # 재활성화할 때 이 return을 제거하고 아래의 기존 코드를 주석 해제합니다.
-        # ====================================================================
-        return {
-            "skipped": True,
-            "reason": "remote DB upload is temporarily disabled for local-only testing",
-        }
-
-        # 기존 remote DB 전송 코드
-        # remote = self._settings("REMOTE", required=False)
-        # if remote is None:
-        #     return {
-        #         "skipped": True,
-        #         "reason": "SLIMHUB_REMOTE_DB_HOST is not configured",
-        #     }
-        # local = self._settings("LOCAL", required=True)
-        # offsets = self._read_json(self.paths.db_upload_offset_path)
-        # result: dict[str, object] = {}
-        # with (
-        #     self._connect(local) as local_connection,
-        #     self._connect(remote) as remote_connection,
-        # ):
-        #     for stream, table in (
-        #         ("ADL", self.adl_table),
-        #         ("INOUT", self.inout_table),
-        #     ):
-        #         last_id = _as_int(offsets.get(stream), 0)
-        #         columns = self._columns_without_id(local_connection, table)
-        #         if not columns:
-        #             result[stream.lower()] = {
-        #                 "uploaded": 0,
-        #                 "last_id": last_id,
-        #             }
-        #             continue
-        #         column_list = ", ".join(f"`{column}`" for column in columns)
-        #         with local_connection.cursor() as cursor:
-        #             cursor.execute(
-        #                 f"SELECT id, {column_list} FROM `{table}` "
-        #                 "WHERE id > %s ORDER BY id ASC LIMIT %s",
-        #                 (
-        #                     last_id,
-        #                     _as_int(
-        #                         self.environ.get("SLIMHUB_DB_UPLOAD_BATCH_SIZE")
-        #                         or self.environ.get("UPLOAD_BATCH_SIZE"),
-        #                         1000,
-        #                     ),
-        #                 ),
-        #             )
-        #             rows = cursor.fetchall()
-        #         if not rows:
-        #             result[stream.lower()] = {
-        #                 "uploaded": 0,
-        #                 "last_id": last_id,
-        #             }
-        #             continue
-        #         placeholders = ", ".join(["%s"] * len(columns))
-        #         with remote_connection.cursor() as cursor:
-        #             cursor.executemany(
-        #                 f"INSERT INTO `{table}` "
-        #                 f"({column_list}) VALUES ({placeholders})",
-        #                 [row[1:] for row in rows],
-        #             )
-        #         remote_connection.commit()
-        #         offsets[stream] = rows[-1][0]
-        #         # Persist each stream independently. If the following table
-        #         # fails, a committed stream must not be uploaded twice.
-        #         self._write_json_atomic(self.paths.db_upload_offset_path, offsets)
-        #         result[stream.lower()] = {
-        #             "uploaded": len(rows),
-        #             "last_id": rows[-1][0],
-        #         }
-        # self._write_json_atomic(self.paths.db_upload_offset_path, offsets)
-        # return result
+        # 2026-10-27: remote DB 전송을 다시 켭니다. REMOTE host가 없으면 건너뛰므로
+        # crontab의 db_upload 줄을 켜도 접속 정보를 넣기 전에는 아무것도 보내지 않습니다.
+        remote = self._settings("REMOTE", required=False)
+        if remote is None:
+            return {
+                "skipped": True,
+                "reason": "SLIMHUB_REMOTE_DB_HOST is not configured",
+            }
+        local = self._settings("LOCAL", required=True)
+        offsets = self._read_json(self.paths.db_upload_offset_path)
+        result: dict[str, object] = {}
+        with (
+            self._connect(local) as local_connection,
+            self._connect(remote) as remote_connection,
+        ):
+            for stream, table in (
+                ("ADL", self.adl_table),
+                ("INOUT", self.inout_table),
+            ):
+                last_id = _as_int(offsets.get(stream), 0)
+                columns = self._columns_without_id(local_connection, table)
+                if not columns:
+                    result[stream.lower()] = {
+                        "uploaded": 0,
+                        "last_id": last_id,
+                    }
+                    continue
+                column_list = ", ".join(f"`{column}`" for column in columns)
+                with local_connection.cursor() as cursor:
+                    cursor.execute(
+                        f"SELECT id, {column_list} FROM `{table}` "
+                        "WHERE id > %s ORDER BY id ASC LIMIT %s",
+                        (
+                            last_id,
+                            _as_int(
+                                self.environ.get("SLIMHUB_DB_UPLOAD_BATCH_SIZE")
+                                or self.environ.get("UPLOAD_BATCH_SIZE"),
+                                1000,
+                            ),
+                        ),
+                    )
+                    rows = cursor.fetchall()
+                if not rows:
+                    result[stream.lower()] = {
+                        "uploaded": 0,
+                        "last_id": last_id,
+                    }
+                    continue
+                placeholders = ", ".join(["%s"] * len(columns))
+                with remote_connection.cursor() as cursor:
+                    cursor.executemany(
+                        f"INSERT INTO `{table}` "
+                        f"({column_list}) VALUES ({placeholders})",
+                        [row[1:] for row in rows],
+                    )
+                remote_connection.commit()
+                offsets[stream] = rows[-1][0]
+                # Persist each stream independently. If the following table
+                # fails, a committed stream must not be uploaded twice.
+                self._write_json_atomic(self.paths.db_upload_offset_path, offsets)
+                result[stream.lower()] = {
+                    "uploaded": len(rows),
+                    "last_id": rows[-1][0],
+                }
+        self._write_json_atomic(self.paths.db_upload_offset_path, offsets)
+        return result
 
     def _settings(self, name: str, *, required: bool) -> MySQLSettings | None:
         prefix = f"SLIMHUB_{name}_DB_"
@@ -421,6 +456,19 @@ class DataDirectoryDatabaseUpdater:
         if error is not None:
             value["error"] = str(error)
         self._write_json_atomic(path, value)
+
+
+def _row_key(row: tuple[object, ...]) -> tuple[str, ...]:
+    """Compare DB and file rows as text (datetime/float/None normalised)."""
+    key: list[str] = []
+    for value in row:
+        if value is None:
+            key.append("")
+        elif isinstance(value, datetime):
+            key.append(value.strftime("%Y-%m-%d %H:%M:%S"))
+        else:
+            key.append(str(value))
+    return tuple(key)
 
 
 def _validate_identifier(value: str) -> None:

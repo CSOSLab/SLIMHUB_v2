@@ -174,11 +174,17 @@ debugstr에서 확인된 보수적인 location/event signature만 `derived_infer
 
 ## DB 증분 적재와 cron
 
-기존 SLIMHUB와 같이 별도 DB 프로그램이 `data/`를 직접 읽습니다.
-`debugstr/YYYY-MM-DD.txt`의 검증된 `EVENT`(`ENTER=10`, `EXIT=20`)는 로컬
-MySQL `in_out`에, final inference(`POP`, `COMPLETE`, `PARTIAL`, `NO_MATCH`)는
-`event_adl`에 적재합니다. `rawdata`는 수집 원본으로만 보존하며 DB 입력에는
-사용하지 않습니다. 파일별 byte offset은
+기존 SLIMHUB와 같이 별도 DB 프로그램이 `data/`를 직접 읽습니다. 대상은 방
+폴더(`ENTRY`, `LIVING`, `BEDROOM`, `KITCHEN`, `TOILET`)의
+`<room>/DEAN_NODE_V2/<node MAC>/inference/{rawdata,debugstr}/YYYY-MM-DD.txt`
+전체 날짜입니다(`_BEDROOM` 같은 수동 사본, `undefined`, `display`, `validation`은
+제외). `rawdata`의 `GridEye=1`, `Direction=10/20` 행은 로컬 MySQL `in_out`에
+(v1과 같은 원천, header 이름으로 열을 찾아 22열·26열 모두 읽음), `debugstr`의 모든
+ESA 결과 `INFERENCE`(COMPLETE, PARTIAL, NO_MATCH, POP, PRE-DETECT 등 status 무관)는
+`event_adl`에 적재합니다. debugstr의 `DEBUG`/`EVENT` 입퇴실 행은 연결이 끊기면
+빠지므로 `in_out` 원천으로 쓰지 않습니다. local table에 같은 행(`in_out`:
+house_mac·location·created_time·direction, `event_adl`: 여기에 event_sequence·adl)이
+이미 있으면 넣지 않습니다. 파일별 byte offset은
 `programdata/db_sync/data_offsets.json`에 저장합니다. 이어서 local table의 `id`
 offset을 기준으로 동일 schema의 원격 table에 전송합니다.
 
@@ -203,7 +209,7 @@ export SLIMHUB_LOCAL_DB_NAME=adl_event
 # 필요할 때만 Hub address 대신 배포용 house identifier를 지정합니다.
 export SLIMHUB_HOUSE_MAC='...'
 
-# 소스에서 원격 upload를 다시 활성화할 때만 설정합니다.
+# 원격 upload 대상입니다. HOST가 비어 있으면 upload는 skipped입니다.
 export SLIMHUB_REMOTE_DB_HOST='...'
 export SLIMHUB_REMOTE_DB_PORT=3306
 export SLIMHUB_REMOTE_DB_USER='...'
@@ -212,24 +218,23 @@ export SLIMHUB_REMOTE_DB_NAME=adl_raw
 
 slimhub-v2 db ingest            # 권장: data/ -> local MySQL
 slimhub-v2 db status            # 설정/offset/최근 실행 결과 확인
-slimhub-v2 db upload            # 현재 local-only 테스트로 skipped
+slimhub-v2 db upload            # local -> remote (REMOTE HOST가 없으면 skipped)
 slimhub-v2 db update            # 호환용: ingest 후 upload stage 실행
 ```
 
 기존 `db update --no-upload`은 스크립트 호환을 위해 계속 인식하지만 `db ingest`와
-동일하므로 일반 CLI 도움말에서는 숨깁니다. 현재 branch의 remote DB 전송 코드는
-명시적으로 비활성화되어 `db upload`과 `db update`의 upload stage가 `skipped`를
-반환합니다.
+동일하므로 일반 CLI 도움말에서는 숨깁니다. remote 전송은 local `id` cursor 뒤의 행을
+stream(ADL, INOUT)마다 최대 1000행씩 보내고, 각 stream이 commit된 뒤 cursor를
+저장합니다. `SLIMHUB_REMOTE_DB_HOST`가 없으면 연결하지 않고 `skipped`를 남깁니다.
 
 테이블 이름은 필요하면 `SLIMHUB_DB_ADL_TABLE`(기본 `event_adl`)과
 `SLIMHUB_DB_INOUT_TABLE`(기본 `in_out`)로 바꿀 수 있습니다. ingest/upload
 offset은 `programdata/db_sync/`에 보관됩니다. cron 예시는
 [`docs/slimhub-v2.crontab`](docs/slimhub-v2.crontab)에 있으며, 실제 설치 전에는
 해당 환경변수가 cron에서도 안전하게 제공되는지 확인해야 합니다.
-기본 ingest는 백업 SLIMHUB처럼 오늘 data 파일부터 시작합니다. 과거 파일까지 의도적으로
-적재할 때만 `SLIMHUB_DB_BACKFILL=1`을 사용합니다. cron은 local ingest를 3분마다,
-remote upload stage를 10분마다 독립 실행합니다. 현재 local-only 테스트 기간에는
-이 stage가 remote에 연결하지 않고 `skipped` 상태만 기록합니다.
+ingest는 모든 날짜 파일을 보고 이미 읽은 부분은 offset으로 건너뛰므로 자정 직전 행과
+늦게 다시 쓰인 행도 적재합니다. cron은 local ingest를 3분마다, remote upload stage를
+10분마다 독립 실행합니다.
 전체 설치·display 확인·cron 반영·local/remote DB 검증·release 절차는
 [`docs/operations-v2.md`](docs/operations-v2.md)에 정리돼 있습니다.
 

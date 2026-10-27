@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 from dataclasses import dataclass
@@ -10,7 +11,10 @@ from slimhub.config import AppPaths
 from slimhub.protocol.nus import normalize_mac
 
 
-FINAL_INFERENCE_STATUSES = {"POP", "COMPLETE", "PARTIAL", "NO_MATCH"}
+# Unit-space folders written by the daemon. Manual copies (_BEDROOM),
+# undefined, display and validation trees are not DB sources.
+ROOM_LOCATIONS = {"ENTRY", "LIVING", "BEDROOM", "KITCHEN", "TOILET"}
+INOUT_DIRECTIONS = {10, 20}
 
 
 @dataclass(frozen=True)
@@ -50,7 +54,7 @@ class DataDirectoryReader:
             identity = _data_path_identity(self.paths.data_dir, path)
             if identity is None:
                 continue
-            location, mac = identity
+            location, mac, stream = identity
             key = str(path.resolve())
             start = self.offsets.get(key, 0)
             try:
@@ -59,11 +63,14 @@ class DataDirectoryReader:
                 continue
             if start > size:
                 start = 0
+            if start == size:
+                continue
 
-            # 변경 사항: DB 입력 원천을 debugstr 하나로 통일했습니다.
-            # IN/OUT은 rawdata의 GridEye/Direction을 추정값으로 사용하지 않고,
-            # Node가 확정해 보낸 EVENT ENTER=10 / EXIT=20만 사용합니다.
-            adl, inout, end_offset, consumed = _read_debugstr(
+            # 변경 사항(2026-10-27): ESA 결과는 debugstr INFERENCE 전체(status 무관),
+            # IN/OUT은 v1과 같이 rawdata의 GridEye=1, Direction=10/20 행에서 읽습니다.
+            # debugstr의 DEBUG/EVENT 행은 연결이 끊기면 빠지므로 IN/OUT 원천으로 쓰지 않습니다.
+            reader = _read_debugstr if stream == "debugstr" else _read_rawdata
+            adl, inout, end_offset, consumed = reader(
                 path,
                 start,
                 house_mac=house_mac,
@@ -85,16 +92,77 @@ class DataDirectoryReader:
         )
 
     def _discover_files(self) -> list[Path]:
-        backfill = _as_bool(self.environ.get("SLIMHUB_DB_BACKFILL"))
-        today = datetime.now().strftime("%Y-%m-%d")
+        # 변경 사항(2026-10-27): 오늘 파일만 읽으면 자정 직전 행과 늦게 다시 쓰인 행을
+        # 놓칩니다. 모든 날짜 파일을 보고, 다 읽은 파일은 offset으로 건너뜁니다.
         files: list[Path] = []
-        # 변경 사항: DB updater는 debugstr만 읽습니다. rawdata는 수집 원본으로
-        # 계속 보존하지만 local DB ingest source에는 포함하지 않습니다.
-        pattern = "*/*/*/inference/debugstr/*.txt"
-        for path in self.paths.data_dir.glob(pattern):
-            if backfill or path.stem == today:
-                files.append(path)
+        for stream in ("debugstr", "rawdata"):
+            files.extend(self.paths.data_dir.glob(f"*/*/*/inference/{stream}/*.txt"))
         return sorted(set(files))
+
+
+def _line_start(source, start: int) -> int:
+    """Return start, or the next line start if start falls inside a line."""
+    if start <= 0:
+        return 0
+    source.seek(start - 1)
+    if source.read(1) == b"\n":
+        return start
+    source.readline()
+    return source.tell()
+
+
+def _read_rawdata(
+    path: Path,
+    start: int,
+    *,
+    house_mac: str,
+    location: str,
+    path_mac: str,
+) -> tuple[
+    list[tuple[object, ...]],
+    list[tuple[object, ...]],
+    int,
+    int,
+]:
+    inout_rows: list[tuple[object, ...]] = []
+    consumed = 0
+    with path.open("rb") as source:
+        header_line = source.readline()
+        if not header_line.endswith(b"\n"):
+            return [], [], 0, 0
+        # Columns by name: v1/June files have 22 columns, July+ files 26.
+        header = next(csv.reader([header_line.decode("utf-8", "replace").strip()]))
+        columns = {name.strip(): index for index, name in enumerate(header)}
+        if not {"time", "GridEye", "Direction"} <= columns.keys():
+            return [], [], source.tell(), 1
+        end_offset = max(_line_start(source, start), source.tell())
+        source.seek(end_offset)
+        while True:
+            line_start = source.tell()
+            raw_line = source.readline()
+            if not raw_line:
+                break
+            if not raw_line.endswith(b"\n"):
+                source.seek(line_start)
+                break
+            end_offset = source.tell()
+            consumed += 1
+            try:
+                row = next(csv.reader([raw_line.decode("utf-8").strip()]))
+            except (UnicodeDecodeError, StopIteration, csv.Error):
+                continue
+            if len(row) <= max(columns["time"], columns["GridEye"], columns["Direction"]):
+                continue
+            if row[columns["GridEye"]].strip() != "1":
+                continue
+            direction = _optional_int(row[columns["Direction"]])
+            created_time = _timestamp_text(row[columns["time"]])
+            if direction not in INOUT_DIRECTIONS or created_time is None:
+                continue
+            inout_rows.append(
+                (house_mac, f"{location}:{path_mac}", created_time, direction)
+            )
+    return [], inout_rows, end_offset, consumed
 
 
 def _read_debugstr(
@@ -114,8 +182,8 @@ def _read_debugstr(
     inout_rows: list[tuple[object, ...]] = []
     consumed = 0
     with path.open("rb") as source:
-        source.seek(start)
-        end_offset = start
+        end_offset = _line_start(source, start)
+        source.seek(end_offset)
         while True:
             line_start = source.tell()
             raw_line = source.readline()
@@ -136,29 +204,10 @@ def _read_debugstr(
             if created_time is None:
                 continue
             record_type = str(document.get("type") or "").upper()
-
-            # 변경 사항: debugstr의 확정 EVENT만 IN/OUT DB row로 변환합니다.
-            # DEBUG record는 같은 EVENT의 legacy duplicate일 수 있어 제외합니다.
-            if record_type == "EVENT":
-                event = str(document.get("event") or "").upper()
-                value = _optional_int(document.get("value"))
-                expected_value = {"ENTER": 10, "EXIT": 20}.get(event)
-                if expected_value is not None and value == expected_value:
-                    inout_rows.append(
-                        (
-                            house_mac,
-                            f"{location}:{path_mac}",
-                            created_time,
-                            expected_value,
-                        )
-                    )
-                continue
-
+            # 모든 ESA 결과(COMPLETE, PARTIAL, NO_MATCH, POP, PRE-DETECT 등)를 넣습니다.
             if record_type != "INFERENCE":
                 continue
             status = str(document.get("status") or "").upper()
-            if status not in FINAL_INFERENCE_STATUSES:
-                continue
             device = str(document.get("device") or path_mac)
             try:
                 device = normalize_mac(device)
@@ -183,7 +232,7 @@ def _read_debugstr(
 def _data_path_identity(
     data_dir: Path,
     path: Path,
-) -> tuple[str, str] | None:
+) -> tuple[str, str, str] | None:
     try:
         relative = path.relative_to(data_dir)
     except ValueError:
@@ -192,13 +241,13 @@ def _data_path_identity(
     if len(parts) != 6 or parts[3] != "inference":
         return None
     location, _device_type, mac, _inference, stream, _filename = parts
-    if stream != "debugstr":
+    if location not in ROOM_LOCATIONS or stream not in {"debugstr", "rawdata"}:
         return None
     try:
         mac = normalize_mac(mac)
     except ValueError:
         return None
-    return location, mac
+    return location, mac, stream
 
 
 def _timestamp_text(value: object) -> str | None:
@@ -229,9 +278,3 @@ def _optional_int(value: object) -> int | None:
 def _as_nonnegative_int(value: object) -> int:
     parsed = _optional_int(value)
     return max(parsed or 0, 0)
-
-
-def _as_bool(value: object) -> bool:
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(value)

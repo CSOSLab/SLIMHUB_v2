@@ -645,16 +645,16 @@ def build_parser() -> argparse.ArgumentParser:
         "db",
         help="Run or inspect the cron-friendly database synchronization pipeline.",
         description=(
-            "Read confirmed EVENT/INFERENCE records from data/**/inference/debugstr,\n"
-            "insert them incrementally into local MySQL, and maintain offsets under\n"
-            "programdata/db_sync. These commands run without the BLE daemon.\n\n"
-            "Remote upload is currently disabled in source for local-only testing."
+            "Read every INFERENCE record from data/<room>/*/<mac>/inference/debugstr and\n"
+            "GridEye ENTER/EXIT rows from .../rawdata, insert new rows into local MySQL,\n"
+            "and maintain offsets under programdata/db_sync. These commands run without\n"
+            "the BLE daemon. Upload is skipped until SLIMHUB_REMOTE_DB_HOST is set."
         ),
         epilog=(
             "Recommended commands:\n"
             "  slimhub-v2 db ingest    # data/ -> local MySQL\n"
             "  slimhub-v2 db status    # inspect config, offsets, and last runs\n"
-            "  slimhub-v2 db upload    # currently reports skipped\n\n"
+            "  slimhub-v2 db upload    # local MySQL -> remote MySQL\n\n"
             "'db update' is a compatibility shortcut that runs ingest then upload."
         ),
         formatter_class=_HelpFormatter,
@@ -664,9 +664,8 @@ def build_parser() -> argparse.ArgumentParser:
         "update",
         help="Compatibility shortcut: run ingest, then the upload stage.",
         description=(
-            "Run local ingest followed by upload. The upload stage currently returns\n"
-            "skipped because remote DB writes are disabled. Prefer 'db ingest' for\n"
-            "local-only operation."
+            "Run local ingest followed by upload. The upload stage returns skipped\n"
+            "when no remote DB host is configured."
         ),
         formatter_class=_HelpFormatter,
     )
@@ -675,19 +674,19 @@ def build_parser() -> argparse.ArgumentParser:
     db_update.add_argument("--no-upload", action="store_true", help=argparse.SUPPRESS)
     db_subparsers.add_parser(
         "ingest",
-        help="Incrementally insert new debugstr records into local MySQL.",
+        help="Incrementally insert new data/ rows into local MySQL.",
         description=(
-            "Canonical local-only DB command. Source offsets advance only after the\n"
+            "Canonical local DB ingest command. Source offsets advance only after the\n"
             "corresponding local transaction commits."
         ),
         formatter_class=_HelpFormatter,
     )
     db_subparsers.add_parser(
         "upload",
-        help="Run the remote-upload stage (currently disabled/skipped).",
+        help="Upload new local rows to the remote DB (skipped without a remote host).",
         description=(
-            "Attempt the local-to-remote stage. In this branch it performs no remote\n"
-            "connection or INSERT and records a skipped result."
+            "Copy local rows after the per-table id cursor to the remote DB, up to the\n"
+            "batch size per table. Without SLIMHUB_REMOTE_DB_HOST it records skipped."
         ),
         formatter_class=_HelpFormatter,
     )
