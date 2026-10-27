@@ -68,6 +68,27 @@ class LogDataProtocolTest(unittest.TestCase):
                          ("aborted", "connect_timeout"))
         self.assertIsNone(ack_target(status.value))
 
+    def test_light_and_sound_level_records_decode_and_ack(self):
+        # Node 2026-10-27: ENV status bit2 + bytes58..59 BH1750 raw, SOUND byte59 level.
+        import zlib
+        env = bytearray(GOLDEN_ENV)
+        env[56] |= 4
+        struct.pack_into("<H", env, 58, 1200)
+        struct.pack_into("<I", env, 60, zlib.crc32(bytes(env[:60])))
+        payload = b"VLG1" + struct.pack("<QI", 7, 1) + bytes(env)
+        detail = parse_frame(build_frame(MAC, "LOGDATA", payload)).parsed
+        self.assertIsNone(detail.error)
+        self.assertAlmostEqual(detail.value["records"][0]["light_lux"], 1000.0)
+        self.assertEqual(ack_target(detail.value), ("log", 1, 1))
+        old = parse_frame(build_frame(MAC, "LOGDATA", vlg1())).parsed
+        self.assertIsNone(old.value["records"][0]["light_raw"])
+        bad = bytearray(GOLDEN_ENV)
+        struct.pack_into("<H", bad, 58, 1200)
+        struct.pack_into("<I", bad, 60, zlib.crc32(bytes(bad[:60])))
+        rejected = parse_frame(build_frame(MAC, "LOGDATA",
+                                           b"VLG1" + struct.pack("<QI", 7, 1) + bytes(bad))).parsed
+        self.assertIsNotNone(rejected.error)
+
     def test_invalid_logdata_is_returned_with_error(self):
         bad = parse_frame(build_frame(MAC, "LOGDATA", b"VLE1" + b"\0" * 10)).parsed
         self.assertIsNotNone(bad.error)

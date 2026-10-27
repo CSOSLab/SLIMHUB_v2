@@ -33,10 +33,12 @@ def decode_record(data):
     if flags & ~(0x3F0F if kind == 4 else 31 if kind in (1, 5) else 15):
         raise ValueError("unknown record flags")
     if kind == 1:
-        if length != 28 or data[58:60] != b"\0\0":
+        if length != 28:
             raise ValueError("invalid ENV payload")
         valid, input_valid, encodable, accuracy, status, fallback = data[52:58]
-        if (valid | input_valid | encodable) & ~31 or accuracy > 3 or status & ~3 or fallback & ~3:
+        if not status & 4 and data[58:60] != b"\0\0":
+            raise ValueError("invalid ENV payload")
+        if (valid | input_valid | encodable) & ~31 or accuracy > 3 or status & ~7 or fallback & ~3:
             raise ValueError("invalid ENV masks/quality")
         values, pairs = [], []
         for channel in range(5):
@@ -48,8 +50,12 @@ def decode_record(data):
         result.update(channels=CHANNELS, decimal_pairs=pairs, values=values,
                       valid_mask=valid, input_valid_mask=input_valid, encodable_mask=encodable,
                       iaq_accuracy=accuracy, status=status, raw_fallback_mask=fallback)
+        # status bit2: BH1750 H-res raw count in bytes 58..59 (lux = raw / 1.2).
+        light_raw = struct.unpack_from("<H", data, 58)[0] if status & 4 else None
+        result.update(light_raw=light_raw,
+                      light_lux=None if light_raw is None else light_raw / 1.2)
     elif kind == 2:
-        if length != 28 or data[59] != 0:
+        if length != 28:
             raise ValueError("invalid SOUND payload")
         count, source, duration, samples, reason = struct.unpack_from("<BBHHB", data, 52)
         if not 1 <= count <= 20 or source not in (1, 2) or duration > timestamp:
@@ -59,7 +65,9 @@ def decode_record(data):
         raw = list(struct.unpack_from(f"<{count}b", data, 32)) if source == 1 else None
         result.update(class_count=count, source="TFLM_INVOKED" if source == 1 else "RMS_GATED",
                       scores_i8=raw, clip_start_ms=timestamp - duration, clip_end_ms=timestamp,
-                      sample_count=samples, gate_reason=reason)
+                      sample_count=samples, gate_reason=reason,
+                      # byte59: 0.25 dB steps above 40 dB, 0 = not measured.
+                      level_db=40 + data[59] * 0.25 if data[59] else None)
     elif kind == 3:
         meta_kind, index, count, size = data[32:36]
         if not 1 <= meta_kind <= 6 or not 0 <= index < count or not 1 <= size <= 24:
