@@ -157,6 +157,16 @@ prints passwords. Every dated file under the five room folders is scanned; byte
 offsets skip what was already read, and rows already present in the local table
 are not inserted again. The first run therefore imports the whole history.
 
+When `SLIMHUB_LEGACY_INOUT_FROM=YYYY-MM-DD` is set, `in_out` rows from that date
+come from `data/legacy_inout/YYYY-MM-DD.txt` instead of rawdata. Each ingest
+first extends those files with `slimhub/integrations/legacy_inout.py`: one
+house-wide active room as in the v1 hub (a Node ENTER in another room writes
+the previous room's 20 and the new room's 10 at the same time; Node EXITs are
+ignored; no timeout). `last_ingest.result.legacy_inout` shows the rows written
+or the generator error, which does not stop the `event_adl` insert. Use
+`scripts/legacy_inout.py --dry-run` to preview and `--rebuild --from DATE` to
+regenerate (then delete that period from `in_out` before the next ingest).
+
 ## 6. Confirm remote upload
 
 Without remote settings the upload stage records `skipped`. With them,

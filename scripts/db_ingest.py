@@ -14,7 +14,7 @@ from slimhub.integrations.database import DataDirectoryDatabaseUpdater
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Incrementally load debugstr INFERENCE and rawdata ENTER/EXIT into local MySQL."
+        description="Incrementally load debugstr INFERENCE and ENTER/EXIT (rawdata, or data/legacy_inout from SLIMHUB_LEGACY_INOUT_FROM) into local MySQL."
     )
     parser.add_argument("--base-dir", default="/home/rtlab/SLIMHUB_v2")
     args = parser.parse_args()

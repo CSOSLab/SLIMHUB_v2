@@ -292,6 +292,47 @@ class DataDirectoryDatabaseUpdaterTests(unittest.TestCase):
                 updater._read_json(paths.db_ingest_offset_path),
             )
 
+    def test_ingest_builds_legacy_inout_first_and_keeps_adl_on_its_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = AppPaths.from_base(tmpdir)
+            date = "2026-10-21"
+            data_path(paths, "rawdata", date=date).write_text(
+                RAW_HEADER + raw_row(f"{date} 10:00:00", 1, 10)
+                + raw_row(f"{date} 10:05:00", 1, 20),
+                encoding="utf-8",
+            )
+            data_path(paths, "debugstr", date=date).write_text(
+                json.dumps({"device": MAC, "type": "INFERENCE", "status": "COMPLETE",
+                            "ADL": "pee", "timestamp": f"{date} 10:05:00"}) + "\n",
+                encoding="utf-8",
+            )
+            environ = {
+                "SLIMHUB_LOCAL_DB_HOST": "localhost",
+                "SLIMHUB_LOCAL_DB_USER": "user",
+                "SLIMHUB_LOCAL_DB_NAME": "adl_event",
+                "SLIMHUB_HOUSE_MAC": "house",
+                "SLIMHUB_LEGACY_INOUT_FROM": "2026-10-20",
+            }
+            updater = DataDirectoryDatabaseUpdater(paths, environ=environ)
+            local = FakeConnection()
+
+            with patch.object(updater, "_connect", return_value=local):
+                result = updater.ingest()
+
+            # The Node's own EXIT is not a legacy row; only the ENTER is.
+            self.assertEqual(result["legacy_inout"]["rows"], 1)
+            self.assertEqual(result["adl_inserted"], 1)
+            self.assertEqual(
+                local.inserts[-1][1], [("house", f"ENTRY:{MAC}", f"{date} 10:00:00", 10)]
+            )
+
+            broken = DataDirectoryDatabaseUpdater(
+                paths, environ={**environ, "SLIMHUB_LEGACY_INOUT_FROM": "2026-10-21"}
+            )
+            with patch.object(broken, "_connect", return_value=FakeConnection()):
+                result = broken.ingest()
+            self.assertIn("--rebuild", result["legacy_inout"]["error"])
+
     def test_preview_writes_pending_db_rows_without_db_or_offset_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = AppPaths.from_base(tmpdir)

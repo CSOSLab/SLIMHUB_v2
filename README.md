@@ -188,6 +188,27 @@ house_mac·location·created_time·direction, `event_adl`: 여기에 event_seque
 `programdata/db_sync/data_offsets.json`에 저장합니다. 이어서 local table의 `id`
 offset을 기준으로 동일 schema의 원격 table에 전송합니다.
 
+**v1 형태 IN/OUT (2026-10-28).** 원격 DB 프로시저는 v1 Hub의 입퇴실 형태(한 가구에 활성
+방 하나)를 전제로 합니다. 지금 Node는 방마다 따로 입퇴실을 판단하므로, `SLIMHUB_LEGACY_INOUT_FROM`
+(예: `2026-10-20`)을 db.env에 넣으면 그 날짜부터 `in_out`은 rawdata 대신
+`data/legacy_inout/YYYY-MM-DD.txt`에서 읽습니다. 이 파일은 ingest가 먼저
+`slimhub/integrations/legacy_inout.py`로 이어서 만듭니다. 다섯 방 rawdata의 Node ENTER
+(`GridEye=1, Direction=10`)를 시각순으로 합쳐, 활성 방이 없으면 `새 방 10`, 같은 방 ENTER는
+무시, 다른 방 ENTER면 같은 시각에 `이전 방 20` + `새 방 10`을 씁니다. Node 자신의 EXIT(20)는
+무시하고 timeout도 없습니다(v1과 같은 결과). 아직 다른 방 파일이 덜 쓰였을 수 있는 최근 60초
+(`SLIMHUB_LEGACY_INOUT_LAG_SECONDS`)는 다음 실행으로 미룹니다. 상태는
+`programdata/db_sync/legacy_inout_state.json`에 둡니다. 한 줄 형식:
+
+```text
+2026-10-27 00:05:01  TOILET 90:E5:B1:D1:23:36 [EVENT] - EXIT value: 20
+2026-10-27 00:05:01  KITCHEN 90:E5:B1:D1:23:22 [EVENT] - ENTER value: 10
+```
+
+`scripts/legacy_inout.py --dry-run`은 날짜별 행 수와 예시만 출력하고,
+`--rebuild --from YYYY-MM-DD`는 기존 파일을 `programdata/db_sync/legacy_inout_backup_*`로
+옮기고 다시 만듭니다. rebuild 뒤에는 local(필요하면 원격) `in_out`의 해당 기간 행을 지운 다음
+ingest해야 합니다. 시작일을 설정하지 않은 Hub는 지금처럼 rawdata에서 읽습니다.
+
 `house_mac`은 기본적으로 `programdata/config.json`의 Hub `address`를 사용하며,
 배포 식별자를 별도로 써야 하면 `SLIMHUB_HOUSE_MAC`으로 재정의합니다. `in_out`의
 `location`은 `<room>:<node MAC>`, `event_adl`의 `location`은 node MAC으로 저장해
