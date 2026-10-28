@@ -822,45 +822,85 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
                 living.address,
             )
 
-    async def test_stuck_bluez_scan_power_cycles_the_adapter_once_per_cooldown(self) -> None:
+    async def test_continuous_scanner_restarts_on_stall_and_resets_adapter_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
             daemon.scan_interval = 0
-            scans = 0
+            starts = 0
 
-            async def stuck_scan(*_: object) -> list[object]:
-                nonlocal scans
-                scans += 1
-                if scans >= 20:
-                    daemon.stop_event.set()
-                raise FakeBleakError("[org.bluez.Error.InProgress] Operation already in progress")
+            class SilentScanner:
+                def __init__(self, callback) -> None:
+                    self.callback = callback
 
-            with patch("slimhub.daemon.discover_named_devices", side_effect=stuck_scan), \
-                    patch("slimhub.daemon.power_cycle_adapter") as power_cycle:
+                async def start(self) -> None:
+                    nonlocal starts
+                    starts += 1
+                    if starts >= 5:
+                        daemon.stop_event.set()
+
+                async def stop(self) -> None:
+                    return None
+
+            with patch("slimhub.daemon.create_scanner", side_effect=SilentScanner), \
+                    patch("slimhub.daemon.power_cycle_adapter") as power_cycle, \
+                    patch("slimhub.daemon.SCAN_STALL_SECONDS", 0.0), \
+                    patch("slimhub.daemon.SCAN_HEALTH_CHECK_SECONDS", 0.0):
                 await daemon._scan_loop()
 
-            # 8 InProgress scans trigger one cycle; the 10 min cooldown blocks
-            # a second one within these 20 scans.
+            # No advertisement: each scanner stalls; the 2nd failure cycles the
+            # adapter and the 10 min cooldown blocks another within this run.
+            power_cycle.assert_awaited_once()
+            self.assertFalse(daemon.central.advertisement_driven)
+
+    async def test_scanner_start_that_never_answers_counts_as_a_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
+            daemon.scan_interval = 0
+            starts = 0
+
+            class HungScanner:
+                def __init__(self, callback) -> None:
+                    pass
+
+                async def start(self) -> None:
+                    nonlocal starts
+                    starts += 1
+                    if starts >= 3:
+                        daemon.stop_event.set()
+                        return
+                    await asyncio.sleep(3600)
+
+                async def stop(self) -> None:
+                    return None
+
+            with patch("slimhub.daemon.create_scanner", side_effect=HungScanner), \
+                    patch("slimhub.daemon.power_cycle_adapter") as power_cycle, \
+                    patch("slimhub.daemon.SCAN_CALL_TIMEOUT_SECONDS", 0.01):
+                await daemon._scan_loop()
+
+            self.assertEqual(starts, 3)
             power_cycle.assert_awaited_once()
 
-    async def test_other_scan_errors_do_not_power_cycle_the_adapter(self) -> None:
+    async def test_advertisement_refreshes_dean_sessions_and_scan_health(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             daemon = SlimHubDaemon(paths=AppPaths.from_base(tmpdir))
-            daemon.scan_interval = 0
-            scans = 0
+            node = types.SimpleNamespace(address="AA:BB:CC:DD:EE:01", name="DEAN_NODE_V2")
+            phone = types.SimpleNamespace(address="AA:BB:CC:DD:EE:99", name="phone")
+            advertisement = types.SimpleNamespace(local_name=None)
+            seen = []
 
-            async def powered_off(*_: object) -> list[object]:
-                nonlocal scans
-                scans += 1
-                if scans >= 12:
-                    daemon.stop_event.set()
-                raise FakeBleakError("No powered Bluetooth adapters found.")
+            async def ensure(target: object) -> None:
+                seen.append(target.address)
 
-            with patch("slimhub.daemon.discover_named_devices", side_effect=powered_off), \
-                    patch("slimhub.daemon.power_cycle_adapter") as power_cycle:
-                await daemon._scan_loop()
+            with patch.object(daemon, "_start_or_update_session", side_effect=ensure):
+                daemon._last_advertisement = 0.0
+                daemon._on_advertisement(phone, advertisement)
+                daemon._on_advertisement(node, advertisement)
+                daemon._on_advertisement(node, advertisement)  # within 1 s: skipped
+                await asyncio.gather(*daemon._advertisement_tasks)
 
-            power_cycle.assert_not_awaited()
+            self.assertEqual(seen, [node.address])
+            self.assertGreater(daemon._last_advertisement, 0.0)
 
     async def test_legacy_detected_20_does_not_assign_demo_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

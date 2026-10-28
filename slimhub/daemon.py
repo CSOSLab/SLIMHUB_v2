@@ -11,7 +11,7 @@ from pathlib import Path
 
 from slimhub.ble.central import BleCentral
 from slimhub.ble.registry import DeviceRegistry
-from slimhub.ble.scanner import discover_named_devices, power_cycle_adapter
+from slimhub.ble.scanner import create_scanner, power_cycle_adapter
 from slimhub.config import (
     DEFAULT_DEVICE_TYPE,
     DEFAULT_LOCATION,
@@ -69,11 +69,25 @@ from slimhub.unitspace.estimator import SimpleUnitspaceEstimator
 CONNECT_SETTLE_SECONDS = 6.0
 # Consecutive scan failures before sessions fall back to timed reconnects.
 SCAN_FAILURES_BEFORE_TIMED_RECONNECT = 2
-# BlueZ discovery stuck in org.bluez.Error.InProgress (2026-10-12/16/21/27):
-# a daemon restart does not clear it, an adapter power cycle does. Cycle after
-# this many consecutive InProgress scans (~2 min), at most once per cooldown.
-SCAN_IN_PROGRESS_BEFORE_ADAPTER_RESET = 8
+# One scanner stays on (2026-10-28): 5 s discover every 15 s meant ~5,760
+# BlueZ start/stop pairs a day, and the start/stop race left discovery stuck
+# (InProgress 10/12/16/21/27; on 10/28 StartDiscovery never answered). A
+# continuous scanner also catches Node advertising at any time.
+# Every BlueZ scanner start/stop must answer within this many seconds.
+SCAN_CALL_TIMEOUT_SECONDS = 15.0
+# No advertisement from any nearby device for this long = scanner is dead.
+SCAN_STALL_SECONDS = 180.0
+SCAN_HEALTH_CHECK_SECONDS = 10.0
+# A Node advertises many times a second; refresh its session at most this often.
+ADVERTISEMENT_REFRESH_SECONDS = 1.0
+# Consecutive scanner failures (error, timeout, stall) before an adapter power
+# cycle, at most once per cooldown.
+SCAN_FAILURES_BEFORE_ADAPTER_RESET = 2
 ADAPTER_RESET_COOLDOWN_SECONDS = 600.0
+
+
+class ScanStalledError(RuntimeError):
+    pass
 
 
 USD_STATUS_FIELDS = (
@@ -150,6 +164,10 @@ class SlimHubDaemon:
         self._sound_schemas: dict[str, tuple[str | None, int | None]] = {}
         self.sound_capture = SoundCaptureStore(paths, self.logger)
         self.adapter_lock = asyncio.Lock()
+        self._advertisement_tasks: set[asyncio.Task[None]] = set()
+        self._advertisement_refresh: dict[str, float] = {}
+        self._last_advertisement = 0.0
+        self._scan_failures = 0
         self.central = BleCentral(
             registry=self.registry,
             on_frame=self.handle_frame,
@@ -186,10 +204,10 @@ class SlimHubDaemon:
         await self.legacy_report_writer.start()
         await self._start_server()
         self.logger.info(
-            "BLE scan settings name=%s scan_timeout=%.1fs scan_interval=%.1fs "
+            "BLE scan settings name=%s mode=continuous stall=%.0fs restart_after=%.1fs "
             "connect_timeout=%.1fs notify_timeout=%.1fs",
             self.device_name,
-            self.scan_timeout,
+            SCAN_STALL_SECONDS,
             self.scan_interval,
             self.connect_timeout,
             self.notify_timeout,
@@ -875,48 +893,75 @@ class SlimHubDaemon:
         )
 
     async def _scan_loop(self) -> None:
-        failures = 0
-        in_progress = 0
+        self._scan_failures = 0
         last_reset = None
         while not self.stop_event.is_set():
             try:
-                async with self.adapter_lock:
-                    devices = await discover_named_devices(self.device_name, self.scan_timeout)
-                if failures >= SCAN_FAILURES_BEFORE_TIMED_RECONNECT:
-                    self.logger.warning("BLE scan recovered; reconnect on advertisements again")
-                failures = 0
-                in_progress = 0
-                await self.central.set_advertisement_driven(True)
-                for device in devices:
-                    await self._start_or_update_session(device)
+                await self._run_scanner()
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception:
                 self.logger.exception("BLE scan failed")
-                failures += 1
-                in_progress = in_progress + 1 if "org.bluez.Error.InProgress" in str(exc) else 0
-                now = time.monotonic()
-                if in_progress >= SCAN_IN_PROGRESS_BEFORE_ADAPTER_RESET and (
-                    last_reset is None or now - last_reset >= ADAPTER_RESET_COOLDOWN_SECONDS
-                ):
-                    last_reset = now
-                    in_progress = 0
-                    await self._reset_adapter()
+                self._scan_failures += 1
+                failures = self._scan_failures
                 if failures == SCAN_FAILURES_BEFORE_TIMED_RECONNECT:
                     # Advertisement-driven sessions would never reconnect
-                    # while the scanner is broken (e.g. BlueZ InProgress).
+                    # while the scanner is broken.
                     self.logger.warning(
                         "BLE scan failed %d times; falling back to timed reconnects",
                         failures,
                     )
                     await self.central.set_advertisement_driven(False)
+                now = time.monotonic()
+                if failures >= SCAN_FAILURES_BEFORE_ADAPTER_RESET and (
+                    last_reset is None or now - last_reset >= ADAPTER_RESET_COOLDOWN_SECONDS
+                ):
+                    last_reset = now
+                    await self._reset_adapter()
             await self._wait_or_stop(self.scan_interval)
 
+    async def _run_scanner(self) -> None:
+        """Keep one scanner on until stop; raise on a BlueZ error or a stall."""
+        self._advertisement_refresh: dict[str, float] = {}
+        started = time.monotonic()
+        self._last_advertisement = started
+        scanner = create_scanner(self._on_advertisement)
+        async with self.adapter_lock:
+            await asyncio.wait_for(scanner.start(), timeout=SCAN_CALL_TIMEOUT_SECONDS)
+        try:
+            while not self.stop_event.is_set():
+                await self._wait_or_stop(SCAN_HEALTH_CHECK_SECONDS)
+                if self._scan_failures and self._last_advertisement > started:
+                    self._scan_failures = 0
+                    if not self.central.advertisement_driven:
+                        self.logger.warning("BLE scan recovered; reconnect on advertisements again")
+                        await self.central.set_advertisement_driven(True)
+                idle = time.monotonic() - self._last_advertisement
+                if idle > SCAN_STALL_SECONDS:
+                    raise ScanStalledError(f"no BLE advertisement for {idle:.0f} s")
+        finally:
+            with suppress(Exception):
+                await asyncio.wait_for(scanner.stop(), timeout=SCAN_CALL_TIMEOUT_SECONDS)
+
+    def _on_advertisement(self, device: object, advertisement: object) -> None:
+        now = time.monotonic()
+        self._last_advertisement = now
+        name = getattr(device, "name", None) or getattr(advertisement, "local_name", None)
+        if name != self.device_name:
+            return
+        address = str(getattr(device, "address", ""))
+        if now - self._advertisement_refresh.get(address, float("-inf")) < ADVERTISEMENT_REFRESH_SECONDS:
+            return
+        self._advertisement_refresh[address] = now
+        task = asyncio.get_running_loop().create_task(self._start_or_update_session(device))
+        self._advertisement_tasks.add(task)
+        task.add_done_callback(self._advertisement_tasks.discard)
+
     async def _reset_adapter(self) -> None:
-        self.logger.warning("BLE scan stuck (BlueZ InProgress); power-cycling the adapter")
+        self.logger.warning("BLE scanner keeps failing; power-cycling the adapter")
         try:
             async with self.adapter_lock:
-                await power_cycle_adapter()
+                await asyncio.wait_for(power_cycle_adapter(), timeout=2 * SCAN_CALL_TIMEOUT_SECONDS)
         except asyncio.CancelledError:
             raise
         except Exception:
