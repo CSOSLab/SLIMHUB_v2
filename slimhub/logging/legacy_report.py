@@ -152,6 +152,22 @@ def validate_legacy_report(
     )
 
 
+def legacy_inout_report(mac: str, direction: int, time_text: str) -> ValidatedLegacyReport:
+    """The hub's v1-style one-active-room ENTER/EXIT (see legacy_inout.py).
+
+    Written as type=EVENT to debugstr and display, which the DB sync reads;
+    the fingerprint carries the time so a quick re-ENTER is not deduplicated.
+    """
+    event = "ENTER" if direction == 10 else "EXIT"
+    mac = normalize_mac(mac)
+    return ValidatedLegacyReport(
+        mac=mac,
+        kind="EVENT",
+        document={"device": mac, "type": "EVENT", "event": event, "value": direction},
+        fingerprint=(mac, "EVENT", event, direction, time_text),
+    )
+
+
 def _require_keys(document: dict[object, object], required: tuple[str, ...]) -> None:
     missing = [key for key in required if key not in document]
     if missing:
@@ -345,20 +361,25 @@ class LegacyReportWriter:
             f"{_display_message(document)}\n"
         )
 
-        debug_path = (
+        inference_dir = (
             self.paths.data_dir
             / item.location
             / item.device_type
             / item.report.mac
             / "inference"
-            / "debugstr"
-            / f"{date}.txt"
         )
+        # 2026-10-28: the Node's own ENTER/EXIT (new per-room algorithm) goes to
+        # new_algo_inout/ only; debugstr and display keep the hub's v1-style
+        # one-active-room EVENT lines that the DB sync reads.
+        if document["type"] == "DEBUG":
+            self._append_locked(inference_dir / "new_algo_inout" / f"{date}.txt", debug_line)
+            self.health["written"] += 1
+            return
         daily_display_path = self.paths.display_dir / f"{date}.txt"
         current_display_path = self.paths.display_path
 
         self._append_locked(
-            debug_path,
+            inference_dir / "debugstr" / f"{date}.txt",
             debug_line,
         )
         self._append_locked(
@@ -396,7 +417,7 @@ class LegacyReportWriter:
 
 
 def _display_message(document: dict[str, object]) -> str:
-    if document["type"] == "DEBUG":
+    if document["type"] in {"DEBUG", "EVENT"}:
         return (
             f"[EVENT] - {document['event']} "
             f"value: {document['value']}"

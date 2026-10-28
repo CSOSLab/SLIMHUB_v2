@@ -3,7 +3,6 @@ from __future__ import annotations
 import csv
 import json
 import os
-import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -16,45 +15,6 @@ from slimhub.protocol.nus import normalize_mac
 # undefined, display and validation trees are not DB sources.
 ROOM_LOCATIONS = {"ENTRY", "LIVING", "BEDROOM", "KITCHEN", "TOILET"}
 INOUT_DIRECTIONS = {10, 20}
-
-# 변경 사항(2026-10-28): 원격 DB 프로시저는 v1의 IN/OUT 형태(집 전체에 활성 방 하나)를
-# 전제로 합니다. 시작일(SLIMHUB_LEGACY_INOUT_FROM) 이후의 in_out은 legacy_inout.py가
-# rawdata에서 만든 data/legacy_inout/YYYY-MM-DD.txt에서만 읽습니다.
-LEGACY_INOUT_DIRNAME = "legacy_inout"
-LEGACY_INOUT_FROM_ENV = "SLIMHUB_LEGACY_INOUT_FROM"
-LEGACY_INOUT_LINE = re.compile(
-    r"^(?P<ts>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)  (?P<room>[A-Z]+) "
-    r"(?P<mac>(?:[0-9A-F]{2}:){5}[0-9A-F]{2}) \[EVENT\] - (?:ENTER|EXIT) "
-    r"value: (?P<value>10|20)$"
-)
-
-
-def legacy_inout_line(created_time: str, room: str, mac: str, direction: int) -> str:
-    event = "ENTER" if direction == 10 else "EXIT"
-    return f"{created_time}  {room} {mac} [EVENT] - {event} value: {direction}\n"
-
-
-def legacy_inout_state_path(paths: AppPaths) -> Path:
-    return paths.db_sync_dir / "legacy_inout_state.json"
-
-
-def legacy_inout_from(paths: AppPaths, environ: dict[str, str]) -> str | None:
-    """Cut-over date from the environment, else from the generator state.
-
-    The state fallback keeps a run without db.env from going back to rawdata.
-    """
-    value = str(environ.get(LEGACY_INOUT_FROM_ENV) or "").strip()
-    if not value:
-        try:
-            state = json.loads(legacy_inout_state_path(paths).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-        value = str(state.get("from_date") or "").strip() if isinstance(state, dict) else ""
-    try:
-        return datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d") if value else None
-    except ValueError:
-        return None
-
 
 @dataclass(frozen=True)
 class DataIngestBatch:
@@ -81,7 +41,6 @@ class DataDirectoryReader:
             for key, value in (offsets or {}).items()
         }
         self.environ = dict(os.environ if environ is None else environ)
-        self.legacy_from = legacy_inout_from(paths, self.environ)
 
     def read(self, *, house_mac: str) -> DataIngestBatch:
         adl_rows: list[tuple[object, ...]] = []
@@ -91,20 +50,10 @@ class DataDirectoryReader:
         lines = 0
 
         for path in self._discover_files():
-            if path.parent.name == LEGACY_INOUT_DIRNAME:
-                if self.legacy_from is None or path.stem < self.legacy_from:
-                    continue
-                location = mac = ""
-                stream = LEGACY_INOUT_DIRNAME
-            else:
-                identity = _data_path_identity(self.paths.data_dir, path)
-                if identity is None:
-                    continue
-                location, mac, stream = identity
-                # rawdata only feeds in_out; from the cut-over the legacy file does.
-                if (stream == "rawdata" and self.legacy_from is not None
-                        and path.stem >= self.legacy_from):
-                    continue
+            identity = _data_path_identity(self.paths.data_dir, path)
+            if identity is None:
+                continue
+            location, mac, _stream = identity
             key = str(path.resolve())
             start = self.offsets.get(key, 0)
             try:
@@ -116,14 +65,10 @@ class DataDirectoryReader:
             if start == size:
                 continue
 
-            # 변경 사항(2026-10-27): ESA 결과는 debugstr INFERENCE 전체(status 무관),
-            # IN/OUT은 v1과 같이 rawdata의 GridEye=1, Direction=10/20 행에서 읽습니다.
-            # debugstr의 DEBUG/EVENT 행은 연결이 끊기면 빠지므로 IN/OUT 원천으로 쓰지 않습니다.
-            reader = {
-                "debugstr": _read_debugstr,
-                "rawdata": _read_rawdata,
-                LEGACY_INOUT_DIRNAME: _read_legacy_inout,
-            }[stream]
+            # 변경 사항(2026-10-28): 원래(060da01)처럼 debugstr 하나만 읽습니다. 입퇴실은
+            # daemon이 쓰는 v1 형태 type=EVENT ENTER/EXIT 줄, ESA 결과는 INFERENCE 전체입니다.
+            # Node 자신의 입퇴실은 new_algo_inout/에 따로 있습니다(legacy_inout.py).
+            reader = _read_debugstr
             adl, inout, end_offset, consumed = reader(
                 path,
                 start,
@@ -148,12 +93,7 @@ class DataDirectoryReader:
     def _discover_files(self) -> list[Path]:
         # 변경 사항(2026-10-27): 오늘 파일만 읽으면 자정 직전 행과 늦게 다시 쓰인 행을
         # 놓칩니다. 모든 날짜 파일을 보고, 다 읽은 파일은 offset으로 건너뜁니다.
-        files: list[Path] = []
-        for stream in ("debugstr", "rawdata"):
-            files.extend(self.paths.data_dir.glob(f"*/*/*/inference/{stream}/*.txt"))
-        if self.legacy_from is not None:
-            files.extend((self.paths.data_dir / LEGACY_INOUT_DIRNAME).glob("*.txt"))
-        return sorted(set(files))
+        return sorted(set(self.paths.data_dir.glob("*/*/*/inference/debugstr/*.txt")))
 
 
 def _line_start(source, start: int) -> int:
@@ -181,7 +121,10 @@ def _read_rawdata(
     int,
     int,
 ]:
-    """Read GridEye ENTER/EXIT rows; with until, stop before the first newer row."""
+    """Read GridEye ENTER/EXIT rows; with until, stop before the first newer row.
+
+    Not a DB source (debugstr is); legacy_inout.py rebuilds Node ENTERs from it.
+    """
     inout_rows: list[tuple[object, ...]] = []
     consumed = 0
     with path.open("rb") as source:
@@ -266,6 +209,16 @@ def _read_debugstr(
             if created_time is None:
                 continue
             record_type = str(document.get("type") or "").upper()
+            # 입퇴실은 확정 EVENT만(원래 규칙). Node의 DEBUG ENTER/EXIT는 넣지 않습니다.
+            if record_type == "EVENT":
+                event = str(document.get("event") or "").upper()
+                value = _optional_int(document.get("value"))
+                expected_value = {"ENTER": 10, "EXIT": 20}.get(event)
+                if expected_value is not None and value == expected_value:
+                    inout_rows.append(
+                        (house_mac, f"{location}:{path_mac}", created_time, expected_value)
+                    )
+                continue
             # 모든 ESA 결과(COMPLETE, PARTIAL, NO_MATCH, POP, PRE-DETECT 등)를 넣습니다.
             if record_type != "INFERENCE":
                 continue
@@ -289,49 +242,6 @@ def _read_debugstr(
                 )
             )
     return adl_rows, inout_rows, end_offset, consumed
-
-
-def _read_legacy_inout(
-    path: Path,
-    start: int,
-    *,
-    house_mac: str,
-    location: str,
-    path_mac: str,
-) -> tuple[
-    list[tuple[object, ...]],
-    list[tuple[object, ...]],
-    int,
-    int,
-]:
-    del location, path_mac  # Each line carries its own room and Node MAC.
-    inout_rows: list[tuple[object, ...]] = []
-    consumed = 0
-    with path.open("rb") as source:
-        end_offset = _line_start(source, start)
-        source.seek(end_offset)
-        while True:
-            line_start = source.tell()
-            raw_line = source.readline()
-            if not raw_line:
-                break
-            if not raw_line.endswith(b"\n"):
-                source.seek(line_start)
-                break
-            end_offset = source.tell()
-            consumed += 1
-            match = LEGACY_INOUT_LINE.match(raw_line.decode("utf-8", "replace").rstrip("\n"))
-            if match is None:
-                continue
-            inout_rows.append(
-                (
-                    house_mac,
-                    f"{match['room']}:{match['mac']}",
-                    match["ts"],
-                    int(match["value"]),
-                )
-            )
-    return [], inout_rows, end_offset, consumed
 
 
 def _data_path_identity(

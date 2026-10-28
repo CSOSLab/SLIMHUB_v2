@@ -7,6 +7,7 @@ import signal
 import time
 from contextlib import suppress
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 from slimhub.ble.central import BleCentral
@@ -42,7 +43,9 @@ from slimhub.logging import (
     RawDataLogger,
     validate_legacy_report,
 )
+from slimhub.integrations.legacy_inout import ROOM_ORDER, LegacyInOutTracker
 from slimhub.location_sync import LocationSyncCoordinator
+from slimhub.logging.legacy_report import SEOUL, legacy_inout_report
 from slimhub.multimodal import DeploymentManifestStore, MultimodalReportStore
 from slimhub.protocol.nus import (
     DEFAULT_DEVICE_NAME,
@@ -146,6 +149,7 @@ class SlimHubDaemon:
         self.validation_store = ValidationStore(paths)
         self.display_writer = DisplayWriter(paths)
         self.legacy_report_writer = LegacyReportWriter(paths)
+        self.legacy_inout = LegacyInOutTracker(paths)
         self.estimator = SimpleUnitspaceEstimator(paths.pir_occupancy_state_path)
         self.multimodal = MultimodalReportStore(
             DeploymentManifestStore(paths.deployment_manifest_path)
@@ -589,6 +593,7 @@ class SlimHubDaemon:
             self.power_shadow.update_rawdata(frame.mac, frame.parsed, timestamp)
             contract_commands = self.dean_contract.handle_raw(raw_event)
             await self.raw_logger.log(raw_event)
+            await self._log_legacy_inout(frame.mac, frame.parsed, event_location, timestamp)
             estimator_commands = self.estimator.handle(raw_event)
             sent_commands = await self._send_unitspace_commands(
                 [*contract_commands, *estimator_commands]
@@ -956,6 +961,24 @@ class SlimHubDaemon:
         task = asyncio.get_running_loop().create_task(self._start_or_update_session(device))
         self._advertisement_tasks.add(task)
         task.add_done_callback(self._advertisement_tasks.discard)
+
+    async def _log_legacy_inout(
+        self, mac: str, packet: RawDataPacket, location: str, timestamp: float
+    ) -> None:
+        """Write the v1-style one-active-room ENTER/EXIT to debugstr (legacy_inout.py).
+
+        Input is the Node's RAWDATA ENTER (the same row rawdata logs), applied in
+        arrival order; the Node's own EXIT is ignored.
+        """
+        if packet.flag_human_presence != 1 or packet.detected != 10 or location not in ROOM_ORDER:
+            return
+        time_text = datetime.fromtimestamp(timestamp, SEOUL).strftime("%Y-%m-%d %H:%M:%S")
+        for row in self.legacy_inout.enter(time_text, location, normalize_mac(mac)):
+            await self.legacy_report_writer.log(
+                legacy_inout_report(row.mac, row.direction, row.time),
+                timestamp=timestamp,
+                location=row.room,
+            )
 
     async def _reset_adapter(self) -> None:
         self.logger.warning("BLE scanner keeps failing; power-cycling the adapter")

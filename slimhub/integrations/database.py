@@ -11,7 +11,6 @@ from typing import Any
 
 from slimhub.config import AppPaths, HubConfigStore
 from slimhub.integrations.data_ingest import DataDirectoryReader
-from slimhub.integrations.legacy_inout import run_from_environ as run_legacy_inout
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -35,8 +34,8 @@ class DataDirectoryDatabaseUpdater:
 
     Collection and DB synchronization are deliberately separate: the daemon
     writes legacy-compatible rawdata CSV and debugstr JSONL files. This class
-    incrementally consumes every INFERENCE (ESA result) record from debugstr and
-    GridEye ENTER/EXIT rows from rawdata, skipping rows the local DB already
+    incrementally consumes every INFERENCE (ESA result) record and the v1-style
+    EVENT ENTER/EXIT lines from debugstr, skipping rows the local DB already
     holds. Credentials are read only from environment variables.
     """
 
@@ -118,13 +117,6 @@ class DataDirectoryDatabaseUpdater:
     # 기존 코드: data/ 파일을 읽어 실제 local DB에 입력하고 offset을 갱신합니다.
     # ========================================================================
     def _ingest(self) -> dict[str, object]:
-        # 변경 사항(2026-10-28): 시작일이 설정되어 있으면 먼저 v1 형태 IN/OUT 파일을
-        # 이어서 만듭니다. 실패해도 ESA 결과(event_adl) 적재는 계속합니다.
-        legacy: dict[str, object] | None
-        try:
-            legacy = run_legacy_inout(self.paths, self.environ)
-        except Exception as exc:
-            legacy = {"error": str(exc)}
         reader = DataDirectoryReader(
             self.paths,
             offsets=self._read_json(self.paths.db_ingest_offset_path),
@@ -167,16 +159,13 @@ class DataDirectoryDatabaseUpdater:
                         )
                 connection.commit()
         self._write_json_atomic(self.paths.db_ingest_offset_path, batch.offsets)
-        result: dict[str, object] = {
+        return {
             "files": batch.files,
             "lines": batch.lines,
             "adl_inserted": len(adl_rows),
             "inout_inserted": len(inout_rows),
             "duplicates_skipped": skipped,
         }
-        if legacy is not None:
-            result["legacy_inout"] = legacy
-        return result
 
     @staticmethod
     def _new_rows(

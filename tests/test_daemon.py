@@ -389,17 +389,15 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             await daemon.handle_frame(address, ack)
             await daemon.handle_frame(address, ack)
 
+            # The Node's own ENTER goes to new_algo_inout/, not debugstr/display.
             debug_path = next(
-                paths.data_dir.glob("*/*/*/inference/debugstr/*.txt")
+                paths.data_dir.glob("*/*/*/inference/new_algo_inout/*.txt")
             )
             self.assertEqual(
                 len(debug_path.read_text(encoding="utf-8").splitlines()),
                 1,
             )
-            self.assertEqual(
-                len(paths.display_path.read_text(encoding="utf-8").splitlines()),
-                1,
-            )
+            self.assertFalse(list(paths.data_dir.glob("*/*/*/inference/debugstr/*.txt")))
             self.assertEqual(
                 daemon.dean_contract.snapshot(address)["occupancy"],
                 "IN",
@@ -595,18 +593,8 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
                 daemon.dean_contract.home_snapshot()["confirmed_occupant"],
                 mac_b,
             )
-            display = paths.display_path.read_text(encoding="utf-8")
-            markers = [
-                "TOILET [EVENT] - ENTER value: 10",
-                "TOILET [EVENT] - EXIT value: 20",
-                "LIVING [EVENT] - ENTER value: 10",
-            ]
-            positions = [display.index(marker) for marker in markers]
-            self.assertEqual(positions, sorted(positions))
-            for marker in markers:
-                self.assertEqual(display.count(marker), 1)
             debug_by_mac: dict[str, list[str]] = {}
-            for path in paths.data_dir.glob("*/*/*/inference/debugstr/*.txt"):
+            for path in paths.data_dir.glob("*/*/*/inference/new_algo_inout/*.txt"):
                 debug_by_mac[path.parents[2].name] = [
                     json.loads(line)["event"]
                     for line in path.read_text(encoding="utf-8").splitlines()

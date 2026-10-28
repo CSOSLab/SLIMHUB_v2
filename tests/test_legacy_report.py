@@ -67,10 +67,11 @@ class LegacyReportTests(unittest.IsolatedAsyncioTestCase):
                     wait_for_commit=True,
                 )
                 self.assertEqual(outcome, "written")
-                self.assertIn(
-                    "[EVENT] - ENTER value: 10",
-                    paths.display_path.read_text(encoding="utf-8"),
-                )
+                node_lines = next(
+                    paths.data_dir.glob("*/*/*/inference/new_algo_inout/*.txt")
+                ).read_text(encoding="utf-8")
+                self.assertIn('"event": "ENTER"', node_lines)
+                self.assertFalse(paths.display_path.exists())
             finally:
                 await writer.stop()
 
@@ -99,24 +100,20 @@ class LegacyReportTests(unittest.IsolatedAsyncioTestCase):
                     "written",
                 )
 
-            debug_path = (
-                paths.data_dir
-                / "TOILET"
-                / "DEAN_NODE_V2"
-                / MAC
-                / "inference"
-                / "debugstr"
-                / "2026-07-31.txt"
-            )
+            inference = paths.data_dir / "TOILET" / "DEAN_NODE_V2" / MAC / "inference"
             display_path = paths.display_dir / "2026-07-31.txt"
+            debug_fixture = (FIXTURES / "debugstr_sample.txt").read_bytes().splitlines(True)
+            display_fixture = (FIXTURES / "display_sample.txt").read_bytes().splitlines(True)
+            # Node DEBUG -> new_algo_inout only; INFERENCE -> debugstr and display.
             self.assertEqual(
-                debug_path.read_bytes(),
-                (FIXTURES / "debugstr_sample.txt").read_bytes(),
+                (inference / "new_algo_inout" / "2026-07-31.txt").read_bytes(),
+                debug_fixture[0],
             )
             self.assertEqual(
-                display_path.read_bytes(),
-                (FIXTURES / "display_sample.txt").read_bytes(),
+                (inference / "debugstr" / "2026-07-31.txt").read_bytes(),
+                debug_fixture[1],
             )
+            self.assertEqual(display_path.read_bytes(), display_fixture[1])
 
     async def test_frame_reassembly_one_two_and_low_mtu_chunks_writes_once(
         self,
@@ -141,7 +138,7 @@ class LegacyReportTests(unittest.IsolatedAsyncioTestCase):
                 with patch("slimhub.daemon.time.time", return_value=FIXED_TIMES[0]):
                     await daemon.handle_frame(MAC, parse_frame(frames[0]))
 
-                debug = next(paths.data_dir.glob("*/*/*/inference/debugstr/*.txt"))
+                debug = next(paths.data_dir.glob("*/*/*/inference/new_algo_inout/*.txt"))
                 self.assertEqual(len(debug.read_text(encoding="utf-8").splitlines()), 1)
 
     async def test_typed_and_legacy_dual_publish_each_order_writes_one_line(
@@ -199,13 +196,9 @@ class LegacyReportTests(unittest.IsolatedAsyncioTestCase):
                         for frame in frames:
                             await daemon.handle_frame(MAC, frame)
                         await daemon.handle_frame(MAC, legacy)
-                    display = (
-                        paths.display_dir / "2026-07-31.txt"
-                    ).read_text(encoding="utf-8")
-                    marker = f"[EVENT] - {debug_event} value: {debug_value}"
-                    self.assertEqual(display.count(marker), 1)
+                    self.assertFalse((paths.display_dir / "2026-07-31.txt").exists())
                     debug = next(
-                        paths.data_dir.glob("*/*/*/inference/debugstr/*.txt")
+                        paths.data_dir.glob("*/*/*/inference/new_algo_inout/*.txt")
                     )
                     self.assertEqual(
                         len(debug.read_text(encoding="utf-8").splitlines()),
@@ -229,10 +222,12 @@ class LegacyReportTests(unittest.IsolatedAsyncioTestCase):
                 location="TOILET",
             )
             self.assertFalse(list(paths.data_dir.rglob("1970-01-01.txt")))
+            node = next(paths.data_dir.glob("*/*/*/inference/new_algo_inout/*.txt"))
             lines = next(paths.data_dir.glob("*/*/*/inference/debugstr/*.txt")).read_text(
                 encoding="utf-8"
             ).splitlines()
-            self.assertEqual([json.loads(line)["type"] for line in lines], ["DEBUG", "INFERENCE"])
+            self.assertEqual([json.loads(line)["type"] for line in lines], ["INFERENCE"])
+            self.assertEqual(json.loads(node.read_text(encoding="utf-8"))["type"], "DEBUG")
 
     async def test_five_node_concurrency_keeps_locations_and_lines_isolated(
         self,

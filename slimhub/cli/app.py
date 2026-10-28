@@ -646,8 +646,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run or inspect the cron-friendly database synchronization pipeline.",
         description=(
             "Read every INFERENCE record from data/<room>/*/<mac>/inference/debugstr and\n"
-            "GridEye ENTER/EXIT rows from .../rawdata (from SLIMHUB_LEGACY_INOUT_FROM:\n"
-            "data/legacy_inout, v1 one-active-room rows), insert new rows into local MySQL,\n"
+            "the v1-style EVENT ENTER/EXIT lines from the same debugstr files, insert new\n"
+            "rows into local MySQL,\n"
             "and maintain offsets under programdata/db_sync. These commands run without\n"
             "the BLE daemon. Upload is skipped until SLIMHUB_REMOTE_DB_HOST is set."
         ),

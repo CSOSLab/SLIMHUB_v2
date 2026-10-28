@@ -184,38 +184,42 @@ debugstr에서 확인된 보수적인 location/event signature만 `derived_infer
 
 기존 SLIMHUB와 같이 별도 DB 프로그램이 `data/`를 직접 읽습니다. 대상은 방
 폴더(`ENTRY`, `LIVING`, `BEDROOM`, `KITCHEN`, `TOILET`)의
-`<room>/DEAN_NODE_V2/<node MAC>/inference/{rawdata,debugstr}/YYYY-MM-DD.txt`
-전체 날짜입니다(`_BEDROOM` 같은 수동 사본, `undefined`, `display`, `validation`은
-제외). `rawdata`의 `GridEye=1`, `Direction=10/20` 행은 로컬 MySQL `in_out`에
-(v1과 같은 원천, header 이름으로 열을 찾아 22열·26열 모두 읽음), `debugstr`의 모든
-ESA 결과 `INFERENCE`(COMPLETE, PARTIAL, NO_MATCH, POP, PRE-DETECT 등 status 무관)는
-`event_adl`에 적재합니다. debugstr의 `DEBUG`/`EVENT` 입퇴실 행은 연결이 끊기면
-빠지므로 `in_out` 원천으로 쓰지 않습니다. local table에 같은 행(`in_out`:
-house_mac·location·created_time·direction, `event_adl`: 여기에 event_sequence·adl)이
-이미 있으면 넣지 않습니다. 파일별 byte offset은
+`<room>/DEAN_NODE_V2/<node MAC>/inference/debugstr/YYYY-MM-DD.txt` 전체 날짜입니다
+(`_BEDROOM` 같은 수동 사본, `undefined`, `display`, `validation`은 제외). debugstr의
+`"type": "EVENT"` ENTER(10)/EXIT(20) 줄은 로컬 MySQL `in_out`에, 모든 ESA 결과
+`INFERENCE`(COMPLETE, PARTIAL, NO_MATCH, POP, PRE-DETECT 등 status 무관)는 `event_adl`에
+적재합니다. local table에 같은 행(`in_out`: house_mac·location·created_time·direction,
+`event_adl`: 여기에 event_sequence·adl)이 이미 있으면 넣지 않습니다. 파일별 byte offset은
 `programdata/db_sync/data_offsets.json`에 저장합니다. 이어서 local table의 `id`
 offset을 기준으로 동일 schema의 원격 table에 전송합니다.
 
-**v1 형태 IN/OUT (2026-10-28).** 원격 DB 프로시저는 v1 Hub의 입퇴실 형태(한 가구에 활성
-방 하나)를 전제로 합니다. 지금 Node는 방마다 따로 입퇴실을 판단하므로, `SLIMHUB_LEGACY_INOUT_FROM`
-(예: `2026-10-20`)을 db.env에 넣으면 그 날짜부터 `in_out`은 rawdata 대신
-`data/legacy_inout/YYYY-MM-DD.txt`에서 읽습니다. 이 파일은 ingest가 먼저
-`slimhub/integrations/legacy_inout.py`로 이어서 만듭니다. 다섯 방 rawdata의 Node ENTER
-(`GridEye=1, Direction=10`)를 시각순으로 합쳐, 활성 방이 없으면 `새 방 10`, 같은 방 ENTER는
-무시, 다른 방 ENTER면 같은 시각에 `이전 방 20` + `새 방 10`을 씁니다. Node 자신의 EXIT(20)는
-무시하고 timeout도 없습니다(v1과 같은 결과). 아직 다른 방 파일이 덜 쓰였을 수 있는 최근 60초
-(`SLIMHUB_LEGACY_INOUT_LAG_SECONDS`)는 다음 실행으로 미룹니다. 상태는
-`programdata/db_sync/legacy_inout_state.json`에 둡니다. 한 줄 형식:
+**입퇴실 두 형식 (2026-10-28).** 원격 DB 프로시저는 v1 Hub의 입퇴실 형태(한 가구에 활성
+방 하나)를 전제로 합니다. 지금 Node는 방마다 따로 입퇴실을 판단하므로 두 기록을 나눠 둡니다.
 
 ```text
-2026-10-27 00:05:01  TOILET 90:E5:B1:D1:23:36 [EVENT] - EXIT value: 20
-2026-10-27 00:05:01  KITCHEN 90:E5:B1:D1:23:22 [EVENT] - ENTER value: 10
+data/<room>/DEAN_NODE_V2/<node MAC>/inference/
+  debugstr/YYYY-MM-DD.txt        Hub의 v1 형태 입퇴실(type EVENT) + ESA 결과 등  ← DB sync가 읽음
+  new_algo_inout/YYYY-MM-DD.txt  이 방 Node가 보낸 입퇴실(type DEBUG, 새 알고리즘)
+  rawdata/YYYY-MM-DD.txt         Node RAWDATA 원본(그대로)
+data/display/YYYY-MM-DD.txt      모든 방 debugstr을 한 줄 글로 모은 timeline(v1 형태 입퇴실)
 ```
 
-`scripts/legacy_inout.py --dry-run`은 날짜별 행 수와 예시만 출력하고,
-`--rebuild --from YYYY-MM-DD`는 기존 파일을 `programdata/db_sync/legacy_inout_backup_*`로
-옮기고 다시 만듭니다. rebuild 뒤에는 local(필요하면 원격) `in_out`의 해당 기간 행을 지운 다음
-ingest해야 합니다. 시작일을 설정하지 않은 Hub는 지금처럼 rawdata에서 읽습니다.
+daemon은 Node RAWDATA 입실(`detected=10`)을 받은 순서대로 집 전체 활성 방 하나를 유지합니다
+(`slimhub/integrations/legacy_inout.py`, 상태 `programdata/legacy_inout_state.json`). 활성 방이
+없으면 새 방 ENTER, 같은 방 ENTER는 무시, 다른 방 ENTER면 같은 시각에 이전 방 EXIT와 새 방
+ENTER를 각 방 debugstr과 display에 씁니다. Node 자신의 EXIT는 무시하고 timeout도 없습니다(v1과
+같은 결과). Node의 ENTER/EXIT JSON은 debugstr 대신 그 방의 `new_algo_inout/`에 씁니다.
+
+```text
+{"device": "90:E5:B1:D1:23:22", "type": "EVENT", "event": "EXIT", "value": 20, "timestamp": "2026-10-28 10:33:02"}
+{"device": "90:E5:B1:D1:23:22", "type": "DEBUG", "event": "ENTER", "value": 10, "timestamp": "2026-10-28 10:32:46"}
+```
+
+daemon이 이렇게 쓰기 전의 날은 `scripts/legacy_inout.py --from YYYY-MM-DD`(daemon을 멈춘 뒤 1회,
+`--dry-run`으로 미리 확인)로 바꿉니다. Node DEBUG 입퇴실을 `new_algo_inout/`으로 옮기고, rawdata
+Node 입실로 만든 v1 형태 EVENT 줄을 debugstr과 display에 시각순으로 넣고, 원본은
+`programdata/db_sync/backup_debugstr_*`에 둡니다. 다시 쓴 debugstr은 offset을 지워 다음 ingest가
+처음부터 읽습니다(같은 행은 넣지 않음).
 
 `house_mac`은 기본적으로 `programdata/config.json`의 Hub `address`를 사용하며,
 배포 식별자를 별도로 써야 하면 `SLIMHUB_HOUSE_MAC`으로 재정의합니다. `in_out`의

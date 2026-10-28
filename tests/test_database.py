@@ -82,6 +82,12 @@ def raw_row(time: str, grideye: int, direction: int) -> str:
     return f"{time},{grideye},{direction}" + ",0" * 23 + "\n"
 
 
+def event_line(time: str, event: str, value: int) -> str:
+    return json.dumps(
+        {"device": MAC, "type": "EVENT", "event": event, "value": value, "timestamp": time}
+    ) + "\n"
+
+
 def data_path(
     paths: AppPaths,
     stream: str,
@@ -132,27 +138,12 @@ class DataDirectoryDatabaseUpdaterTests(unittest.TestCase):
             self.assertEqual(remote.port, 4404)
             self.assertEqual(updater.adl_table, "legacy_adl")
 
-    def test_data_reader_maps_rawdata_inout_and_every_inference_status(self) -> None:
+    def test_data_reader_maps_event_inout_and_every_inference_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = AppPaths.from_base(tmpdir)
-            # An old date: every date file is read, not only today's.
-            raw = data_path(paths, "rawdata", date="2026-07-15")
-            raw.write_text(
-                RAW_HEADER
-                + raw_row("2026-07-15 10:00:00", 0, 0)
-                + raw_row("2026-07-15 10:00:01", 1, 10)
-                + raw_row("2026-07-15 10:00:02", 1, 1)
-                + raw_row("2026-07-15 10:00:03", 1, 20),
-                encoding="utf-8",
-            )
-            # June files use the 22-column header; columns are found by name.
-            june = data_path(paths, "rawdata", location="KITCHEN", date="2026-06-01")
-            june.write_text(
-                "time,GridEye,Direction,ENV,temp,humid,iaq,eco2,bvoc,SOUND,background,"
-                "hitting,speech_tv,air_appliances,brushing,peeing,flushing,flush_end,"
-                "microwave,cooking,watering_low,watering_high\n"
-                "2026-06-01 09:00:00,1,20" + ",0" * 19 + "\n",
-                encoding="utf-8",
+            # rawdata is not a DB source (the hub's EVENT lines in debugstr are).
+            data_path(paths, "rawdata", date="2026-07-15").write_text(
+                RAW_HEADER + raw_row("2026-07-15 10:00:01", 1, 10), encoding="utf-8"
             )
             debug = data_path(paths, "debugstr", date="2026-07-15")
             records = [
@@ -164,6 +155,9 @@ class DataDirectoryDatabaseUpdaterTests(unittest.TestCase):
                  "sequence": "D0_S2_D1_", "truth": 0.0, "timestamp": "2026-07-15 10:00:03"},
                 {"device": MAC, "type": "EVENT", "event": "ENTER", "value": 10,
                  "timestamp": "2026-07-15 10:00:04"},
+                {"device": MAC, "type": "EVENT", "event": "EXIT", "value": 20,
+                 "timestamp": "2026-07-15 10:00:05"},
+                # The Node's own DEBUG lines are not in_out rows.
                 {"device": MAC, "type": "DEBUG", "event": "EXIT", "value": 20,
                  "timestamp": "2026-07-15 10:00:06"},
             ]
@@ -173,24 +167,20 @@ class DataDirectoryDatabaseUpdaterTests(unittest.TestCase):
                 encoding="utf-8",
             )
             # Manual copies and non-room folders are not DB sources.
-            data_path(paths, "rawdata", location="_ENTRY", date="2026-07-15").write_text(
-                RAW_HEADER + raw_row("2026-07-15 10:00:01", 1, 10), encoding="utf-8"
-            )
             data_path(paths, "debugstr", location="undefined", date="2026-07-15").write_text(
-                json.dumps(records[1]) + "\n", encoding="utf-8"
+                json.dumps(records[3]) + "\n", encoding="utf-8"
             )
 
             batch = DataDirectoryReader(paths).read(house_mac="11:22:33:44:55:66")
 
             self.assertEqual(
-                sorted(batch.inout_rows),
+                batch.inout_rows,
                 [
-                    ("11:22:33:44:55:66", f"ENTRY:{MAC}", "2026-07-15 10:00:01", 10),
-                    ("11:22:33:44:55:66", f"ENTRY:{MAC}", "2026-07-15 10:00:03", 20),
-                    ("11:22:33:44:55:66", f"KITCHEN:{MAC}", "2026-06-01 09:00:00", 20),
+                    ("11:22:33:44:55:66", f"ENTRY:{MAC}", "2026-07-15 10:00:04", 10),
+                    ("11:22:33:44:55:66", f"ENTRY:{MAC}", "2026-07-15 10:00:05", 20),
                 ],
             )
-            self.assertEqual(batch.files, 3)
+            self.assertEqual(batch.files, 1)
             self.assertEqual(
                 batch.adl_rows,
                 [
@@ -200,25 +190,26 @@ class DataDirectoryDatabaseUpdaterTests(unittest.TestCase):
                 ],
             )
 
-    def test_rawdata_offsets_skip_read_rows_and_realign_inside_a_line(self) -> None:
+    def test_debugstr_offsets_skip_read_rows_and_realign_inside_a_line(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = AppPaths.from_base(tmpdir)
-            raw = data_path(paths, "rawdata")
-            raw.write_text(RAW_HEADER + raw_row("2026-10-27 10:00:00", 1, 10), encoding="utf-8")
+            debug = data_path(paths, "debugstr")
+            first_line = event_line("2026-10-27 10:00:00", "ENTER", 10)
+            debug.write_text(first_line, encoding="utf-8")
             first = DataDirectoryReader(paths).read(house_mac="house")
-            key = str(raw.resolve())
+            key = str(debug.resolve())
             self.assertEqual(len(first.inout_rows), 1)
-            self.assertEqual(first.offsets[key], raw.stat().st_size)
+            self.assertEqual(first.offsets[key], debug.stat().st_size)
 
-            with raw.open("a", encoding="utf-8") as output:
-                output.write(raw_row("2026-10-27 10:05:00", 1, 20))
+            with debug.open("a", encoding="utf-8") as output:
+                output.write(event_line("2026-10-27 10:05:00", "EXIT", 20))
             second = DataDirectoryReader(paths, offsets=first.offsets).read(house_mac="house")
             self.assertEqual(
                 second.inout_rows, [("house", f"ENTRY:{MAC}", "2026-10-27 10:05:00", 20)]
             )
 
             # A stale offset inside a line (file rewritten) skips to the next line.
-            inside = {key: len(RAW_HEADER) + 5}
+            inside = {key: 5}
             third = DataDirectoryReader(paths, offsets=inside).read(house_mac="house")
             self.assertEqual(
                 third.inout_rows, [("house", f"ENTRY:{MAC}", "2026-10-27 10:05:00", 20)]
@@ -251,12 +242,11 @@ class DataDirectoryDatabaseUpdaterTests(unittest.TestCase):
     def test_ingest_commits_data_rows_then_writes_data_offsets(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = AppPaths.from_base(tmpdir)
-            raw = data_path(paths, "rawdata")
+            raw = data_path(paths, "debugstr")
             raw.write_text(
-                RAW_HEADER
-                + raw_row("2026-07-15 10:00:00", 1, 20)
-                + raw_row("2026-07-15 10:00:00", 1, 20)
-                + raw_row("2026-07-15 10:01:00", 1, 10),
+                event_line("2026-07-15 10:00:00", "EXIT", 20)
+                + event_line("2026-07-15 10:00:00", "EXIT", 20)
+                + event_line("2026-07-15 10:01:00", "ENTER", 10),
                 encoding="utf-8",
             )
             updater = DataDirectoryDatabaseUpdater(
@@ -292,52 +282,12 @@ class DataDirectoryDatabaseUpdaterTests(unittest.TestCase):
                 updater._read_json(paths.db_ingest_offset_path),
             )
 
-    def test_ingest_builds_legacy_inout_first_and_keeps_adl_on_its_error(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            paths = AppPaths.from_base(tmpdir)
-            date = "2026-10-21"
-            data_path(paths, "rawdata", date=date).write_text(
-                RAW_HEADER + raw_row(f"{date} 10:00:00", 1, 10)
-                + raw_row(f"{date} 10:05:00", 1, 20),
-                encoding="utf-8",
-            )
-            data_path(paths, "debugstr", date=date).write_text(
-                json.dumps({"device": MAC, "type": "INFERENCE", "status": "COMPLETE",
-                            "ADL": "pee", "timestamp": f"{date} 10:05:00"}) + "\n",
-                encoding="utf-8",
-            )
-            environ = {
-                "SLIMHUB_LOCAL_DB_HOST": "localhost",
-                "SLIMHUB_LOCAL_DB_USER": "user",
-                "SLIMHUB_LOCAL_DB_NAME": "adl_event",
-                "SLIMHUB_HOUSE_MAC": "house",
-                "SLIMHUB_LEGACY_INOUT_FROM": "2026-10-20",
-            }
-            updater = DataDirectoryDatabaseUpdater(paths, environ=environ)
-            local = FakeConnection()
-
-            with patch.object(updater, "_connect", return_value=local):
-                result = updater.ingest()
-
-            # The Node's own EXIT is not a legacy row; only the ENTER is.
-            self.assertEqual(result["legacy_inout"]["rows"], 1)
-            self.assertEqual(result["adl_inserted"], 1)
-            self.assertEqual(
-                local.inserts[-1][1], [("house", f"ENTRY:{MAC}", f"{date} 10:00:00", 10)]
-            )
-
-            broken = DataDirectoryDatabaseUpdater(
-                paths, environ={**environ, "SLIMHUB_LEGACY_INOUT_FROM": "2026-10-21"}
-            )
-            with patch.object(broken, "_connect", return_value=FakeConnection()):
-                result = broken.ingest()
-            self.assertIn("--rebuild", result["legacy_inout"]["error"])
-
     def test_preview_writes_pending_db_rows_without_db_or_offset_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = AppPaths.from_base(tmpdir)
-            raw = data_path(paths, "rawdata")
-            raw.write_text(RAW_HEADER + raw_row("2026-07-15 10:00:00", 1, 20), encoding="utf-8")
+            data_path(paths, "debugstr").write_text(
+                event_line("2026-07-15 10:00:00", "EXIT", 20), encoding="utf-8"
+            )
             updater = DataDirectoryDatabaseUpdater(
                 paths,
                 environ={"SLIMHUB_HOUSE_MAC": "house"},
