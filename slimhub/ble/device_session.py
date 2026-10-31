@@ -31,6 +31,8 @@ CommandResultHandler = Callable[[CommandEvent, bool, str | None, float], Awaitab
 
 # Longest wait for BlueZ to report the negotiated ATT write capacity.
 WRITE_CAPACITY_WAIT_SECONDS = 2.0
+# Longest wait for frame handlers still running when a link ends.
+FRAME_DRAIN_TIMEOUT_SECONDS = 30.0
 
 
 class DeviceSession:
@@ -97,6 +99,15 @@ class DeviceSession:
         self.last_seen = time.time()
         self.waiting_for_advertisement = False
         self._target_updated_event.set()
+        # A session task that died (an unexpected error escaped the loop) must
+        # not leave the Node unreachable until the daemon restarts.
+        if (
+            self._task is not None
+            and self._task.done()
+            and not self._stop_event.is_set()
+        ):
+            self.logger.warning("%s BLE session task was not running; restarting", self.address)
+            self.start()
 
     def set_advertisement_driven(self, enabled: bool) -> None:
         self.advertisement_driven = enabled
@@ -250,11 +261,7 @@ class DeviceSession:
                     with suppress(BleakError, RuntimeError, AttributeError):
                         if client.is_connected:
                             await client.disconnect()
-                if self._inflight_frame_tasks:
-                    await asyncio.gather(
-                        *list(self._inflight_frame_tasks),
-                        return_exceptions=True,
-                    )
+                await self._drain_inflight_frames()
                 assembler.clear()
                 self.connected = False
                 self._negotiated_mtu = None
@@ -265,7 +272,14 @@ class DeviceSession:
                     # turned its radio off; wait for a new advertisement.
                     self._target_updated_event.clear()
                 if reported_connected and self.on_connection_state is not None:
-                    await self.on_connection_state(self.address, False, time.time())
+                    # A failing disconnect handler must not end this session
+                    # task: nothing would reconnect the Node afterwards.
+                    try:
+                        await self.on_connection_state(self.address, False, time.time())
+                    except Exception:
+                        self.logger.exception(
+                            "%s disconnect handler failed", self.address
+                        )
 
             if not self._stop_event.is_set():
                 self.waiting_for_advertisement = True
@@ -278,9 +292,13 @@ class DeviceSession:
         expected_mac = mac_to_bytes(self.address)
 
         def handle_notify(sender: object, data: bytearray) -> None:
-            chunk = bytes(data)
-
-            for frame_bytes in assembler.push(chunk):
+            try:
+                frames = assembler.push(bytes(data))
+            except Exception:
+                self.logger.exception("%s NUS reassembly failed; dropping buffer", self.address)
+                assembler.clear()
+                return
+            for frame_bytes in frames:
                 if frame_bytes[:6] != expected_mac:
                     self.logger.error(
                         "%s frame rejected before payload parsing: source MAC mismatch",
@@ -289,7 +307,9 @@ class DeviceSession:
                     continue
                 try:
                     frame = parse_frame(frame_bytes)
-                except PacketParseError as exc:
+                except Exception as exc:
+                    # PacketParseError is the expected case; any other error
+                    # in one frame must not discard the frames behind it.
                     raw_type = (
                         frame_bytes[6:14].rstrip(b"\x00").decode(
                             "ascii", errors="replace"
@@ -328,6 +348,23 @@ class DeviceSession:
                 task.add_done_callback(self._frame_task_done)
 
         return handle_notify
+
+    async def _drain_inflight_frames(self) -> None:
+        """Wait briefly for frame handlers; a hung one must not block reconnects."""
+        if not self._inflight_frame_tasks:
+            return
+        pending = list(self._inflight_frame_tasks)
+        _done, still_running = await asyncio.wait(pending, timeout=FRAME_DRAIN_TIMEOUT_SECONDS)
+        if still_running:
+            self.logger.error(
+                "%s %d frame handler(s) still running after %.0f s; cancelling",
+                self.address,
+                len(still_running),
+                FRAME_DRAIN_TIMEOUT_SECONDS,
+            )
+            for task in still_running:
+                task.cancel()
+            await asyncio.gather(*still_running, return_exceptions=True)
 
     async def _dispatch_frame(self, frame: ParsedFrame) -> None:
         # Preserve wire order across notification callbacks so state-changing

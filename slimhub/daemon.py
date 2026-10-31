@@ -973,12 +973,17 @@ class SlimHubDaemon:
         if packet.flag_human_presence != 1 or packet.detected != 10 or location not in ROOM_ORDER:
             return
         time_text = datetime.fromtimestamp(timestamp, SEOUL).strftime("%Y-%m-%d %H:%M:%S")
-        for row in self.legacy_inout.enter(time_text, location, normalize_mac(mac)):
-            await self.legacy_report_writer.log(
-                legacy_inout_report(row.mac, row.direction, row.time),
-                timestamp=timestamp,
-                location=row.room,
-            )
+        try:
+            for row in self.legacy_inout.enter(time_text, location, normalize_mac(mac)):
+                await self.legacy_report_writer.log(
+                    legacy_inout_report(row.mac, row.direction, row.time),
+                    timestamp=timestamp,
+                    location=row.room,
+                )
+        except Exception:
+            # This is a derived v1-style record; its failure (disk full, ...)
+            # must not stop the estimator and contract handling of this RAWDATA.
+            self.logger.exception("legacy IN/OUT write failed mac=%s room=%s", mac, location)
 
     async def _reset_adapter(self) -> None:
         self.logger.warning("BLE scanner keeps failing; power-cycling the adapter")
@@ -994,16 +999,22 @@ class SlimHubDaemon:
 
     async def _occupancy_timeout_loop(self) -> None:
         while not self.stop_event.is_set():
-            timestamp = time.time()
-            commands = self.dean_contract.expire_confirmations(timestamp)
-            commands.extend(
-                self.dean_contract.expire_occupancy(timestamp)
-            )
-            commands.extend(self.estimator.expire(time.monotonic()))
-            sent = await self._send_unitspace_commands(commands)
-            self._log_commands(sent)
-            await self._log_estimator_records()
-            await self._log_contract_records()
+            try:
+                timestamp = time.time()
+                commands = self.dean_contract.expire_confirmations(timestamp)
+                commands.extend(
+                    self.dean_contract.expire_occupancy(timestamp)
+                )
+                commands.extend(self.estimator.expire(time.monotonic()))
+                sent = await self._send_unitspace_commands(commands)
+                self._log_commands(sent)
+                await self._log_estimator_records()
+                await self._log_contract_records()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # One bad tick must not end this loop for the rest of the run.
+                self.logger.exception("occupancy timeout tick failed; continuing")
             await self._wait_or_stop(1.0)
 
     async def _send_unitspace_commands(

@@ -338,7 +338,10 @@ class LegacyReportWriter:
                 if item is None:
                     return
                 await asyncio.to_thread(self._write_item, item)
-            except OSError:
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Not only OSError: any failure must keep the writer alive.
                 self.health["write_errors"] += 1
                 if item is not None:
                     logging.exception(

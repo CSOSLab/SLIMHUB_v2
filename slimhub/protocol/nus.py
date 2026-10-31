@@ -185,7 +185,25 @@ class FrameAssembler:
                 continue
 
             if len(self._buffer) < frame_len:
-                break
+                # A frame cut short by a Node-side failure leaves this header
+                # waiting for bytes that never come, with complete frames
+                # queued behind it. Resume at the first complete valid frame.
+                embedded = self._find_embedded_frame()
+                if embedded is None:
+                    break
+                mac = ":".join(f"{byte:02X}" for byte in self._buffer[:MAC_LEN])
+                logging.warning(
+                    "NUS reject mac=%s frame_type=%s declared_length=%d "
+                    "actual_available=%d reason=truncated_before_next_frame "
+                    "resync_skip=%d",
+                    mac,
+                    packet_type,
+                    packet_length,
+                    max(0, embedded - HEADER_LEN),
+                    embedded,
+                )
+                del self._buffer[:embedded]
+                continue
 
             if self._buffer[frame_len - END_FLAG_LEN : frame_len] != END_FLAG:
                 mac = ":".join(f"{byte:02X}" for byte in self._buffer[:MAC_LEN])
@@ -206,6 +224,43 @@ class FrameAssembler:
             del self._buffer[:frame_len]
 
         return frames
+
+    def _find_embedded_frame(self) -> int | None:
+        """Offset of a complete, valid frame from the same MAC inside the buffer."""
+        buffer = self._buffer
+        mac = bytes(buffer[:MAC_LEN])
+        position = buffer.find(mac, 1)
+        while position != -1:
+            if len(buffer) - position >= HEADER_LEN:
+                try:
+                    packet_type = (
+                        bytes(buffer[position + MAC_LEN : position + MAC_LEN + PACKET_TYPE_LEN])
+                        .rstrip(b"\x00")
+                        .decode("ascii")
+                    )
+                except UnicodeDecodeError:
+                    packet_type = ""
+                length = int.from_bytes(
+                    buffer[position + MAC_LEN + PACKET_TYPE_LEN : position + HEADER_LEN],
+                    byteorder="little",
+                    signed=False,
+                )
+                length_ok = not (
+                    (packet_type == "RAWDATA" and length != RAWDATA_PAYLOAD_LEN)
+                    or (packet_type == "REPORT" and length > MAX_REPORT_PAYLOAD_LEN)
+                    or (packet_type == "LOGDATA" and length > MAX_LOGDATA_PAYLOAD_LEN)
+                )
+                end = position + HEADER_LEN + length + END_FLAG_LEN
+                if (
+                    packet_type in KNOWN_PACKET_TYPES
+                    and length_ok
+                    and end - position <= self._max_frame_len
+                    and end <= len(buffer)
+                    and buffer[end - END_FLAG_LEN : end] == END_FLAG
+                ):
+                    return position
+            position = buffer.find(mac, position + 1)
+        return None
 
     def clear(self) -> None:
         if self._buffer:

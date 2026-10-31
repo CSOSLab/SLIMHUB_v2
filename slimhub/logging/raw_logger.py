@@ -207,6 +207,13 @@ class RawDataLogger:
                     await self.write_structured(event)
                 else:
                     await self.write_event(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A single bad event must not kill the writer: the queue would
+                # then fill and every later record would be dropped.
+                self.health["write_errors"] = self.health.get("write_errors", 0) + 1
+                logging.exception("Raw writer failed on %s", type(event).__name__)
             finally:
                 self._queue.task_done()
 

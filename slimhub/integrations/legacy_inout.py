@@ -23,6 +23,7 @@ display timeline). The daemon applies the rules live (LegacyInOutTracker);
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -96,7 +97,12 @@ class LegacyInOutTracker:
     def enter(self, time_text: str, room: str, mac: str) -> list[LegacyRow]:
         rows = apply_enter(self.state, time_text, room, mac)
         if rows:
-            _write_json_atomic(self.path, self.state)
+            try:
+                _write_json_atomic(self.path, self.state)
+            except OSError:
+                # Keep the in-memory token and still return the rows: losing
+                # them would desync debugstr from the token after a disk error.
+                logging.exception("legacy IN/OUT state not saved path=%s", self.path)
         return rows
 
 
