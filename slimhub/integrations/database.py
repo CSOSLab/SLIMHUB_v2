@@ -35,8 +35,9 @@ class DataDirectoryDatabaseUpdater:
     Collection and DB synchronization are deliberately separate: the daemon
     writes legacy-compatible rawdata CSV and debugstr JSONL files. This class
     incrementally consumes every INFERENCE (ESA result) record and the v1-style
-    EVENT ENTER/EXIT lines from debugstr, skipping rows the local DB already
-    holds. Credentials are read only from environment variables.
+    EVENT ENTER/EXIT lines from debugstr, and the BATTERY lines from battery/,
+    skipping rows the local DB already holds. Credentials are read only from
+    environment variables.
     """
 
     def __init__(self, paths: AppPaths, environ: dict[str, str] | None = None) -> None:
@@ -47,12 +48,14 @@ class DataDirectoryDatabaseUpdater:
             self.environ.get("ADL_TABLE", "event_adl"),
         )
         self.inout_table = self.environ.get("SLIMHUB_DB_INOUT_TABLE", "in_out")
+        self.battery_table = self.environ.get("SLIMHUB_DB_BATTERY_TABLE", "battery_status")
         self.house_mac = (
             self.environ.get("SLIMHUB_HOUSE_MAC")
             or HubConfigStore(paths).load_or_create().address
         )
         _validate_identifier(self.adl_table)
         _validate_identifier(self.inout_table)
+        _validate_identifier(self.battery_table)
 
     def update(self, *, upload: bool = True) -> dict[str, object]:
         started_at = _now()
@@ -125,12 +128,13 @@ class DataDirectoryDatabaseUpdater:
         batch = reader.read(house_mac=self.house_mac)
         adl_rows = batch.adl_rows
         inout_rows = batch.inout_rows
+        battery_rows = batch.battery_rows
         skipped = 0
-        if adl_rows or inout_rows:
+        if adl_rows or inout_rows or battery_rows:
             local = self._settings("LOCAL", required=True)
             with self._connect(local) as connection:
                 # 같은 행이 이미 있으면 넣지 않습니다(commit 뒤 offset 저장 전 중단, 재적재).
-                before = len(adl_rows) + len(inout_rows)
+                before = len(adl_rows) + len(inout_rows) + len(battery_rows)
                 adl_rows = self._new_rows(
                     connection, self.adl_table,
                     ("house_mac", "location", "created_time", "event_sequence", "adl"),
@@ -141,7 +145,12 @@ class DataDirectoryDatabaseUpdater:
                     ("house_mac", "location", "created_time", "direction"),
                     inout_rows, key_size=4,
                 )
-                skipped = before - len(adl_rows) - len(inout_rows)
+                battery_rows = self._new_rows(
+                    connection, self.battery_table,
+                    ("house_mac", "location_mac", "created_time", "battery_level"),
+                    battery_rows, key_size=4,
+                )
+                skipped = before - len(adl_rows) - len(inout_rows) - len(battery_rows)
                 with connection.cursor() as cursor:
                     if adl_rows:
                         cursor.executemany(
@@ -157,6 +166,13 @@ class DataDirectoryDatabaseUpdater:
                             "VALUES (%s, %s, %s, %s)",
                             inout_rows,
                         )
+                    if battery_rows:
+                        cursor.executemany(
+                            f"INSERT INTO `{self.battery_table}` "
+                            "(house_mac, location_mac, created_time, battery_level) "
+                            "VALUES (%s, %s, %s, %s)",
+                            battery_rows,
+                        )
                 connection.commit()
         self._write_json_atomic(self.paths.db_ingest_offset_path, batch.offsets)
         return {
@@ -164,6 +180,7 @@ class DataDirectoryDatabaseUpdater:
             "lines": batch.lines,
             "adl_inserted": len(adl_rows),
             "inout_inserted": len(inout_rows),
+            "battery_inserted": len(battery_rows),
             "duplicates_skipped": skipped,
         }
 
@@ -247,6 +264,10 @@ class DataDirectoryDatabaseUpdater:
             output.write(f"\n[{self.inout_table}]\n")
             writer.writerow(("house_mac", "location", "created_time", "direction"))
             writer.writerows(batch.inout_rows)
+
+            output.write(f"\n[{self.battery_table}]\n")
+            writer.writerow(("house_mac", "location_mac", "created_time", "battery_level"))
+            writer.writerows(batch.battery_rows)
         temporary.replace(destination)
 
         return {
@@ -255,6 +276,7 @@ class DataDirectoryDatabaseUpdater:
             "lines": batch.lines,
             "adl_rows": len(batch.adl_rows),
             "inout_rows": len(batch.inout_rows),
+            "battery_rows": len(batch.battery_rows),
         }
 
     def upload(self) -> dict[str, object]:
@@ -296,6 +318,7 @@ class DataDirectoryDatabaseUpdater:
             for stream, table in (
                 ("ADL", self.adl_table),
                 ("INOUT", self.inout_table),
+                ("BATTERY", self.battery_table),
             ):
                 last_id = _as_int(offsets.get(stream), 0)
                 columns = self._columns_without_id(local_connection, table)

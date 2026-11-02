@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -23,6 +23,7 @@ class DataIngestBatch:
     offsets: dict[str, int]
     files: int
     lines: int
+    battery_rows: list[tuple[object, ...]] = field(default_factory=list)
 
 
 class DataDirectoryReader:
@@ -45,6 +46,7 @@ class DataDirectoryReader:
     def read(self, *, house_mac: str) -> DataIngestBatch:
         adl_rows: list[tuple[object, ...]] = []
         inout_rows: list[tuple[object, ...]] = []
+        battery_rows: list[tuple[object, ...]] = []
         updated_offsets = dict(self.offsets)
         files = 0
         lines = 0
@@ -53,7 +55,7 @@ class DataDirectoryReader:
             identity = _data_path_identity(self.paths.data_dir, path)
             if identity is None:
                 continue
-            location, mac, _stream = identity
+            location, mac, stream = identity
             key = str(path.resolve())
             start = self.offsets.get(key, 0)
             try:
@@ -63,6 +65,17 @@ class DataDirectoryReader:
             if start > size:
                 start = 0
             if start == size:
+                continue
+
+            # 신규(2026-11-02): battery/ 파일(battery_log.py가 덧붙임)은 battery_status 행입니다.
+            if stream == "battery":
+                battery, end_offset, consumed = _read_battery(
+                    path, start, house_mac=house_mac, path_mac=mac
+                )
+                battery_rows.extend(battery)
+                updated_offsets[key] = end_offset
+                files += 1
+                lines += consumed
                 continue
 
             # 변경 사항(2026-10-28): 원래(060da01)처럼 debugstr 하나만 읽습니다. 입퇴실은
@@ -88,12 +101,16 @@ class DataDirectoryReader:
             offsets=updated_offsets,
             files=files,
             lines=lines,
+            battery_rows=battery_rows,
         )
 
     def _discover_files(self) -> list[Path]:
         # 변경 사항(2026-10-27): 오늘 파일만 읽으면 자정 직전 행과 늦게 다시 쓰인 행을
         # 놓칩니다. 모든 날짜 파일을 보고, 다 읽은 파일은 offset으로 건너뜁니다.
-        return sorted(set(self.paths.data_dir.glob("*/*/*/inference/debugstr/*.txt")))
+        return sorted(
+            set(self.paths.data_dir.glob("*/*/*/inference/debugstr/*.txt"))
+            | set(self.paths.data_dir.glob("*/*/*/inference/battery/*.txt"))
+        )
 
 
 def _line_start(source, start: int) -> int:
@@ -244,6 +261,54 @@ def _read_debugstr(
     return adl_rows, inout_rows, end_offset, consumed
 
 
+def _read_battery(
+    path: Path,
+    start: int,
+    *,
+    house_mac: str,
+    path_mac: str,
+) -> tuple[list[tuple[object, ...]], int, int]:
+    """Read type=BATTERY lines as (house_mac, location_mac, created_time, battery_level).
+
+    location_mac is the Node MAC, battery_level the percentage as text. Lines
+    without a percentage (invalid ADC reading) are skipped.
+    """
+    battery_rows: list[tuple[object, ...]] = []
+    consumed = 0
+    with path.open("rb") as source:
+        end_offset = _line_start(source, start)
+        source.seek(end_offset)
+        while True:
+            line_start = source.tell()
+            raw_line = source.readline()
+            if not raw_line:
+                break
+            if not raw_line.endswith(b"\n"):
+                source.seek(line_start)
+                break
+            end_offset = source.tell()
+            consumed += 1
+            try:
+                document = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(document, dict):
+                continue
+            if str(document.get("type") or "").upper() != "BATTERY":
+                continue
+            created_time = _timestamp_text(document.get("timestamp"))
+            level = _optional_int(document.get("percentage"))
+            if created_time is None or level is None:
+                continue
+            device = str(document.get("device") or path_mac)
+            try:
+                device = normalize_mac(device)
+            except ValueError:
+                device = path_mac
+            battery_rows.append((house_mac, device, created_time, str(level)))
+    return battery_rows, end_offset, consumed
+
+
 def _data_path_identity(
     data_dir: Path,
     path: Path,
@@ -256,7 +321,7 @@ def _data_path_identity(
     if len(parts) != 6 or parts[3] != "inference":
         return None
     location, _device_type, mac, _inference, stream, _filename = parts
-    if location not in ROOM_LOCATIONS or stream not in {"debugstr", "rawdata"}:
+    if location not in ROOM_LOCATIONS or stream not in {"debugstr", "rawdata", "battery"}:
         return None
     try:
         mac = normalize_mac(mac)

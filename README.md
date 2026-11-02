@@ -221,6 +221,23 @@ Node 입실로 만든 v1 형태 EVENT 줄을 debugstr과 display에 시각순으
 `programdata/db_sync/backup_debugstr_*`에 둡니다. 다시 쓴 debugstr은 offset을 지워 다음 ingest가
 처음부터 읽습니다(같은 행은 넣지 않음).
 
+**배터리 (2026-11-02).** Node 배터리 측정(LOGDATA VLB1, 약 300초마다 1건)은
+`data/validation/<MAC12>/<stream>.jsonl`에 저장됩니다. `scripts/db_ingest.py`는 ingest 전에
+`slimhub/integrations/battery_log.py`로 새로 받은 측정만 그 날의 debugstr 옆 파일 끝에
+덧붙입니다(첫 실행은 2026-10-01 이후 전체를 다시 씀, 상태 `programdata/db_sync/battery_export_state.json`).
+방 폴더는 그 날짜에 debugstr/rawdata가 있는 방, 없으면 `programdata/config/<MAC>.json`의 location입니다.
+
+```text
+data/<room>/DEAN_NODE_V2/<node MAC>/inference/battery/YYYY-MM-DD.txt
+{"device": "90:E5:B1:D1:23:36", "type": "BATTERY", "percentage": 76, "batt_mv": 3985, "usb": 0, "uptime_s": 158890, "timestamp": "2026-11-02 15:03:41"}
+```
+
+`percentage`는 firmware와 같은 임시 전압 표(4180 mV=100 %, 3743=50 %, 3000=0 %, 선형 보간)로
+계산하고 ADC가 무효인 측정은 null입니다. `usb` 1은 USB 연결(이때 전압은 충전기 전압)입니다.
+`timestamp`는 hub 수신 시각이 아니라 측정 시각(부팅 시각 추정 min(수신 − uptime) + uptime)입니다.
+ingest는 `percentage`가 있는 줄을 로컬 `battery_status`(house_mac, location_mac = node MAC,
+battery_level = percentage 문자열, created_time)에 넣습니다. 같은 네 값의 행은 넣지 않습니다.
+
 `house_mac`은 기본적으로 `programdata/config.json`의 Hub `address`를 사용하며,
 배포 식별자를 별도로 써야 하면 `SLIMHUB_HOUSE_MAC`으로 재정의합니다. `in_out`의
 `location`은 `<room>:<node MAC>`, `event_adl`의 `location`은 node MAC으로 저장해
@@ -257,11 +274,12 @@ slimhub-v2 db update            # 호환용: ingest 후 upload stage 실행
 
 기존 `db update --no-upload`은 스크립트 호환을 위해 계속 인식하지만 `db ingest`와
 동일하므로 일반 CLI 도움말에서는 숨깁니다. remote 전송은 local `id` cursor 뒤의 행을
-stream(ADL, INOUT)마다 최대 1000행씩 보내고, 각 stream이 commit된 뒤 cursor를
+stream(ADL, INOUT, BATTERY)마다 최대 1000행씩 보내고, 각 stream이 commit된 뒤 cursor를
 저장합니다. `SLIMHUB_REMOTE_DB_HOST`가 없으면 연결하지 않고 `skipped`를 남깁니다.
 
-테이블 이름은 필요하면 `SLIMHUB_DB_ADL_TABLE`(기본 `event_adl`)과
-`SLIMHUB_DB_INOUT_TABLE`(기본 `in_out`)로 바꿀 수 있습니다. ingest/upload
+테이블 이름은 필요하면 `SLIMHUB_DB_ADL_TABLE`(기본 `event_adl`),
+`SLIMHUB_DB_INOUT_TABLE`(기본 `in_out`), `SLIMHUB_DB_BATTERY_TABLE`(기본 `battery_status`)로
+바꿀 수 있습니다. ingest/upload
 offset은 `programdata/db_sync/`에 보관됩니다. cron 예시는
 [`docs/slimhub-v2.crontab`](docs/slimhub-v2.crontab)에 있으며, 실제 설치 전에는
 해당 환경변수가 cron에서도 안전하게 제공되는지 확인해야 합니다.
