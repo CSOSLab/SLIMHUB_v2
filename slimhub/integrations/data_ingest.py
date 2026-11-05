@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -248,17 +249,31 @@ def _read_debugstr(
             adl = str(document.get("ADL") or ("NO_MATCH" if status == "NO_MATCH" else ""))
             if not adl:
                 continue
+            sequence = str(document.get("sequence") or "")
+            # Node firmware from 2026-11-05 sends NO_MATCH as ADL "none" with
+            # sequence D0_D1_ (no event between entry and exit). Such rows carry
+            # no ESA result and are not stored; every other result is.
+            if _is_empty_no_match(adl, sequence):
+                continue
             adl_rows.append(
                 (
                     house_mac,
                     device,
                     created_time,
-                    str(document.get("sequence") or ""),
+                    sequence,
                     adl,
                     _truth_value(document.get("truth")),
                 )
             )
     return adl_rows, inout_rows, end_offset, consumed
+
+
+def _is_empty_no_match(adl: str, sequence: str) -> bool:
+    """ADL none/NO_MATCH whose sequence has no event between D0 and D1."""
+    if adl.strip().lower() not in {"none", "no_match"}:
+        return False
+    codes = [code for code in re.split(r"[_>]", sequence) if code]
+    return all(code in {"D0", "D1"} for code in codes)
 
 
 def _read_battery(

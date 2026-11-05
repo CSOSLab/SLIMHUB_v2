@@ -188,7 +188,8 @@ debugstr에서 확인된 보수적인 location/event signature만 `derived_infer
 (`_BEDROOM` 같은 수동 사본, `undefined`, `display`, `validation`은 제외). debugstr의
 `"type": "EVENT"` ENTER(10)/EXIT(20) 줄은 로컬 MySQL `in_out`에, 모든 ESA 결과
 `INFERENCE`(COMPLETE, PARTIAL, NO_MATCH, POP, PRE-DETECT 등 status 무관)는 `event_adl`에
-적재합니다. local table에 같은 행(`in_out`: house_mac·location·created_time·direction,
+적재합니다. 단, ADL이 `none`(NO_MATCH)이고 sequence의 D0·D1 사이에 이벤트가 없는 줄(`D0_D1_`, Node firmware
+2026-11-05부터의 NO_MATCH 형식)은 ESA 결과가 없으므로 넣지 않습니다(이미 적재된 행은 그대로). local table에 같은 행(`in_out`: house_mac·location·created_time·direction,
 `event_adl`: 여기에 event_sequence·adl)이 이미 있으면 넣지 않습니다. 파일별 byte offset은
 `programdata/db_sync/data_offsets.json`에 저장합니다. 이어서 local table의 `id`
 offset을 기준으로 동일 schema의 원격 table에 전송합니다.

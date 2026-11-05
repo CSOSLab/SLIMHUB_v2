@@ -195,6 +195,14 @@ class DataDirectoryDatabaseUpdaterTests(unittest.TestCase):
                 # The Node's own DEBUG lines are not in_out rows.
                 {"device": MAC, "type": "DEBUG", "event": "EXIT", "value": 20,
                  "timestamp": "2026-07-15 10:00:06"},
+                # NO_MATCH with no event between D0 and D1 is not stored ...
+                {"device": MAC, "type": "INFERENCE", "status": "NO_MATCH", "ADL": "none",
+                 "sequence": "D0_D1_", "sequence_list": "", "truth": 0.0,
+                 "timestamp": "2026-07-15 10:00:07"},
+                # ... but an ADL with an empty sequence still is.
+                {"device": MAC, "type": "INFERENCE", "status": "COMPLETE", "ADL": "sleeping",
+                 "sequence": "D0_D1_", "sequence_list": "", "truth": 0.6,
+                 "timestamp": "2026-07-15 10:00:08"},
             ]
             debug.write_text(
                 "".join(json.dumps(record) + "\n" for record in records)
@@ -222,6 +230,7 @@ class DataDirectoryDatabaseUpdaterTests(unittest.TestCase):
                     ("11:22:33:44:55:66", MAC, "2026-07-15 10:00:01", "", "pee", 0.5),
                     ("11:22:33:44:55:66", MAC, "2026-07-15 10:00:02", "D0_S5_", "pee", 0.88),
                     ("11:22:33:44:55:66", MAC, "2026-07-15 10:00:03", "D0_S2_D1_", "none", 0.0),
+                    ("11:22:33:44:55:66", MAC, "2026-07-15 10:00:08", "D0_D1_", "sleeping", 0.6),
                 ],
             )
 
